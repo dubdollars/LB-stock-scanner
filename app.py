@@ -29,6 +29,7 @@ from scanner.social_scan import (
 from ui.style import apply_theme, signal_banner, panel, pill, PALETTE
 from ui.deepdive_view import render_deep_dive
 from ui.excel_export import format_dataframe_to_excel
+from ui.quality_view import render_quality_page, render_quality_sidebar
 
 
 # ---------------------------------------------------------------------------
@@ -149,17 +150,24 @@ def _render_mode_switcher():
     def _btn_type(mode_name: str) -> str:
         return "primary" if current == mode_name else "secondary"
 
-    # Display order: LONGS · SOCIAL · ROTATION · SHORTS · RESEARCH.
+    # Display order: LONGS · QUALITY · SOCIAL · ROTATION · SHORTS · RESEARCH.
     # Internal mode key for the social mode stays "twitter" so existing
     # session state / snapshots keep working — only the LABEL is "SOCIAL".
-    col_long, col_social, col_rotation, col_short, col_research, col_spacer = st.columns(
-        [1.5, 1.5, 1.5, 1.5, 1.5, 2.5]
+    col_long, col_quality, col_social, col_rotation, col_short, col_research, col_spacer = st.columns(
+        [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0]
     )
     with col_long:
         if st.button("📈 LONGS", type=_btn_type("longs"),
                      use_container_width=True, key="mode_btn_longs"):
             st.session_state.mode = "longs"
             st.session_state.view = "dashboard"
+            st.session_state.research_ticker = None
+            st.rerun()
+    with col_quality:
+        if st.button("💎 QUALITY", type=_btn_type("quality"),
+                     use_container_width=True, key="mode_btn_quality"):
+            st.session_state.mode = "quality"
+            st.session_state.view = "quality"
             st.session_state.research_ticker = None
             st.rerun()
     with col_social:
@@ -198,7 +206,7 @@ def _render_mode_switcher():
     mode_pretty = {
         "longs": "LONGS", "shorts": "SHORTS",
         "research": "RESEARCH", "twitter": "SOCIAL",
-        "rotation": "ROTATION",
+        "rotation": "ROTATION", "quality": "QUALITY",
     }.get(current, current.upper())
     st.markdown(
         f"<div style='font-family:JetBrains Mono;font-size:0.72rem;color:{muted};"
@@ -734,6 +742,8 @@ def _render_sidebar():
             _render_twitter_sidebar()
         elif mode == "rotation":
             _render_rotation_sidebar()
+        elif mode == "quality":
+            render_quality_sidebar()
         else:
             _render_long_sidebar()
 
@@ -1514,7 +1524,14 @@ def render_deep_dive_page():
     ticker = st.session_state.deep_dive_ticker
 
     # Back-to-scan goes to the right home page based on the active mode
-    home_view = "short_candidates" if st.session_state.get("mode") == "shorts" else "dashboard"
+    _origin = st.session_state.get("deep_dive_origin")
+    _mode_now = st.session_state.get("mode")
+    if _origin == "quality" or _mode_now == "quality":
+        home_view = "quality"
+    elif _mode_now == "shorts":
+        home_view = "short_candidates"
+    else:
+        home_view = "dashboard"
 
     col1, col2 = st.columns([1, 8])
     with col1:
@@ -3109,6 +3126,9 @@ elif mode == "twitter" and view not in ("twitter", "deepdive"):
 elif mode == "rotation" and view not in ("rotation", "deepdive"):
     view = "rotation"
     st.session_state.view = view
+elif mode == "quality" and view not in ("quality", "deepdive"):
+    view = "quality"
+    st.session_state.view = view
 
 if view == "deepdive" and st.session_state.deep_dive_ticker:
     render_deep_dive_page()
@@ -3118,6 +3138,9 @@ elif view == "twitter":
     render_twitter_page()
 elif view == "rotation":
     render_rotation_page()
+elif view == "quality":
+    _render_mode_switcher()
+    render_quality_page()
 elif view == "top_stocks":
     render_top_stocks_page()
 elif view == "diagnose":

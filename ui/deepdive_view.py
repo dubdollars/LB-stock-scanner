@@ -47,6 +47,9 @@ def _cached_reddit_mentions(ticker: str, limit_per_sub: int, time_filter: str) -
 def _base_layout(title: str = "", height: int = 500) -> dict:
     return dict(
         template="plotly_dark",
+        # Open with the Pan tool active by default instead of Zoom — far
+        # more intuitive for scrolling through historical price data.
+        dragmode="pan",
         plot_bgcolor=PALETTE["bg_main"],
         paper_bgcolor=PALETTE["bg_main"],
         font=dict(family="JetBrains Mono, monospace", color=PALETTE["text_primary"], size=13),
@@ -145,16 +148,27 @@ def _build_price_chart(d: DeepDiveData) -> go.Figure:
         row=1, col=1,
     )
 
-    # VCP zones — vertical rectangles
+    # VCP zones — vertical rectangles with readable labels.
+    # White bold text on a dark semi-transparent pill keeps the labels
+    # legible against the cyan-tinted zone fill (the old cyan-on-cyan
+    # had basically no contrast). Alternating top/bottom positions
+    # also prevents overlapping labels when contractions are close
+    # together in time.
     if d.vcp_zones:
-        for start_dt, end_dt, contraction in d.vcp_zones:
+        for i, (start_dt, end_dt, contraction) in enumerate(d.vcp_zones):
+            # Alternate label position to reduce stacking on overlapping zones
+            pos = "top left" if i % 2 == 0 else "bottom left"
             fig.add_vrect(
                 x0=start_dt, x1=end_dt,
                 fillcolor=PALETTE["accent_cyan"], opacity=0.10,
                 line_width=0,
                 annotation_text=f"VCP -{contraction:.1f}%",
-                annotation_position="top left",
-                annotation_font=dict(color=PALETTE["accent_cyan"], size=11),
+                annotation_position=pos,
+                annotation_font=dict(color="#FFFFFF", size=12, family="JetBrains Mono, monospace"),
+                annotation_bgcolor="rgba(15, 22, 32, 0.85)",
+                annotation_bordercolor=PALETTE["accent_cyan"],
+                annotation_borderwidth=1,
+                annotation_borderpad=3,
                 row=1, col=1,
             )
 
@@ -1567,6 +1581,7 @@ def _render_social_tab(d):
             ))
             fig.update_layout(
                 template="plotly_dark",
+                dragmode="pan",
                 plot_bgcolor=PALETTE["bg_main"],
                 paper_bgcolor=PALETTE["bg_main"],
                 font=dict(family="JetBrains Mono, monospace", color=primary, size=11),
