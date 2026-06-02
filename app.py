@@ -30,6 +30,7 @@ from ui.style import apply_theme, signal_banner, panel, pill, PALETTE
 from ui.deepdive_view import render_deep_dive
 from ui.excel_export import format_dataframe_to_excel
 from ui.quality_view import render_quality_page, render_quality_sidebar
+from ui.top_stocks_view import render_top_stocks_page, render_top_stocks_sidebar
 
 
 # ---------------------------------------------------------------------------
@@ -114,10 +115,14 @@ def _init_state():
     # Top-level MODE: 'longs' or 'shorts'. Determines which sidebar + which
     # default view is shown. Two big buttons at the top of every page switch
     # between them.
+    # Default mode + view = ⭐ TOP STOCKS (the new home page).
+    # Top Stocks is the intersection of the Long + Quality scans — only the
+    # very best stocks show up here. This is what the user sees when the
+    # app opens.
     if "mode" not in st.session_state:
-        st.session_state.mode = "longs"
+        st.session_state.mode = "top_stocks"
     if "view" not in st.session_state:
-        st.session_state.view = "dashboard"
+        st.session_state.view = "top_stocks"
     if "deep_dive_ticker" not in st.session_state:
         st.session_state.deep_dive_ticker = None
     if "settings" not in st.session_state:
@@ -150,14 +155,24 @@ def _render_mode_switcher():
     def _btn_type(mode_name: str) -> str:
         return "primary" if current == mode_name else "secondary"
 
-    # Display order: LONGS · QUALITY · SOCIAL · ROTATION · SHORTS · RESEARCH.
+    # Display order: TOP STOCKS · LONGS · QUALITY · SOCIAL · ROTATION · SHORTS · RESEARCH.
+    # TOP STOCKS is leftmost AND the default landing page — it's the
+    # intersection of the Long + Quality scans (only the very best stocks).
     # Internal mode key for the social mode stays "twitter" so existing
     # session state / snapshots keep working — only the LABEL is "SOCIAL".
-    col_long, col_quality, col_social, col_rotation, col_short, col_research, col_spacer = st.columns(
-        [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0]
+    (col_top, col_long, col_quality, col_social, col_rotation,
+     col_short, col_research, col_spacer) = st.columns(
+        [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0]
     )
+    with col_top:
+        if st.button("⭐ TOP STOCKS", type=_btn_type("top_stocks"),
+                     use_container_width=True, key="mode_btn_top_stocks"):
+            st.session_state.mode = "top_stocks"
+            st.session_state.view = "top_stocks"
+            st.session_state.research_ticker = None
+            st.rerun()
     with col_long:
-        if st.button("📈 LONGS", type=_btn_type("longs"),
+        if st.button("📈 MOMENTUM", type=_btn_type("longs"),
                      use_container_width=True, key="mode_btn_longs"):
             st.session_state.mode = "longs"
             st.session_state.view = "dashboard"
@@ -204,7 +219,8 @@ def _render_mode_switcher():
     cyan = PALETTE["accent_cyan"]
     muted = PALETTE["text_muted"]
     mode_pretty = {
-        "longs": "LONGS", "shorts": "SHORTS",
+        "top_stocks": "TOP STOCKS",
+        "longs": "MOMENTUM", "shorts": "SHORTS",
         "research": "RESEARCH", "twitter": "SOCIAL",
         "rotation": "ROTATION", "quality": "QUALITY",
     }.get(current, current.upper())
@@ -446,7 +462,7 @@ def _render_long_sidebar():
     st.markdown(
         f"<div style='font-family:JetBrains Mono;font-size:1.3rem;font-weight:700;color:{cyan};margin-bottom:0.5rem;line-height:1.2'>💰 LEGACY BRANDS</div>"
         f"<div style='font-family:JetBrains Mono;font-size:0.8rem;font-weight:700;color:{cyan};margin-bottom:0.5rem'>MONEY MAKING MACHINE</div>"
-        f"<div style='color:{muted};font-size:0.75rem;margin-bottom:1.25rem'>Long-side SEPA scanner</div>",
+        f"<div style='color:{muted};font-size:0.75rem;margin-bottom:1.25rem'>SEPA momentum scanner</div>",
         unsafe_allow_html=True,
     )
 
@@ -461,8 +477,8 @@ def _render_long_sidebar():
 
     # ---- Start Scan button ----
     st.markdown("<div style='margin-top:0.5rem'></div>", unsafe_allow_html=True)
-    if st.button("▶ Start Scan", type="primary", use_container_width=True,
-                 help="Run a full ~25-minute LONG scan against the S&P 500 + Nasdaq 100 + Russell 2000 + Russell 3000 universe"):
+    if st.button("▶ Run Scan", type="primary", use_container_width=True,
+                 help="Run a full ~25-minute MOMENTUM scan against the S&P 500 + Nasdaq 100 + Russell 2000 + Russell 3000 universe"):
         _trigger_rescan(settings, demo=False)
         st.rerun()
 
@@ -476,7 +492,7 @@ def _render_long_sidebar():
             excel_bytes = format_dataframe_to_excel(
                 filtered_df,
                 sheet_name="Candidates",
-                title=f"Legacy Brands - Long Candidates {stamp}",
+                title=f"Legacy Brands - Momentum Candidates {stamp}",
             )
             st.download_button(
                 label="📥 Download Excel",
@@ -502,18 +518,17 @@ def _render_long_sidebar():
             type="primary",
         )
 
-        if st.button("⭐ Top Stocks", type="primary", use_container_width=True,
-                     help="My top 10 picks from this scan, scored by Minervini/O'Neil criteria"):
-            st.session_state.view = "top_stocks"
-            st.rerun()
+        # Note: the old "⭐ Top Stocks" button used to live here. It now
+        # lives as the leftmost top-level mode button and is the app's
+        # default home page — see ui/top_stocks_view.py.
 
         if st.button("📖 Table of Contents", type="primary", use_container_width=True,
-                     help="Definitions for every long-scan column and signal/warning tag"):
+                     help="Definitions for every momentum-scan column and signal/warning tag"):
             _show_toc_dialog()
 
         st.caption(f"Exports include the {len(filtered_df)} rows currently visible (after filters).")
     else:
-        st.caption("Run a scan to enable exports + Top Stocks.")
+        st.caption("Run a scan to enable exports.")
 
     st.markdown("---")
 
@@ -587,7 +602,7 @@ def _render_short_sidebar():
 
     # ---- Start Scan (shorts) ----
     short_settings: ShortScanSettings = st.session_state.short_settings
-    if st.button("▶ Start Scan", type="primary", use_container_width=True,
+    if st.button("▶ Run Scan", type="primary", use_container_width=True,
                  help="Run a full ~25-minute SHORT scan finding overbought stocks likely to pull back over 1-3 weeks"):
         _trigger_short_rescan(short_settings)
         st.session_state.view = "short_candidates"
@@ -658,7 +673,7 @@ def _render_twitter_sidebar():
 
     # ---- Refresh button (primary action) ----
     social_settings: SocialScanSettings = st.session_state.social_settings
-    if st.button("🔄 Refresh", type="primary", use_container_width=True,
+    if st.button("▶ Run Scan", type="primary", use_container_width=True,
                  help="Fetch the current top-100 trending tickers from Apewisdom, "
                       "apply price/volume guardrails, enrich with technicals + fundamentals, "
                       "save a snapshot. Takes ~30-60 seconds with warm caches."):
@@ -733,8 +748,27 @@ def _render_twitter_sidebar():
 def _render_sidebar():
     """Dispatch to the correct mode-specific sidebar."""
     mode = st.session_state.get("mode", "longs")
+    view = st.session_state.get("view", "dashboard")
     with st.sidebar:
-        if mode == "shorts":
+        # Universal "Return to Home" — shown everywhere except the TOP STOCKS
+        # page (which IS home). Routes back to the Top Stocks intersection
+        # page (the app's new default landing page).
+        is_home = (mode == "top_stocks" and view == "top_stocks")
+        if not is_home:
+            if st.button("← Return to Home",
+                         key="universal_home_btn",
+                         type="primary",
+                         use_container_width=True):
+                st.session_state.mode = "top_stocks"
+                st.session_state.view = "top_stocks"
+                st.session_state.deep_dive_ticker = None
+                st.session_state.deep_dive_origin = None
+                st.rerun()
+            st.markdown("---")
+
+        if mode == "top_stocks":
+            render_top_stocks_sidebar()
+        elif mode == "shorts":
             _render_short_sidebar()
         elif mode == "research":
             _render_research_sidebar()
@@ -1523,419 +1557,37 @@ def render_deep_dive_page():
     _render_mode_switcher()
     ticker = st.session_state.deep_dive_ticker
 
-    # Back-to-scan goes to the right home page based on the active mode
-    _origin = st.session_state.get("deep_dive_origin")
-    _mode_now = st.session_state.get("mode")
-    if _origin == "quality" or _mode_now == "quality":
-        home_view = "quality"
-    elif _mode_now == "shorts":
-        home_view = "short_candidates"
-    else:
-        home_view = "dashboard"
-
-    col1, col2 = st.columns([1, 8])
-    with col1:
-        if st.button("← Back to scan", type="primary", use_container_width=True):
-            st.session_state.view = home_view
-            st.session_state.deep_dive_ticker = None
-            st.rerun()
-    with col2:
-        st.markdown(
-            f"<div style='font-family:JetBrains Mono;font-size:0.85rem;color:{PALETTE['text_muted']};padding-top:0.5rem'>"
-            f"DEEP DIVE  /  {ticker}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        f"<div style='font-family:JetBrains Mono;font-size:0.85rem;color:{PALETTE['text_muted']};padding-top:0.5rem'>"
+        f"DEEP DIVE  /  {ticker}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     settings: ScanSettings = st.session_state.settings
     render_deep_dive(ticker, settings.account_size, settings.risk_per_trade)
 
 
 # ---------------------------------------------------------------------------
-# Top Stocks view
+# Top Stocks view — RETIRED
 # ---------------------------------------------------------------------------
-
-def _score_candidate(c: dict) -> tuple:
-    """Composite Minervini/O'Neil score for one candidate.
-
-    Returns (score 0-100, list of (label, points) reasons, list of caveats).
-    Each reason carries its own point contribution so the explanation text
-    can show exactly where the points came from. Score is the raw sum
-    clamped 0-100; the raw can exceed 100 for a perfect setup.
-
-    Weight allocation (max points per component before 0-100 cap):
-        RS                       22  (steeper top-decile reward)
-        Distance to pivot         5  (was 15 -- user uses price alerts for
-                                      triggers; this is a "what to research"
-                                      list, not a "buy today" list)
-        Risk %                   15  (smooth)
-        VCP quality              12
-        Breakout today           10  (volume-weighted)
-        Power Play               10
-        RS line at new high       7
-        Industry rank            10  (O\'Neil priority)
-        Fundamentals             14  (was 8 -- half of CAN SLIM; heavy bump
-                                      to reward durable growth over tactical
-                                      proximity)
-        Institutional ownership   6  (was 3 -- the "I" of CAN SLIM)
-        PEG ratio                 4  (was 3 -- valuation sanity check)
-        Tier alignment bonus      8  (A=8 B=4 C=0; keeps composite consistent
-                                      with the A/B/C tier classifier)
-        Total possible raw      123  (clipped to 100 after summation;
-                                      real-world maxes around 85-95)
-
-    Penalties subtract from the score and also generate caveats:
-        EXT (>20% above 50MA)    -8
-        ER imminent             -12
-        SQUAT (bearish reversal) -5
-        Light avg volume         -5  (new -- <500K daily shares)
-        PEG > 3                  -3  (new -- priced for perfection)
-    """
-    score = 0
-    reasons: list = []  # list of (label, points) tuples
-    caveats: list = []
-
-    def _add(label: str, pts: int):
-        nonlocal score
-        if pts > 0:
-            score += pts
-            reasons.append((label, pts))
-
-    # --- RS (max 22, steeper top-decile reward) ---
-    rs = c.get("RS", 0) or 0
-    if rs >= 99:
-        _add(f"top of universe RS ({rs})", 22)
-    elif rs >= 95:
-        _add(f"top-decile RS ({rs})", 18)
-    elif rs >= 90:
-        _add(f"strong RS ({rs})", 13)
-    elif rs >= 85:
-        _add(f"qualifying RS ({rs})", 8)
-    elif rs > 0:
-        score += 3
-        reasons.append((f"RS {rs} (below 85)", 3))
-
-    # --- Distance to pivot (max 5, tight bonus only) ---
-    # User uses price alerts for triggers; this is a "what to research" list,
-    # not a "buy today" list. Stocks 5-10%+ from pivot can fire in a single
-    # day and shouldn\'t be deprioritised just because they haven\'t broken
-    # out yet. So we only give a small bonus for genuinely tight setups,
-    # and no caveat for being further away.
-    price = c.get("Price", 0) or 0
-    buy = c.get("Buy_Trigger", 0) or 0
-    if price > 0 and buy > 0:
-        gap_pct = abs(buy - price) / price * 100
-        if gap_pct <= 1.5:
-            _add(f"tight setup ({gap_pct:.1f}% from pivot)", 5)
-        elif gap_pct <= 4:
-            _add(f"near pivot ({gap_pct:.1f}% away)", 3)
-        # gap > 4% — no bonus, no caveat. User\'s alerts handle the trigger.
-
-    # --- Risk % (max 15, smooth) ---
-    risk = c.get("Risk_Pct", 0) or 0
-    if risk > 0:
-        # 1.5% or tighter = full 15 pts; each 1pp wider costs ~2.5 pts
-        risk_pts = max(0, round(15 - max(0, risk - 1.5) * 2.5))
-        if risk_pts > 0:
-            if risk <= 3:
-                label = f"very low risk ({risk:.1f}%)"
-            elif risk <= 5:
-                label = f"low risk ({risk:.1f}%)"
-            else:
-                label = f"acceptable risk ({risk:.1f}%)"
-            _add(label, risk_pts)
-        if risk > 8:
-            caveats.append(f"wide stop ({risk:.1f}%)")
-
-    # --- VCP quality (max 12) ---
-    vcp = c.get("VCP_Quality") or "None"
-    if vcp == "A":
-        _add("VCP grade A (clean contractions)", 12)
-    elif vcp == "B":
-        _add("VCP grade B", 8)
-    elif vcp == "C":
-        _add("VCP grade C", 4)
-
-    # --- Breakout today (max 10, VOLUME-WEIGHTED) ---
-    if c.get("Breakout_Today"):
-        vol_ratio = c.get("Vol_vs_Avg", 0) or 0
-        # vol=1.0 -> 0pts, vol=1.5 -> 5pts, vol=2.0+ -> 10pts
-        bo_pts = max(0, min(10, round((vol_ratio - 1.0) * 10)))
-        if bo_pts > 0:
-            _add(f"breakout on {vol_ratio:.1f}x volume", bo_pts)
-        else:
-            caveats.append(f"breakout on weak volume ({vol_ratio:.1f}x)")
-
-    # --- Power Play (max 10) ---
-    if c.get("Power_Play"):
-        _add("Power Play setup (+100% in 8wk + consolidating)", 10)
-
-    # --- RS line at new high (max 7) ---
-    if c.get("RS_NH") == "YES":
-        _add("RS line at new 50-day high", 7)
-
-    # --- Industry rank (max 10) ---
-    ind_rank = c.get("Industry_Rank")
-    if ind_rank is not None and ind_rank > 0:
-        if ind_rank <= 5:
-            _add(f"#{ind_rank} industry group", 10)
-        elif ind_rank <= 15:
-            _add(f"top-15 industry group (#{ind_rank})", 6)
-        elif ind_rank <= 30:
-            _add(f"top-30 industry group (#{ind_rank})", 3)
-
-    # --- Fundamentals (max 14 — half of CAN SLIM, deserves heavy weight) ---
-    fund = c.get("Fundamentals", "") or ""
-    if "EPS++" in fund:
-        _add("accelerating EPS growth (EPS++)", 14)
-    elif "EPS+" in fund and "Sale+" in fund:
-        _add("EPS + revenue growth", 10)
-    elif "EPS+" in fund or "Sale+" in fund:
-        _add("partial fundamentals (EPS+ or Sale+)", 5)
-
-    # --- Institutional ownership (max 6 — the "I" in CAN SLIM) ---
-    inst = c.get("Held_Pct_Inst")
-    if inst is not None and inst > 0:
-        if inst >= 60:
-            _add(f"strong institutional ownership ({inst:.0f}%)", 6)
-        elif inst >= 40:
-            _add(f"healthy institutional ownership ({inst:.0f}%)", 4)
-        elif inst >= 20:
-            _add(f"some institutional ownership ({inst:.0f}%)", 2)
-
-    # --- PEG ratio (max 4 / min -3) ---
-    peg = c.get("PEG")
-    if peg is not None and peg > 0:
-        if peg <= 1.5:
-            _add(f"PEG {peg:.2f} (growth at fair price)", 4)
-        elif peg <= 2.0:
-            _add(f"PEG {peg:.2f} (reasonable)", 2)
-        elif peg > 3.0:
-            score -= 3
-            caveats.append(f"PEG {peg:.2f} (priced for perfection)")
-
-    # --- Tier alignment bonus (max 8) ---
-    # Keeps the composite score in lockstep with the A/B/C tier classifier
-    # so the two never disagree about which candidates are best. If the
-    # caller hasn\'t pre-computed Tier on the candidate dict (the Top Picks
-    # page passes raw candidates straight from the scan), we classify here
-    # so the bonus fires consistently.
-    tier = c.get("Tier")
-    if tier is None:
-        try:
-            tier = _classify_tier(c)
-        except Exception:
-            tier = None
-    if tier == "A":
-        _add("A-Tier (Trade Now)", 8)
-    elif tier == "B":
-        _add("B-Tier (Watch List)", 4)
-
-    # --- Penalties ---
-    warnings_list = c.get("Warnings", []) or []
-    if isinstance(warnings_list, list):
-        for w in warnings_list:
-            if w == "EXT":
-                score -= 8
-                caveats.append("extended >20% above 50MA (chase risk)")
-            elif isinstance(w, str) and w.startswith("ER"):
-                score -= 12
-                caveats.append(f"earnings imminent ({w})")
-            elif w == "WIDE":
-                # already counted in Risk % section
-                pass
-            elif w == "SQUAT":
-                score -= 5
-                caveats.append("bearish reversal candle today")
-
-    # Light average volume penalty (illiquid = bad fills + wide spreads)
-    avg_vol = c.get("Avg_Volume")
-    if avg_vol is not None and avg_vol > 0 and avg_vol < 500_000:
-        score -= 5
-        caveats.append(f"light avg volume ({int(avg_vol/1000)}K/day)")
-
-    score = max(0, min(100, score))
-    return score, reasons, caveats
-
-
-def _build_explanation(score: int, reasons, caveats: list) -> str:
-    """Human-readable explanation showing where points came from.
-
-    Reasons is a list of (label, points) tuples -- we render each as
-    "label (+N)" so the user can see exactly which components drove the
-    composite. Caveats stay as plain strings.
-    """
-    if not reasons and not caveats:
-        return "Composite score based on weak partial criteria."
-    parts = []
-    if reasons:
-        joined = ", ".join(f"{label} (+{pts})" for label, pts in reasons)
-        parts.append(f"Strong because: {joined}.")
-    if caveats:
-        joined = ", ".join(caveats)
-        parts.append(f"Caveats: {joined}.")
-    parts.append(f"Composite score: {score}/100.")
-    return " ".join(parts)
-
-
-def render_top_stocks_page():
-    _render_mode_switcher()
-    col1, col2 = st.columns([1, 8])
-    with col1:
-        if st.button("← Back to scan", type="primary", use_container_width=True):
-            st.session_state.view = "dashboard"
-            st.rerun()
-    with col2:
-        st.markdown(
-            f"<div style='font-family:JetBrains Mono;font-size:0.85rem;color:{PALETTE['text_muted']};padding-top:0.5rem'>"
-            "TOP STOCKS  /  Composite SEPA score"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<h2 style='margin-top:1rem'>⭐ Top 10 Picks</h2>", unsafe_allow_html=True)
-    st.markdown(
-        f"<div style='color:{PALETTE['text_muted']};font-size:0.9rem;line-height:1.5;margin-bottom:1rem'>"
-        "Top 10 candidates from this scan ranked by composite SEPA score (0-100). "
-        "Score blends RS strength, distance to pivot, risk %, VCP quality, breakout-on-volume, "
-        "Power Play setup, RS-line new high, industry group rank, fundamentals, institutional "
-        "ownership, PEG, and an A/B-tier bonus. Penalties for extended, earnings-imminent, "
-        "wide stops, light volume, or expensive PEG. Use this list to decide which charts to "
-        "load and review for possible additions to your portfolio."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    scan = st.session_state.latest_scan or {}
-    candidates = scan.get("candidates", [])
-    if not candidates:
-        st.info("No scan results yet. Run a scan first.")
-        return
-
-    scored = []
-    for c in candidates:
-        s, reasons, caveats = _score_candidate(c)
-        scored.append({"candidate": c, "score": s, "reasons": reasons, "caveats": caveats})
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    # Always show top 10 by score. Floor at 30 so we do not serve up
-    # genuinely bad setups when the market has nothing.
-    qualified = [s for s in scored if s["score"] >= 30][:10]
-
-    if not qualified:
-        st.warning(
-            "No candidates scored >= 30/100 in this scan. The market is not offering "
-            "anything worth focusing on right now. Don't force trades."
-        )
-        if scored:
-            top = scored[0]
-            st.markdown(
-                f"<div style='color:{PALETTE['text_muted']};font-size:0.85rem;margin-top:1rem'>"
-                f"Highest score in this scan: {top['score']}/100 ({top['candidate']['Ticker']})."
-                "</div>",
-                unsafe_allow_html=True,
-            )
-        return
-
-    cyan = PALETTE["accent_cyan"]
-    muted = PALETTE["text_muted"]
-    primary = PALETTE["text_primary"]
-    up = PALETTE["up_green"]
-    down = PALETTE["down_red"]
-    yellow = PALETTE["signal_yellow"]
-
-    for rank, item in enumerate(qualified, start=1):
-        c = item["candidate"]
-        s = item["score"]
-        reasons = item["reasons"]
-        caveats = item["caveats"]
-
-        # Score color
-        score_color = up if s >= 80 else (cyan if s >= 70 else (yellow if s >= 55 else muted))
-
-        # Build per-line breakdown HTML: one criterion per line, each with
-        # its +N points in green, followed by red caveats marked with a ⚠.
-        breakdown_rows = []
-        for label, pts in reasons:
-            row = (
-                f"<div style='display:flex;gap:0.65rem;align-items:baseline;line-height:1.45'>"
-                f"<div style='min-width:2.6rem;text-align:right;font-family:JetBrains Mono;"
-                f"font-size:0.85rem;font-weight:700;color:{up}'>+{pts}</div>"
-                f"<div style='font-family:Inter;font-size:0.85rem;color:{primary}'>{label}</div>"
-                f"</div>"
-            )
-            breakdown_rows.append(row)
-        for cv in caveats:
-            row = (
-                f"<div style='display:flex;gap:0.65rem;align-items:baseline;line-height:1.45'>"
-                f"<div style='min-width:2.6rem;text-align:right;font-family:JetBrains Mono;"
-                f"font-size:0.85rem;font-weight:700;color:{down}'>⚠</div>"
-                f"<div style='font-family:Inter;font-size:0.85rem;color:{down}'>{cv}</div>"
-                f"</div>"
-            )
-            breakdown_rows.append(row)
-        breakdown_html = "".join(breakdown_rows) if breakdown_rows else (
-            f"<div style='color:{muted};font-size:0.85rem'>No qualifying criteria.</div>"
-        )
-
-        # Pin the ticker/sector column to a fixed 200px width so longer
-        # sector strings (e.g. "Semiconductor Equipment & Materials") don't
-        # push the breakdown column further right than for shorter sectors.
-        ticker = c.get("Ticker", "")
-        sector = c.get("Sector", "")
-        industry = c.get("Industry", "")
-        price = c.get("Price", "--")
-        buy_trigger = c.get("Buy_Trigger", "--")
-        stop = c.get("Stop", "--")
-        risk_pct = c.get("Risk_Pct", "--")
-        rs_val = c.get("RS", "--")
-
-        body = (
-            f"<div style='display:grid;grid-template-columns:200px 1fr auto;"
-            f"gap:1.25rem;align-items:start'>"
-            f"<div>"
-            f"<div style='font-family:JetBrains Mono;font-size:1.5rem;font-weight:700;"
-            f"color:{cyan}'>{ticker}</div>"
-            f"<div style='font-size:0.72rem;color:{muted};line-height:1.35;margin-top:0.15rem;"
-            f"word-wrap:break-word'>{sector} • {industry}</div>"
-            f"</div>"
-            f"<div>{breakdown_html}"
-            f"<div style='margin-top:0.4rem;font-family:JetBrains Mono;font-size:0.8rem;"
-            f"color:{muted}'>Composite score: <b style='color:{score_color}'>{s}/100</b></div>"
-            f"</div>"
-            f"<div style='text-align:right'>"
-            f"<div style='font-family:JetBrains Mono;font-size:1.8rem;font-weight:700;"
-            f"color:{score_color}'>{s}</div>"
-            f"<div style='font-size:0.7rem;color:{muted}'>SCORE</div>"
-            f"</div>"
-            f"</div>"
-            f"<div style='display:flex;gap:1.5rem;margin-top:0.75rem;font-family:JetBrains Mono;"
-            f"font-size:0.8rem;color:{muted}'>"
-            f"<div>Price: <b style='color:{primary}'>${price}</b></div>"
-            f"<div>Buy: <b style='color:{up}'>${buy_trigger}</b></div>"
-            f"<div>Stop: <b style='color:{down}'>${stop}</b></div>"
-            f"<div>Risk: <b style='color:{primary}'>{risk_pct}%</b></div>"
-            f"<div>RS: <b style='color:{cyan}'>{rs_val}</b></div>"
-            f"</div>"
-        )
-        st.markdown(panel(f"PICK #{rank}", body), unsafe_allow_html=True)
+# The old composite-scoring Top Stocks page (and its _score_candidate helper)
+# was retired when Top Stocks was redesigned as the intersection of the
+# Long + Quality scans. The new page lives in ui/top_stocks_view.py and is
+# imported at the top of this file. See scanner/top_stocks.py for the data
+# layer.
 
 
 def render_diagnose_page():
     _render_mode_switcher()
     ticker = st.session_state.get("diagnose_ticker", "")
 
-    col1, col2 = st.columns([1, 8])
-    with col1:
-        if st.button("← Back to scan", type="primary", use_container_width=True):
-            st.session_state.view = "dashboard"
-            st.rerun()
-    with col2:
-        st.markdown(
-            f"<div style='font-family:JetBrains Mono;font-size:0.85rem;color:{PALETTE['text_muted']};padding-top:0.5rem'>"
-            f"DIAGNOSE  /  {ticker}"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        f"<div style='font-family:JetBrains Mono;font-size:0.85rem;color:{PALETTE['text_muted']};padding-top:0.5rem'>"
+        f"DIAGNOSE  /  {ticker}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
     st.markdown(f"<h2>🔍 Diagnostic for {ticker}</h2>", unsafe_allow_html=True)
     st.caption("Why did (or didn\'t) this ticker pass the SEPA scan?")
@@ -2453,7 +2105,7 @@ def _social_candidates_dataframe(candidates: list) -> "pd.DataFrame":
 
 def render_twitter_page():
     """Social momentum dashboard — Apewisdom-sourced trending tickers,
-    enriched with the same technical/fundamental data as the long scan.
+    enriched with the same technical/fundamental data as the momentum scan.
     Click any row to deep-dive (includes the new SOCIAL tab in Phase 4)."""
     _render_mode_switcher()
 
@@ -2466,7 +2118,7 @@ def render_twitter_page():
         f"<div style='color:{muted};font-size:0.9rem;line-height:1.5;margin-bottom:1rem'>"
         "Top trending tickers from Apewisdom (Reddit + Twitter sources), cross-referenced "
         "with your tradeable universe (price ≥ $2.50, US-listed, avg vol ≥ 100K). "
-        "Each row carries the same technical + fundamental enrichment as the longs scan, so you "
+        "Each row carries the same technical + fundamental enrichment as the momentum scan, so you "
         "can filter spikes down to tradeable setups before loading any chart."
         "</div>",
         unsafe_allow_html=True,
@@ -2585,7 +2237,7 @@ def render_twitter_page():
             help="Climb in social rank vs yesterday (positive = climbing)"),
         "Price": st.column_config.NumberColumn("PRICE", format="$%.2f", width="small"),
         "RS": st.column_config.NumberColumn("RS", format="%d", width="small",
-            help="Universe-relative RS rating (0-99) from latest long scan. Empty = no long scan available or ticker not in long scan."),
+            help="Universe-relative RS rating (0-99) from latest momentum scan. Empty = no momentum scan available or ticker not in momentum scan."),
         "RSI": st.column_config.NumberColumn("RSI", format="%.0f", width="small",
             help="14-period RSI; >70 overbought, <30 oversold"),
         "Pct_Above_50MA": st.column_config.NumberColumn("% > 50MA", format="%.1f%%", width="small",
@@ -2659,11 +2311,11 @@ def _render_rotation_sidebar():
     )
 
     # ---- Refresh: re-reads latest cached long scan + rebuilds table ----
-    if st.button("🔄 Refresh", type="primary", use_container_width=True,
+    if st.button("▶ Run Scan", type="primary", use_container_width=True,
                  key="rotation_refresh",
-                 help="Re-read the latest cached long scan from disk and "
+                 help="Re-read the latest cached momentum scan from disk and "
                       "rebuild the rotation table. Useful after running a "
-                      "new long scan elsewhere."):
+                      "new momentum scan elsewhere."):
         # Reload the latest scan into session state, then rerun
         st.session_state.latest_scan = load_latest_scan()
         st.rerun()
@@ -2844,8 +2496,8 @@ def render_rotation_page():
     scan = st.session_state.latest_scan or {}
     if not scan or not scan.get("candidates"):
         st.warning(
-            "No long scan loaded — rotation analysis needs a recent scan to anchor on. "
-            "Switch to LONGS mode and click Start Scan first, then come back."
+            "No momentum scan loaded — rotation analysis needs a recent scan to anchor on. "
+            "Switch to MOMENTUM mode and click Run Scan first, then come back."
         )
         return
 
@@ -3111,10 +2763,13 @@ view = st.session_state.view
 mode = st.session_state.get("mode", "longs")
 
 # Mode-aware view defaults
-if mode == "shorts" and view == "dashboard":
+if mode == "top_stocks" and view not in ("top_stocks", "deepdive"):
+    view = "top_stocks"
+    st.session_state.view = view
+elif mode == "shorts" and view == "dashboard":
     view = "short_candidates"
     st.session_state.view = view
-elif mode == "longs" and view == "short_candidates":
+elif mode == "longs" and view in ("short_candidates", "top_stocks"):
     view = "dashboard"
     st.session_state.view = view
 elif mode == "research" and view not in ("research", "deepdive"):
@@ -3132,6 +2787,9 @@ elif mode == "quality" and view not in ("quality", "deepdive"):
 
 if view == "deepdive" and st.session_state.deep_dive_ticker:
     render_deep_dive_page()
+elif view == "top_stocks":
+    _render_mode_switcher()
+    render_top_stocks_page()
 elif view == "research":
     render_research_page()
 elif view == "twitter":
@@ -3141,8 +2799,6 @@ elif view == "rotation":
 elif view == "quality":
     _render_mode_switcher()
     render_quality_page()
-elif view == "top_stocks":
-    render_top_stocks_page()
 elif view == "diagnose":
     render_diagnose_page()
 elif view == "short_candidates":

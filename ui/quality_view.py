@@ -466,16 +466,8 @@ def render_quality_sidebar():
     latest = load_latest_quality_scan()
 
     # ---- Scan trigger ----
-    label = "▶ Start Quality Scan" if latest is None else "🔄 Refresh Quality Scan"
-    if st.button(label, key="quality_start_btn", type="primary", use_container_width=True):
+    if st.button("▶ Run Scan", key="quality_start_btn", type="primary", use_container_width=True):
         _run_quality_scan_with_progress()
-        st.rerun()
-
-    # ---- Back to Long Scan ----
-    if st.button("← Back to Scan", key="quality_back_btn", type="primary", use_container_width=True,
-                 help="Return to the Long scanner dashboard"):
-        st.session_state.mode = "longs"
-        st.session_state.view = "dashboard"
         st.rerun()
 
     # ---- Download buttons (only when we have data) ----
@@ -624,7 +616,7 @@ def render_quality_page():
     latest = load_latest_quality_scan()
     if latest is None:
         st.info(
-            "No Quality scan has been run yet. Use the **▶ Start Quality Scan** "
+            "No Quality scan has been run yet. Use the **▶ Run Scan** "
             "button in the sidebar to populate this page. First scan takes ~15-25 "
             "minutes (full universe fundamentals + price calcs)."
         )
@@ -635,7 +627,7 @@ def render_quality_page():
         st.warning(
             "Latest Quality scan returned 0 stocks. This usually means yfinance "
             "rate-limited or your local price cache is empty. Try refreshing — "
-            "and make sure you've run at least one Long scan first to populate "
+            "and make sure you've run at least one Momentum scan first to populate "
             "the price cache."
         )
         return
