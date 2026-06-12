@@ -122,55 +122,93 @@ def detect_vcp_contractions(df: pd.DataFrame, lookback: int = 80) -> list[dict]:
                 continue
             depth = (peak_price - price) / peak_price * 100
             length = (dt - peak_dt).days if hasattr(dt - peak_dt, "days") else 0
+            # Average volume in a 5-bar window centered on the trough.
+            # Used by vcp_quality_score for the volume-drying-up check.
+            # Falls back to None if Volume column or lookup fails (graceful).
+            trough_volume = None
+            if "Volume" in df.columns:
+                try:
+                    pos = df.index.get_loc(dt)
+                    if isinstance(pos, slice):
+                        pos = pos.start
+                    lo = max(0, pos - 2)
+                    hi = min(len(df), pos + 3)
+                    vol_slice = df["Volume"].iloc[lo:hi]
+                    if len(vol_slice) > 0:
+                        trough_volume = float(vol_slice.mean())
+                except Exception:
+                    trough_volume = None
+
             contractions.append({
-                "peak_date":   peak_dt,
-                "peak_price":  round(peak_price, 2),
-                "trough_date": dt,
-                "trough_price": round(price, 2),
-                "depth_pct":   round(depth, 2),
-                "length_bars": length,
+                "peak_date":     peak_dt,
+                "peak_price":    round(peak_price, 2),
+                "trough_date":   dt,
+                "trough_price":  round(price, 2),
+                "depth_pct":     round(depth, 2),
+                "length_bars":   length,
+                "trough_volume": trough_volume,
             })
             current_peak = None
 
     return contractions
 
 
+def _filter_to_single_base(contractions: list[dict],
+                            peak_tolerance_pct: float = 5.0) -> list[dict]:
+    """Restrict contractions to those whose peak is near the highest peak.
+
+    A real Minervini VCP is one tightening structure UNDER a recent resistance
+    level — not random pullbacks scattered across the lookback window. Each
+    contraction's peak should retest near the same prior high (the level the
+    breakout would clear).
+    """
+    if not contractions:
+        return contractions
+    base_high = max(c["peak_price"] for c in contractions)
+    threshold = base_high * (1.0 - peak_tolerance_pct / 100.0)
+    return [c for c in contractions if c["peak_price"] >= threshold]
+
+
 def vcp_quality_score(contractions: list[dict]) -> dict:
     """Summarize VCP quality from a list of contractions.
 
-    Returns:
-        {
-            count: int,                    # number of contractions
-            depths: list[float],           # depth % of each
-            decreasing: bool,              # True if each subsequent depth is smaller
-            current_depth: float | None,   # most recent contraction depth
-            quality: 'A' | 'B' | 'C' | 'None'
-        }
-
-    Quality grading:
-      A: 3+ contractions, monotonically decreasing, current depth < 10%
-      B: 2+ contractions, current depth < 15%
+    Grading rules (tightened 2026-06-06+ after SKYT-class false positives):
+      A: 3+ contractions in a single base, MEANINGFULLY contracting
+         (each <= 75% of prior), current depth < 6%, volume drying up
+      B: 2+ contractions, current depth < 10%
       C: 1+ contraction, any depth
-      None: no contractions detected
     """
     if not contractions:
         return {"count": 0, "depths": [], "decreasing": False,
-                "current_depth": None, "quality": "None"}
+                "volume_drying": False, "current_depth": None, "quality": "None"}
 
-    # Only count meaningful contractions (>= 4% depth) — ignore noise
     real = [c for c in contractions if c["depth_pct"] >= 4.0]
+    real = _filter_to_single_base(real, peak_tolerance_pct=5.0)
     depths = [c["depth_pct"] for c in real]
 
     if not real:
         return {"count": 0, "depths": [], "decreasing": False,
-                "current_depth": None, "quality": "None"}
+                "volume_drying": False, "current_depth": None, "quality": "None"}
 
-    decreasing = all(depths[i] > depths[i + 1] for i in range(len(depths) - 1))
+    meaningfully_contracting = all(
+        depths[i + 1] <= depths[i] * 0.75
+        for i in range(len(depths) - 1)
+    )
     current_depth = depths[-1]
 
-    if len(real) >= 3 and decreasing and current_depth < 10:
+    trough_vols = [c.get("trough_volume") for c in real]
+    if all(v is not None for v in trough_vols) and len(trough_vols) >= 2:
+        volume_drying = all(
+            trough_vols[i + 1] <= trough_vols[i] * 1.10
+            for i in range(len(trough_vols) - 1)
+        )
+    else:
+        volume_drying = True  # graceful: missing data doesn't penalize
+
+    if (len(real) >= 3 and meaningfully_contracting
+            and current_depth < 6 and volume_drying):
         quality = "A"
-    elif len(real) >= 2 and current_depth < 15:
+    elif len(real) >= 2 and current_depth < 10:
         quality = "B"
     elif len(real) >= 1:
         quality = "C"
@@ -180,7 +218,8 @@ def vcp_quality_score(contractions: list[dict]) -> dict:
     return {
         "count": len(real),
         "depths": depths,
-        "decreasing": decreasing,
+        "decreasing": meaningfully_contracting,
+        "volume_drying": volume_drying,
         "current_depth": round(current_depth, 2),
         "quality": quality,
     }

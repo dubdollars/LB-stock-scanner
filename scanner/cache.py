@@ -9,6 +9,7 @@ Saves each scan as a timestamped JSON file under data/scans/, plus a
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,23 @@ def _ensure_dir() -> None:
     SCANS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically — never leaves a partial file.
+
+    Writes to a temp file in the same directory, then os.replace() swaps
+    it in. os.replace() is atomic on both Windows and POSIX when source
+    and destination are on the same filesystem.
+
+    Without this, an interrupted Streamlit rerun can leave latest.json
+    half-written and the next scan load fails with JSONDecodeError. We
+    saw this repeatedly during dev (user-reported 2026-06-06: blank
+    Top Stocks page caused by truncated latest.json + latest_quality.json).
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _serialize(result: ScanResult) -> dict:
     if is_dataclass(result):
         return asdict(result)
@@ -34,16 +52,19 @@ def _serialize(result: ScanResult) -> dict:
 
 
 def save_scan(result: ScanResult) -> Path:
-    """Save scan to data/scans/scan_YYYYMMDD_HHMMSS.json + latest.json."""
+    """Save scan to data/scans/scan_YYYYMMDD_HHMMSS.json + latest.json.
+
+    Both writes go through _atomic_write_text() so a crash mid-write
+    leaves the prior file intact rather than truncated.
+    """
     _ensure_dir()
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     out_path = SCANS_DIR / f"scan_{stamp}.json"
     payload = _serialize(result)
+    body = json.dumps(payload, indent=2, default=str)
 
-    out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    LATEST_FILE.write_text(
-        json.dumps(payload, indent=2, default=str), encoding="utf-8"
-    )
+    _atomic_write_text(out_path, body)
+    _atomic_write_text(LATEST_FILE, body)
     _prune_old()
     return out_path
 
@@ -100,16 +121,18 @@ def _prune_old() -> None:
 
 def save_short_scan(result) -> Path:
     """Save short-scan result to data/scans/scan_short_YYYYMMDD_HHMMSS.json
-    + latest_short.json. Doesn't collide with long-scan cache."""
+    + latest_short.json. Doesn't collide with long-scan cache.
+
+    Atomic writes prevent half-written files (see _atomic_write_text docstring).
+    """
     _ensure_dir()
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     out_path = SCANS_DIR / f"scan_short_{stamp}.json"
     payload = _serialize(result)
+    body = json.dumps(payload, indent=2, default=str)
 
-    out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    LATEST_SHORT_FILE.write_text(
-        json.dumps(payload, indent=2, default=str), encoding="utf-8"
-    )
+    _atomic_write_text(out_path, body)
+    _atomic_write_text(LATEST_SHORT_FILE, body)
     _prune_old_short()
     return out_path
 

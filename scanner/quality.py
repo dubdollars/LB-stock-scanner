@@ -658,18 +658,28 @@ def run_quality_scan(
         diagnostics=diagnostics,
     )
 
-    # ---- 8. Persist ----
+    # ---- 8. Persist (atomic writes — see _atomic_write_text in scanner/cache.py) ----
+    # An interrupted write previously left latest_quality.json half-written,
+    # which made every subsequent load fail with JSONDecodeError until we
+    # restored from a timestamped sibling. Atomic writes prevent that:
+    # write to .tmp, then os.replace() swaps in (atomic on Windows + POSIX).
     try:
+        import os as _os
         _ensure_dirs()
+        body = json.dumps(asdict(result), indent=2, default=str)
         stamp = result.timestamp.replace(":", "").replace("-", "").replace("T", "_")
         stamp = stamp.split("+")[0].rstrip("Z")
+
         fname = QUALITY_SCANS_DIR / f"scan_quality_{stamp}.json"
-        with fname.open("w", encoding="utf-8") as f:
-            json.dump(asdict(result), f, indent=2, default=str)
+        tmp_fname = fname.with_suffix(".json.tmp")
+        tmp_fname.write_text(body, encoding="utf-8")
+        _os.replace(tmp_fname, fname)
+
         # Also write latest_quality.json for the UI to load quickly
         latest = QUALITY_SCANS_DIR / "latest_quality.json"
-        with latest.open("w", encoding="utf-8") as f:
-            json.dump(asdict(result), f, indent=2, default=str)
+        tmp_latest = latest.with_suffix(".json.tmp")
+        tmp_latest.write_text(body, encoding="utf-8")
+        _os.replace(tmp_latest, latest)
     except Exception:
         pass
 

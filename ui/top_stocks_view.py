@@ -119,6 +119,19 @@ _TS_SLIDER_DOCS = {
         "- 75 = conservative (excludes more)\n"
         "- 70 = very conservative (Wilder's classic overbought line)"
     ),
+    "MAX INDUSTRY RANK": (
+        "**Hide stocks whose industry group ranks worse than this number.**\n\n"
+        "Industry_Rank ranges 1 (strongest) to ~150 (weakest). O'Neil's research "
+        "found ~49% of a stock's price move is attributable to its industry group's "
+        "strength. Filtering to top-N industries is the cleanest single-knob "
+        "quality bump available.\n\n"
+        "**Suggested thresholds:**\n"
+        "- 150 = no filter (default)\n"
+        "- 30 = top-30 industries (loose quality cut)\n"
+        "- 15 = top-15 industries (IBD typical leadership zone)\n"
+        "- 10 = top-10 industries (concentrated leadership)\n"
+        "- 5  = top-5 industries (extreme concentration)"
+    ),
 }
 
 
@@ -515,7 +528,7 @@ def render_top_stocks_page():
 
     # ---- Filter sliders ----
     st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
-    sc1, sc2, sc3, sc4, sc5 = st.columns([1, 1, 1, 1, 1])
+    sc1, sc2, sc3, sc4, sc5, sc6 = st.columns([1, 1, 1, 1, 1, 1])
 
     with sc1:
         st.markdown(_slider_hover_label("MIN COMPOSITE RATING"), unsafe_allow_html=True)
@@ -548,6 +561,13 @@ def render_top_stocks_page():
             "MAX RSI", 50, 100, value=int(max_rsi), step=1,
             key="ts_max_rsi", label_visibility="collapsed",
         )
+    with sc6:
+        st.markdown(_slider_hover_label("MAX INDUSTRY RANK"), unsafe_allow_html=True)
+        st.slider(
+            "MAX INDUSTRY RANK", 1, 150,
+            value=int(st.session_state.get("ts_max_ind_rank", 150)), step=1,
+            key="ts_max_ind_rank", label_visibility="collapsed",
+        )
 
     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
@@ -560,6 +580,18 @@ def render_top_stocks_page():
             "loosen the sliders to see more."
         )
         return
+
+    # Apply Industry filter (added 2026-06-07): drop rows whose Industry_Rank
+    # exceeds the user's slider value. Rows with missing Industry_Rank are
+    # kept (graceful — don't filter out stocks just because rank wasn't computed).
+    max_ind_rank = int(st.session_state.get("ts_max_ind_rank", 150))
+    if max_ind_rank < 150:
+        candidates = [
+            c for c in candidates
+            if c.get("Industry_Rank") is None
+            or (isinstance(c.get("Industry_Rank"), (int, float))
+                and c["Industry_Rank"] <= max_ind_rank)
+        ]
 
     # Build the dataframe — drop the carried-along _long/_quality private cols.
     # Also drop Buy_Trigger and Stop per user request (2026-06-02): the row

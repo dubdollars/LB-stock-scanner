@@ -21,8 +21,6 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scanner import ScanSettings, run_scan, save_scan, load_latest_scan, list_scans
-from scanner.short_scan import ShortScanSettings, run_short_scan
-from scanner.cache import save_short_scan, load_latest_short_scan
 from scanner.social_scan import (
     SocialScanSettings, run_social_scan, load_latest_social_snapshot,
 )
@@ -31,6 +29,8 @@ from ui.deepdive_view import render_deep_dive
 from ui.excel_export import format_dataframe_to_excel
 from ui.quality_view import render_quality_page, render_quality_sidebar
 from ui.top_stocks_view import render_top_stocks_page, render_top_stocks_sidebar
+from ui.journal_view import render_journal_page, render_journal_sidebar
+from ui.mean_reversion_view import render_mean_reversion_page, render_mean_reversion_sidebar
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +129,6 @@ def _init_state():
         st.session_state.settings = ScanSettings()
     if "latest_scan" not in st.session_state:
         st.session_state.latest_scan = load_latest_scan()
-    if "latest_short_scan" not in st.session_state:
-        st.session_state.latest_short_scan = load_latest_short_scan()
-    if "short_settings" not in st.session_state:
-        st.session_state.short_settings = ShortScanSettings()
     if "research_ticker" not in st.session_state:
         st.session_state.research_ticker = None
     if "rotation_selected_industry" not in st.session_state:
@@ -144,25 +140,33 @@ def _init_state():
 
 
 def _render_mode_switcher():
-    """Four buttons at the top of every page: LONGS / SHORTS / RESEARCH / TWITTER.
+    """Mode buttons at the top of every page.
     The currently-active mode renders as a solid cyan PRIMARY button; the
     others render as dark SECONDARY buttons. The contrast makes the active
     mode obvious at a glance. A small "VIEWING: …" caption underneath also
     spells it out in writing for absolute clarity.
     """
-    current = st.session_state.get("mode", "longs")
+    current = st.session_state.get("mode", "top_stocks")
 
     def _btn_type(mode_name: str) -> str:
         return "primary" if current == mode_name else "secondary"
 
-    # Display order: TOP STOCKS · LONGS · QUALITY · SOCIAL · ROTATION · SHORTS · RESEARCH.
-    # TOP STOCKS is leftmost AND the default landing page — it's the
-    # intersection of the Long + Quality scans (only the very best stocks).
+    # Display order: TOP STOCKS · MOMENTUM · QUALITY · MEAN REVERSION · SOCIAL · ROTATION · JOURNAL · RESEARCH.
+    # MEAN REVERSION sits next to QUALITY because it consumes the Quality scan
+    # (its universe = Quality candidates with Composite ≥ 70).
+    # TOP STOCKS is leftmost AND the default landing page (intersection of momentum + quality).
+    # JOURNAL is the trade-tracking workspace (used after entries).
+    # RESEARCH is the catch-all deep-dive — rightmost.
+    # EARLY mode was removed 2026-06-11 (was not producing reliable signals).
+    # SHORTS was removed 2026-06-06.
     # Internal mode key for the social mode stays "twitter" so existing
     # session state / snapshots keep working — only the LABEL is "SOCIAL".
-    (col_top, col_long, col_quality, col_social, col_rotation,
-     col_short, col_research, col_spacer) = st.columns(
-        [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0]
+    # Equal column widths for every mode button so the chips look uniform.
+    # MEAN REVERSION's two-word label wraps to a second line at this width;
+    # that's better than making one button noticeably wider than the rest.
+    (col_top, col_long, col_quality, col_mr, col_social, col_rotation,
+     col_journal, col_research, col_spacer) = st.columns(
+        [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0]
     )
     with col_top:
         if st.button("⭐ TOP STOCKS", type=_btn_type("top_stocks"),
@@ -185,6 +189,16 @@ def _render_mode_switcher():
             st.session_state.view = "quality"
             st.session_state.research_ticker = None
             st.rerun()
+    with col_mr:
+        # Label kept short ("MEAN REV") so the button stays on one line and
+        # matches the height of its neighbors. Full "Mean Reversion" name still
+        # appears in the page header, sidebar, and TOC dialog.
+        if st.button("🔁 MEAN REV", type=_btn_type("mean_reversion"),
+                     use_container_width=True, key="mode_btn_mean_reversion"):
+            st.session_state.mode = "mean_reversion"
+            st.session_state.view = "mean_reversion"
+            st.session_state.research_ticker = None
+            st.rerun()
     with col_social:
         if st.button("🐦 SOCIAL", type=_btn_type("twitter"),
                      use_container_width=True, key="mode_btn_twitter"):
@@ -200,11 +214,11 @@ def _render_mode_switcher():
             st.session_state.research_ticker = None
             st.session_state.rotation_selected_industry = None
             st.rerun()
-    with col_short:
-        if st.button("🔻 SHORTS", type=_btn_type("shorts"),
-                     use_container_width=True, key="mode_btn_shorts"):
-            st.session_state.mode = "shorts"
-            st.session_state.view = "short_candidates"
+    with col_journal:
+        if st.button("📓 JOURNAL", type=_btn_type("journal"),
+                     use_container_width=True, key="mode_btn_journal"):
+            st.session_state.mode = "journal"
+            st.session_state.view = "journal"
             st.session_state.research_ticker = None
             st.rerun()
     with col_research:
@@ -220,9 +234,11 @@ def _render_mode_switcher():
     muted = PALETTE["text_muted"]
     mode_pretty = {
         "top_stocks": "TOP STOCKS",
-        "longs": "MOMENTUM", "shorts": "SHORTS",
+        "journal": "JOURNAL",
+        "longs": "MOMENTUM",
         "research": "RESEARCH", "twitter": "SOCIAL",
         "rotation": "ROTATION", "quality": "QUALITY",
+        "mean_reversion": "MEAN REVERSION",
     }.get(current, current.upper())
     st.markdown(
         f"<div style='font-family:JetBrains Mono;font-size:0.72rem;color:{muted};"
@@ -375,41 +391,6 @@ def _trigger_rescan(settings: ScanSettings, demo: bool = False):
     finally:
         progress_container.empty()
         _allow_sleep()
-
-
-def _trigger_short_rescan(settings: ShortScanSettings):
-    """Run a short-side scan with a live progress UI."""
-    progress_container = st.empty()
-    bar = st.progress(0.0, text="Starting short scan…")
-    status = st.empty()
-    _keep_awake()
-
-    def progress_cb(phase: str, current: int, total: int, message: str):
-        pct = (current / total) if total else 0.0
-        pct = max(0.0, min(1.0, pct))
-        weights = {"market": 0.05, "tickers": 0.05, "history": 0.45,
-                   "fundamentals": 0.30, "groups": 0.05, "filter": 0.10, "done": 0.0}
-        order = ["market", "tickers", "history", "fundamentals", "groups", "filter", "done"]
-        phase_idx = order.index(phase) if phase in order else 0
-        completed_weight = sum(weights[order[i]] for i in range(phase_idx))
-        global_pct = completed_weight + weights.get(phase, 0) * pct
-        bar.progress(min(1.0, global_pct), text=f"[SHORT · {phase.upper()}] {message}")
-
-    try:
-        result = run_short_scan(settings, progress=progress_cb)
-        save_short_scan(result)
-        st.session_state.latest_short_scan = result.to_dict()
-        bar.progress(1.0, text=f"✓ Short scan complete — {len(result.candidates)} candidates")
-        status.success(f"Found {len(result.candidates)} short candidates from {result.universe_size} stocks scanned.")
-    except Exception as e:
-        status.error(f"Short scan failed: {e}")
-        raise
-    finally:
-        progress_container.empty()
-        _allow_sleep()
-
-
-
 
 
 def _trigger_social_rescan(settings: SocialScanSettings):
@@ -568,97 +549,6 @@ def _render_long_sidebar():
         )
 
 
-def _render_short_sidebar():
-    """Short-mode sidebar — Start Scan (shorts), short-specific Table of Contents."""
-    cyan = PALETTE['accent_cyan']
-    muted = PALETTE['text_muted']
-    red = PALETTE['down_red']
-    st.markdown(
-        f"<div style='font-family:JetBrains Mono;font-size:1.3rem;font-weight:700;color:{red};margin-bottom:0.5rem;line-height:1.2'>🔻 LEGACY BRANDS</div>"
-        f"<div style='font-family:JetBrains Mono;font-size:0.8rem;font-weight:700;color:{red};margin-bottom:0.5rem'>SHORT-SIDE SCANNER</div>"
-        f"<div style='color:{muted};font-size:0.75rem;margin-bottom:1.5rem'>Overbought / mean-reversion candidates</div>",
-        unsafe_allow_html=True,
-    )
-
-    # Last short scan info
-    latest = st.session_state.latest_short_scan
-    if latest:
-        age = _scan_age_string(latest.get("timestamp", ""))
-        stamp = _format_timestamp(latest.get("timestamp", ""))
-        st.markdown(
-            panel("LAST SHORT SCAN",
-                  f"<div style='font-family:JetBrains Mono;font-size:0.85rem'>{stamp}<br>"
-                  f"<span style='color:{cyan}'>{age}</span> &middot; "
-                  f"{len(latest.get('candidates', []))} candidates</div>"),
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            panel("LAST SHORT SCAN", f"<div style='color:{muted}'>No short scan yet — run one below.</div>"),
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("---")
-
-    # ---- Start Scan (shorts) ----
-    short_settings: ShortScanSettings = st.session_state.short_settings
-    if st.button("▶ Run Scan", type="primary", use_container_width=True,
-                 help="Run a full ~25-minute SHORT scan finding overbought stocks likely to pull back over 1-3 weeks"):
-        _trigger_short_rescan(short_settings)
-        st.session_state.view = "short_candidates"
-        st.rerun()
-
-    # ---- Download buttons (mirrors long-side pattern) ----
-    short_filtered_df = st.session_state.get("filtered_short_candidates")
-    short_has_results = short_filtered_df is not None and len(short_filtered_df) > 0
-
-    if short_has_results:
-        # Excel
-        try:
-            stamp = datetime.utcnow().strftime("%d%b%Y")
-            excel_bytes = format_dataframe_to_excel(
-                short_filtered_df,
-                sheet_name="Short Candidates",
-                title=f"Legacy Brands - Short Candidates {stamp}",
-            )
-            st.download_button(
-                label="📥 Download Excel",
-                data=excel_bytes,
-                file_name=f"legacy_brands_shorts_{stamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary",
-            )
-        except ModuleNotFoundError:
-            st.caption("⚠ Excel export needs `openpyxl`. Run `pip install openpyxl` in the venv.")
-        except Exception as e:
-            st.caption(f"Excel export error: {e}")
-
-        # Tickers
-        tickers_text = "\n".join(short_filtered_df["Ticker"].astype(str).tolist())
-        stamp = datetime.utcnow().strftime("%d%b%Y")
-        st.download_button(
-            label="📥 Download Tickers (.txt)",
-            data=tickers_text,
-            file_name=f"legacy_brands_shorts_tickers_{stamp}.txt",
-            mime="text/plain",
-            use_container_width=True,
-            type="primary",
-        )
-
-    # ---- Table of Contents (short-specific) ----
-    if st.button("📖 Table of Contents", type="primary", use_container_width=True,
-                 help="Definitions for every SHORT-scan column and signal tag"):
-        _show_short_toc_dialog()
-
-    if short_has_results:
-        st.caption(f"Exports include the {len(short_filtered_df)} rows currently visible (after filters).")
-    else:
-        st.caption("Run a scan to enable exports.")
-
-    st.markdown("---")
-
-
 def _render_twitter_sidebar():
     """Twitter-mode sidebar — Refresh, Download Excel + Tickers, Table of Contents,
     LAST SOCIAL SCAN box at the bottom (mirrors the long sidebar layout)."""
@@ -768,8 +658,8 @@ def _render_sidebar():
 
         if mode == "top_stocks":
             render_top_stocks_sidebar()
-        elif mode == "shorts":
-            _render_short_sidebar()
+        elif mode == "journal":
+            render_journal_sidebar()
         elif mode == "research":
             _render_research_sidebar()
         elif mode == "twitter":
@@ -778,6 +668,8 @@ def _render_sidebar():
             _render_rotation_sidebar()
         elif mode == "quality":
             render_quality_sidebar()
+        elif mode == "mean_reversion":
+            render_mean_reversion_sidebar()
         else:
             _render_long_sidebar()
 
@@ -1235,12 +1127,16 @@ def _candidates_dataframe(candidates: list[dict]) -> pd.DataFrame:
     # Done here on the raw candidate dicts before display ordering.
     df["Tier"] = [_classify_tier(c) for c in candidates]
 
+    # RS_Leading was here but moved to EARLY mode 2026-06-07 — by construction,
+    # almost no Momentum candidate is RS-leading-its-price (they're already in
+    # Stage 2 near new highs). The signal lives where it can actually fire:
+    # in the EARLY scan against the full universe.
     column_order = [
         "Ticker", "Tier", "RS", "RSI", "PEG", "Signals_Display", "Warnings_Display",
         "RS_NH", "VCP_Quality", "VDU", "Fundamentals",
         "Price", "Buy_Trigger", "Stop", "Risk_Pct",
         "Pct_Above_50MA", "Vol_vs_Avg", "Days_To_Earnings", "Earnings_Date",
-        "Index", "Industry_Rank", "Market_Cap", "Sector", "Industry",
+        "Index", "Industry_Rank", "Sector", "Market_Cap", "Industry",
     ]
     df = df[[c for c in column_order if c in df.columns]]
     return df
@@ -1253,8 +1149,8 @@ def _render_results_table(scan: dict):
         st.info("No candidates passed the screen. The market may be in a bad regime, or settings are too strict.")
         return
 
-    # Initialize toggle state for the 4 filter buttons (persists across reruns)
-    for _k in ("flt_trade_now", "flt_watch_list", "flt_vcp_ab", "flt_breakout"):
+    # Initialize toggle state for the 5 filter buttons (persists across reruns)
+    for _k in ("flt_trade_now", "flt_watch_list", "flt_vcp_ab", "flt_vcp_b", "flt_breakout"):
         if _k not in st.session_state:
             st.session_state[_k] = False
 
@@ -1273,6 +1169,10 @@ def _render_results_table(scan: dict):
         _count(df["VCP_Quality"] == "A")
         if "VCP_Quality" in df.columns else 0
     )
+    n_vcp_b = (
+        _count(df["VCP_Quality"] == "B")
+        if "VCP_Quality" in df.columns else 0
+    )
     n_breakout = (
         _count(df["Signals_Display"].astype(str).str.contains("BO TODAY", na=False))
         if "Signals_Display" in df.columns else 0
@@ -1287,10 +1187,39 @@ def _render_results_table(scan: dict):
     # and text input (which have labels above them taking ~1.6rem of height)
     _BTN_SPACER = "<div style='height:1.65rem'></div>"
 
-    # Filters row — Index | 4 toggle buttons | Search; Index & Search equal width
-    fcol1, fcol2, fcol3, fcol4, fcol5, fcol6 = st.columns([2, 1.4, 1.4, 1.4, 1.4, 2])
+    # Filters row — Index | Industry | 5 toggle buttons | Search.
+    # Industry filter added 2026-06-07: filter to stocks in top-N industry
+    # groups by RS rank. O'Neil's research: ~49% of a stock's price move is
+    # attributable to its industry group, so filtering to top industries is
+    # the cleanest single-knob quality bump available.
+    # VCP B Only added 2026-06-11 — A-grade is rare; B-grade is the practical
+    # daily watchlist filter.
+    fcol1, fcol_ind, fcol2, fcol3, fcol4, fcol_b, fcol5, fcol6 = st.columns(
+        [1.6, 1.6, 1.3, 1.3, 1.2, 1.2, 1.3, 1.8]
+    )
     with fcol1:
         idx_filter = st.multiselect("Index", options=sorted(df["Index"].unique()), default=None, placeholder="All")
+    with fcol_ind:
+        # Industry filter — preset dropdown matching the INDEX widget pattern
+        industry_choice = st.selectbox(
+            "Industry rank",
+            options=["All industries", "Top 30", "Top 15", "Top 10", "Top 5"],
+            index=0,
+            key="momentum_industry_filter",
+            help="Filter to stocks whose industry group ranks in the top N by RS. "
+                 "O'Neil's research: ~49% of a stock's price move is attributable "
+                 "to its industry group. Filtering to top-N industries is the "
+                 "cleanest one-knob quality bump available.",
+        )
+        # Map dropdown selection to a max rank threshold (None = no filter)
+        _ind_rank_map = {
+            "All industries": None,
+            "Top 30": 30,
+            "Top 15": 15,
+            "Top 10": 10,
+            "Top 5":  5,
+        }
+        max_industry_rank = _ind_rank_map.get(industry_choice)
     with fcol2:
         st.markdown(_BTN_SPACER, unsafe_allow_html=True)
         label = _btn_label("TRADE NOW", st.session_state.flt_trade_now, n_trade_now)
@@ -1314,7 +1243,15 @@ def _render_results_table(scan: dict):
                      help="Only show grade-A VCP setups — the cleanest, textbook Minervini contraction pattern (3+ contractions, monotonically tightening)."):
             st.session_state.flt_vcp_ab = not st.session_state.flt_vcp_ab
             st.rerun()
-        vcp_only = st.session_state.flt_vcp_ab
+        vcp_a_only = st.session_state.flt_vcp_ab
+    with fcol_b:
+        st.markdown(_BTN_SPACER, unsafe_allow_html=True)
+        label = _btn_label("VCP B ONLY", st.session_state.flt_vcp_b, n_vcp_b)
+        if st.button(label, type="primary", use_container_width=True, key="btn_vcp_b",
+                     help="Only show grade-B VCP setups — meaningful multi-contraction structure that didn't quite meet every A criterion. The practical daily watchlist filter when A-grade is empty."):
+            st.session_state.flt_vcp_b = not st.session_state.flt_vcp_b
+            st.rerun()
+        vcp_b_only = st.session_state.flt_vcp_b
     with fcol5:
         st.markdown(_BTN_SPACER, unsafe_allow_html=True)
         label = _btn_label("BREAKOUT", st.session_state.flt_breakout, n_breakout)
@@ -1329,8 +1266,18 @@ def _render_results_table(scan: dict):
     filtered = df.copy()
     if idx_filter:
         filtered = filtered[filtered["Index"].isin(idx_filter)]
-    if vcp_only and "VCP_Quality" in filtered.columns:
-        filtered = filtered[filtered["VCP_Quality"] == "A"]
+    # Industry rank filter — only show stocks whose industry ranks <= max.
+    # None Industry_Rank values are kept (graceful: don't drop stocks just
+    # because their industry rank wasn't computed).
+    if max_industry_rank is not None and "Industry_Rank" in filtered.columns:
+        ranks = pd.to_numeric(filtered["Industry_Rank"], errors="coerce")
+        filtered = filtered[ranks.isna() | (ranks <= max_industry_rank)]
+    # VCP filter — A only, B only, or A+B if both toggles are on
+    if (vcp_a_only or vcp_b_only) and "VCP_Quality" in filtered.columns:
+        accepted_vcp = []
+        if vcp_a_only: accepted_vcp.append("A")
+        if vcp_b_only: accepted_vcp.append("B")
+        filtered = filtered[filtered["VCP_Quality"].isin(accepted_vcp)]
     if breakout_only and "Signals_Display" in filtered.columns:
         filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("BO TODAY", na=False)]
     # Tier filters — if both Trade Now AND Watch List are checked, show A+B
@@ -1695,258 +1642,6 @@ def _show_toc_dialog():
 
 
 # ---------------------------------------------------------------------------
-# Short Table of Contents — short-side columns and signals ONLY
-# ---------------------------------------------------------------------------
-
-@st.dialog("Short Scan - Table of Contents", width="large")
-def _show_short_toc_dialog():
-    """Modal dialog explaining short-scan columns, GREEN signals (favorable
-    for short setups) and RED warnings (reasons NOT to short).
-
-    Called DIRECTLY from a button (not via session_state flag) so the dialog
-    only appears when the user clicks Table of Contents on the shorts page.
-    Signals here are coloured GREEN from the SHORT TRADER\'s perspective —
-    RSI2 >= 95 is a green light to initiate a mean-reversion short. Warnings
-    are RED and describe conditions that should make you skip the trade even
-    when the green stack looks tempting.
-    """
-    from ui.toc import COLUMN_DOCS, SIGNAL_DOCS_SHORT, WARNING_DOCS_SHORT
-
-    muted = PALETTE["text_muted"]
-    cyan = PALETTE["accent_cyan"]
-    green = PALETTE["up_green"]
-    red = PALETTE["down_red"]
-
-    st.markdown(
-        f"<div style='color:{muted};font-size:0.85rem;margin-bottom:1rem'>"
-        "Every column in the short candidates table, with definitions and "
-        "what each value means. GREEN signals below are favourable for a "
-        "short setup; RED warnings are reasons NOT to take the trade."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    # Columns that actually appear in the short table, listed by their DISPLAY
-    # NAMES (which is how COLUMN_DOCS is keyed). Underlying column names from
-    # the dataframe wouldn\'t match the docs dict.
-    short_col_keys = [
-        "TICKER",
-        "SETUP (short)", "SCORE (short)", "🟢 SIGNALS",
-        "RSI", "RSI(2)", "WK RSI",
-        "% > 50MA", "% > 200MA", "ATRx", "RUN 15d",
-        "PRICE", "SHORT <", "COVER >", "RISK %",
-        "-> 20MA", "-> 50MA",
-        "FUND", "ER (d)", "ER DATE",
-        "INDEX", "IND #", "MKT CAP", "SECTOR", "INDUSTRY",
-    ]
-    st.markdown(f"<h4 style='margin-top:0;color:{cyan}'>SHORT-SCAN COLUMNS</h4>", unsafe_allow_html=True)
-    for col in short_col_keys:
-        doc = COLUMN_DOCS.get(col)
-        if doc:
-            with st.expander(f"-- {col}", expanded=False):
-                st.markdown(doc)
-
-    # GREEN signals — favourable for shorting. From the short trader\'s POV,
-    # an overbought reading is a GREEN light, not a warning.
-    st.markdown(
-        f"<h4 style='color:{green};margin-top:1.5rem'>SHORT-SIDE GREEN SIGNALS (favorable for shorting)</h4>",
-        unsafe_allow_html=True,
-    )
-    with st.expander("-- All short-favorable signal tags", expanded=False):
-        for tag, doc in SIGNAL_DOCS_SHORT.items():
-            st.markdown(
-                f"<div style='margin-bottom:0.75rem'>"
-                f"<b style='font-family:JetBrains Mono;color:{green};font-size:1rem'>{tag}</b>"
-                f"<div style='margin-top:0.25rem'>{doc}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-    # RED warnings — reasons NOT to short, even if green signals are firing.
-    st.markdown(
-        f"<h4 style='color:{red};margin-top:1.5rem'>SHORT-SIDE RED WARNINGS (reasons NOT to short)</h4>",
-        unsafe_allow_html=True,
-    )
-    with st.expander("-- All short-side warning tags", expanded=False):
-        for tag, doc in WARNING_DOCS_SHORT.items():
-            st.markdown(
-                f"<div style='margin-bottom:0.75rem'>"
-                f"<b style='font-family:JetBrains Mono;color:{red};font-size:1rem'>{tag}</b>"
-                f"<div style='margin-top:0.25rem'>{doc}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-    if st.button("Close", use_container_width=True, key="short_toc_close"):
-        st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Short Candidates view
-# ---------------------------------------------------------------------------
-
-def _short_candidates_dataframe(candidates: list[dict]) -> pd.DataFrame:
-    if not candidates:
-        return pd.DataFrame()
-    df = pd.DataFrame(candidates)
-    column_order = [
-        "Ticker", "Setup_Tier", "Score", "Signals_Display",
-        "RSI", "RSI2", "Weekly_RSI",
-        "Pct_Above_50MA", "Pct_Above_200MA", "ATR_Stretch", "Run_Pct_15d",
-        "Price", "Short_Below", "Cover_Stop", "Risk_Pct",
-        "Target_20MA", "Target_50MA",
-        "Fundamentals", "Days_To_Earnings", "Earnings_Date",
-        "Index", "Industry_Rank", "Market_Cap", "Sector", "Industry",
-    ]
-    df = df[[c for c in column_order if c in df.columns]]
-    return df
-
-
-def render_short_candidates_page():
-    _render_mode_switcher()
-    scan = st.session_state.latest_short_scan
-
-    # Subtitle (mode switcher above is the primary navigation; no back button needed)
-    st.markdown(
-        f"<div style='font-family:JetBrains Mono;font-size:0.85rem;color:{PALETTE['text_muted']};margin-bottom:0.5rem'>"
-        "SHORT CANDIDATES  /  Overbought mean-reversion setups"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    if scan is None:
-        st.info("No short scan results yet. Click Find Shorts in the sidebar to run one (~25 min).")
-        return
-
-    st.markdown(f"<h1>🔻 Short Candidates ({len(scan.get('candidates', []))})</h1>", unsafe_allow_html=True)
-
-    spy_rsi = scan.get("spy_rsi") or 0
-    qqq_rsi = scan.get("qqq_rsi") or 0
-    mkt_ob = scan.get("market_overbought", False)
-    # Color logic is FROM THE SHORT-TRADER'S PERSPECTIVE:
-    #   Market overbought = favorable conditions for shorts = GREEN
-    #   Market NOT overbought = less favorable = YELLOW
-    if mkt_ob:
-        banner_color = PALETTE["up_green"]
-        msg = f"✅ MARKET OVERBOUGHT — SPY RSI: {spy_rsi:.1f} · QQQ RSI: {qqq_rsi:.1f}. Mean-reversion edge is elevated. Prime conditions for short setups."
-    else:
-        banner_color = PALETTE["signal_yellow"]
-        msg = f"⚠ Market not overbought — SPY RSI: {spy_rsi:.1f} · QQQ RSI: {qqq_rsi:.1f}. Individual setups can still work, but whole-market reversal is less likely. Be selective."
-    st.markdown(
-        f"<div class='signal-banner' style='border:1px solid {banner_color};color:{banner_color};font-size:0.95rem;padding:0.75rem 1rem'>{msg}</div>",
-        unsafe_allow_html=True,
-    )
-
-    short_settings: ShortScanSettings = st.session_state.short_settings
-    short_settings.require_market_overbought = st.toggle(
-        "Only show short candidates when SPY/QQQ are also overbought (re-run scan to apply)",
-        value=short_settings.require_market_overbought,
-        help="When ON, the next short scan will only return setups during broad market overbought conditions. Reduces false signals in trending bull markets.",
-    )
-    st.session_state.short_settings = short_settings
-
-    candidates = scan.get("candidates", [])
-    if not candidates:
-        st.warning(
-            "No short candidates passed the screen. Either the market doesn't have any sufficiently "
-            "overbought + stretched stocks right now, or the scan settings are too strict."
-        )
-        return
-
-    df = _short_candidates_dataframe(candidates)
-
-    fcol1, fcol2, fcol3 = st.columns([2, 2, 4])
-    with fcol1:
-        tier_filter = st.multiselect(
-            "Setup tier", options=["CONFIRMED", "ANTICIPATE"],
-            default=["CONFIRMED"], placeholder="All",
-            help="CONFIRMED = at least one reversal/exhaustion signal fired today. ANTICIPATE = overbought-only (riskier entries).",
-        )
-    with fcol2:
-        min_score = st.slider("Min score", min_value=0, max_value=100, value=50, step=5)
-    with fcol3:
-        search = st.text_input("Search ticker / sector / industry", placeholder="e.g. NVDA or Tech")
-
-    filtered = df.copy()
-    if tier_filter:
-        filtered = filtered[filtered["Setup_Tier"].isin(tier_filter)]
-    if "Score" in filtered.columns:
-        filtered = filtered[filtered["Score"] >= min_score]
-    if search:
-        s = search.upper()
-        mask = filtered["Ticker"].astype(str).str.upper().str.contains(s, na=False)
-        if "Sector" in filtered.columns:
-            mask |= filtered["Sector"].astype(str).str.upper().str.contains(s, na=False)
-        if "Industry" in filtered.columns:
-            mask |= filtered["Industry"].astype(str).str.upper().str.contains(s, na=False)
-        filtered = filtered[mask]
-
-    if "Score" in filtered.columns:
-        filtered = filtered.sort_values("Score", ascending=False, na_position="last")
-
-    # Stash filtered df so the sidebar download buttons can read it
-    st.session_state.filtered_short_candidates = filtered
-
-    column_config = {
-        "Ticker": st.column_config.TextColumn("TICKER", width="small", pinned=True),
-        "Setup_Tier": st.column_config.TextColumn("SETUP", width="small",
-            help="CONFIRMED = reversal signal present today. ANTICIPATE = overbought-only"),
-        "Score": st.column_config.ProgressColumn("SCORE", min_value=0, max_value=100, format="%d", width="small"),
-        "Signals_Display": st.column_config.TextColumn("SIGNALS", width="medium",
-            help="Bonus reversal/exhaustion signals firing on this stock"),
-        "RSI": st.column_config.NumberColumn("RSI", format="%.1f", width="small"),
-        "RSI2": st.column_config.NumberColumn("RSI(2)", format="%.0f", width="small",
-            help="Connors 2-period RSI. >95 = extreme short-term overbought"),
-        "Weekly_RSI": st.column_config.NumberColumn("WK RSI", format="%.0f", width="small",
-            help="Weekly RSI. >70 = multi-timeframe overbought confirmation"),
-        "Pct_Above_50MA": st.column_config.NumberColumn("% > 50MA", format="%.1f%%", width="small"),
-        "Pct_Above_200MA": st.column_config.NumberColumn("% > 200MA", format="%.1f%%", width="small"),
-        "ATR_Stretch": st.column_config.NumberColumn("ATRx", format="%.1f", width="small",
-            help="Price stretch above 21-EMA in ATR units. >2.5 = extended; >3.5 = extreme"),
-        "Run_Pct_15d": st.column_config.NumberColumn("RUN 15d", format="%.1f%%", width="small",
-            help="% gain over last 15 bars. 25%+ on rising volume = climax run"),
-        "Price": st.column_config.NumberColumn("PRICE", format="$%.2f", width="small"),
-        "Short_Below": st.column_config.NumberColumn("SHORT <", format="$%.2f", width="small",
-            help="Sell-stop entry: short when price breaks below this level"),
-        "Cover_Stop": st.column_config.NumberColumn("COVER >", format="$%.2f", width="small",
-            help="Buy-to-cover stop: exit short if price closes above this level"),
-        "Risk_Pct": st.column_config.NumberColumn("RISK %", format="%.1f%%", width="small"),
-        "Target_20MA": st.column_config.NumberColumn("-> 20MA", format="$%.2f", width="small",
-            help="First profit target: pullback to the 20-day MA"),
-        "Target_50MA": st.column_config.NumberColumn("-> 50MA", format="$%.2f", width="small",
-            help="Second profit target: pullback to the 50-day MA"),
-        "Fundamentals": st.column_config.TextColumn("FUND", width="small"),
-        "Days_To_Earnings": st.column_config.NumberColumn("ER (d)", format="%d", width="small"),
-        "Earnings_Date": st.column_config.TextColumn("ER DATE", width="small"),
-        "Index": st.column_config.TextColumn("INDEX", width="small"),
-        "Industry_Rank": st.column_config.NumberColumn("IND #", format="%d", width="small"),
-        "Market_Cap": st.column_config.TextColumn("MKT CAP", width="small"),
-        "Sector": st.column_config.TextColumn("SECTOR", width="small"),
-        "Industry": st.column_config.TextColumn("INDUSTRY"),
-    }
-
-    selection = st.dataframe(
-        filtered,
-        use_container_width=True,
-        height=600,
-        hide_index=True,
-        column_config=column_config,
-        on_select="rerun",
-        selection_mode="single-row",
-    )
-
-    # Handle selection -> deep dive
-    if selection and "selection" in selection and selection["selection"].get("rows"):
-        selected_row_idx = selection["selection"]["rows"][0]
-        ticker = filtered.iloc[selected_row_idx]["Ticker"]
-        st.session_state.deep_dive_ticker = ticker
-        st.session_state.view = "deepdive"
-        st.rerun()
-
-
-
-
-# ---------------------------------------------------------------------------
 # Research mode -- load deep-dive for any ticker without needing a scan
 # ---------------------------------------------------------------------------
 
@@ -2097,7 +1792,7 @@ def _social_candidates_dataframe(candidates: list) -> "pd.DataFrame":
         "Price", "RS", "RSI", "Pct_Above_50MA",
         "VCP_Quality", "Signals_Display", "Warnings_Display",
         "PEG", "Held_Pct_Inst", "Fundamentals",
-        "Sector", "Industry", "Market_Cap",
+        "Sector", "Market_Cap", "Industry",
     ]
     cols_present = [c for c in column_order if c in df.columns]
     return df[cols_present]
@@ -2760,16 +2455,24 @@ def render_rotation_page():
 # ---------------------------------------------------------------------------
 
 view = st.session_state.view
-mode = st.session_state.get("mode", "longs")
+mode = st.session_state.get("mode", "top_stocks")
+
+# Recover from stale modes that were deleted. shorts (2026-06-06) and early
+# (2026-06-11) both removed. Anyone with one cached gets sent back to Top Stocks.
+if mode in ("shorts", "early") or view in ("short_candidates", "early"):
+    mode = "top_stocks"
+    view = "top_stocks"
+    st.session_state.mode = mode
+    st.session_state.view = view
 
 # Mode-aware view defaults
 if mode == "top_stocks" and view not in ("top_stocks", "deepdive"):
     view = "top_stocks"
     st.session_state.view = view
-elif mode == "shorts" and view == "dashboard":
-    view = "short_candidates"
+elif mode == "journal" and view not in ("journal", "deepdive"):
+    view = "journal"
     st.session_state.view = view
-elif mode == "longs" and view in ("short_candidates", "top_stocks"):
+elif mode == "longs" and view in ("top_stocks", "journal"):
     view = "dashboard"
     st.session_state.view = view
 elif mode == "research" and view not in ("research", "deepdive"):
@@ -2784,12 +2487,18 @@ elif mode == "rotation" and view not in ("rotation", "deepdive"):
 elif mode == "quality" and view not in ("quality", "deepdive"):
     view = "quality"
     st.session_state.view = view
+elif mode == "mean_reversion" and view not in ("mean_reversion", "deepdive"):
+    view = "mean_reversion"
+    st.session_state.view = view
 
 if view == "deepdive" and st.session_state.deep_dive_ticker:
     render_deep_dive_page()
 elif view == "top_stocks":
     _render_mode_switcher()
     render_top_stocks_page()
+elif view == "journal":
+    _render_mode_switcher()
+    render_journal_page()
 elif view == "research":
     render_research_page()
 elif view == "twitter":
@@ -2799,10 +2508,11 @@ elif view == "rotation":
 elif view == "quality":
     _render_mode_switcher()
     render_quality_page()
+elif view == "mean_reversion":
+    _render_mode_switcher()
+    render_mean_reversion_page()
 elif view == "diagnose":
     render_diagnose_page()
-elif view == "short_candidates":
-    render_short_candidates_page()
 else:
     render_dashboard()
 

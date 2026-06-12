@@ -99,51 +99,52 @@ def _md_to_tooltip_html(md: str) -> str:
 
 
 # Slider docs (rich tooltips that replace Streamlit's default blue-dot help icon)
+# Sliders are now bidirectional (min + max) — 2026-06-11 update.
 _QUALITY_SLIDER_DOCS = {
-    "MIN COMPOSITE RATING": (
-        "**Hide stocks with a Composite Rating below this value.**\n\n"
+    "COMPOSITE RATING": (
+        "**Filter stocks by Composite Rating range (min + max).**\n\n"
         "Composite is the 1-99 master quality score blending EPS Rating, 6-month RS, "
-        "and Acc/Dis. Higher = better. Default 0 (show all).\n\n"
+        "and Acc/Dis. Higher = better. Drag the left handle up to set a floor, "
+        "the right handle down to set a ceiling.\n\n"
         "**Suggested thresholds:**\n"
-        "- 0 = no filter, show all stocks\n"
-        "- 70 = decent quality (top 30%)\n"
-        "- 80 = IBD 'investment grade' (top 20%)\n"
-        "- 90 = IBD 'elite' tier (top 10%)\n"
-        "- 95 = ultra-elite (top 5%)"
+        "- (0, 99) = no filter, show all stocks\n"
+        "- (70, 99) = decent quality and above (top 30%)\n"
+        "- (80, 99) = IBD 'investment grade' (top 20%)\n"
+        "- (90, 99) = IBD 'elite' tier (top 10%)\n"
+        "- (80, 90) = solid quality but NOT extreme (avoid late-stage climax names)"
     ),
-    "MIN EPS RATING": (
-        "**Hide stocks with an EPS Rating below this value.**\n\n"
+    "EPS RATING": (
+        "**Filter stocks by EPS Rating range (min + max).**\n\n"
         "EPS Rating is the 1-99 percentile of forward EPS growth across the "
         "universe. Higher = faster earnings growth relative to other stocks.\n\n"
         "**Suggested thresholds:**\n"
-        "- 0 = no filter\n"
-        "- 70 = above-average growth (top 30%)\n"
-        "- 80 = IBD's threshold for 'strong earnings' (top 20%)\n"
-        "- 90 = elite growth (top 10%)"
+        "- (0, 99) = no filter\n"
+        "- (70, 99) = above-average growth (top 30%)\n"
+        "- (80, 99) = IBD's threshold for 'strong earnings'\n"
+        "- (90, 99) = elite growth (top 10%)"
     ),
-    "MIN A/D": (
-        "**Hide stocks below this Accumulation/Distribution rating.**\n\n"
+    "A/D": (
+        "**Filter stocks by A/D rating range (worst min, best max).**\n\n"
         "A/D measures whether institutions are buying (accumulation) or selling "
         "(distribution) based on 13 weeks of price-volume patterns. Drag right "
-        "to require stronger accumulation.\n\n"
+        "handle in to exclude the very strongest accumulation; drag left handle "
+        "in to exclude the weakest distribution.\n\n"
         "**Suggested settings:**\n"
-        "- E = no filter, show all stocks\n"
-        "- C+ = exclude only the worst distribution (E, D, C)\n"
-        "- B+ = only mild-or-better accumulation (IBD elite threshold)\n"
-        "- A = only strong accumulation\n"
-        "- A+ = only the strongest accumulation"
+        "- (E, A+) = no filter, show all stocks\n"
+        "- (C+, A+) = exclude the worst distribution (E, D, C)\n"
+        "- (B+, A+) = only mild-or-better accumulation (IBD elite threshold)\n"
+        "- (A, A+) = only strong accumulation"
     ),
-    "MIN U/D VOL RATIO": (
-        "**Hide stocks below this 50-day up-volume / down-volume ratio.**\n\n"
+    "U/D VOL RATIO": (
+        "**Filter stocks by 50-day up/down volume ratio range (min + max).**\n\n"
         "Exact IBD calculation: sum of volume on up-days divided by sum of volume "
         "on down-days, over the last 50 trading sessions. Higher = institutions "
         "buying harder than selling.\n\n"
         "**Suggested thresholds:**\n"
-        "- 0.0 = no filter\n"
-        "- 1.0 = balanced (above this means net accumulation)\n"
-        "- 1.5 = strong accumulation (IBD elite threshold)\n"
-        "- 2.0 = very heavy buying pressure\n"
-        "- 3.0+ = extreme accumulation, often climactic"
+        "- (0.0, 5.0) = no filter\n"
+        "- (1.0, 5.0) = balanced or better (net accumulation)\n"
+        "- (1.5, 5.0) = strong accumulation (IBD elite threshold)\n"
+        "- (1.5, 2.5) = strong but NOT climactic accumulation"
     ),
 }
 
@@ -417,14 +418,16 @@ def _quality_toc_dialog():
     body += "</table>"
     st.markdown(body, unsafe_allow_html=True)
 
-    hdr("Sliders (above the table)")
+    hdr("Sliders (above the table) — all are RANGE sliders with a min AND a max")
     st.markdown(
         f"<div style='color:black;background:#fff;padding:0.4rem 0.6rem;border-radius:4px'>"
-        f"<b>Min Composite</b> — set a floor on the Composite Rating. Default 0 (show all).<br>"
-        f"<b>Min EPS Rating</b> — set a floor on EPS Rating. Default 0.<br>"
-        f"<b>Min A/D</b> — pick the worst A/D rating you'll accept. Drag to A+ to see only stocks under the heaviest accumulation; drag to E to show everything. Default E.<br>"
-        f"<b>Min U/D Vol Ratio</b> — set a floor on the 50-day up-vol/down-vol ratio. 0.0 = show all; 1.0 = balanced; 1.5+ = strong accumulation; 2.0+ = very heavy buying.<br><br>"
-        f"<b>Tip:</b> for an IBD-style 'elite' filter, set Composite ≥ 90, EPS ≥ 80, A/D ≥ B+, U/D Vol ≥ 1.5. That mirrors IBD's standard quality screen."
+        f"<b>Composite Rating</b> — drag left handle to set floor, right to set ceiling. Default (0, 99) = show all.<br>"
+        f"<b>EPS Rating</b> — range for EPS Rating. Default (0, 99).<br>"
+        f"<b>A/D</b> — pick the worst-to-best A/D range you'll accept. Default (E, A+) = show all.<br>"
+        f"<b>U/D Vol Ratio</b> — range for the 50-day up-vol/down-vol ratio. Default (0.0, 5.0) = show all.<br>"
+        f"<b>Search</b> — partial-match filter on ticker, sector, or industry.<br><br>"
+        f"<b>Tip:</b> for an IBD-style 'elite' screen, set Composite (90, 99), EPS (80, 99), A/D (B+, A+), U/D Vol (1.5, 5.0). "
+        f"For a 'quality but not climactic' screen, cap the max instead — e.g. Composite (80, 90) avoids both weak quality AND extreme late-stage names."
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -640,57 +643,91 @@ def render_quality_page():
     # Long-scan breadth tiles)
     _render_quality_tiles(df, len(candidates), int(diag.get("universe_size", 0)))
 
-    # ---- Filter sliders (4 sliders side-by-side, hover labels for rich tooltips) ----
-    sc1, sc2, sc3, sc4 = st.columns(4)
+    # ---- Filter sliders (4 RANGE sliders side-by-side + search input) ----
+    # 2026-06-11: converted from one-sided lower-bound to bidirectional range
+    # sliders so you can cap quality scores too (e.g. 80-90 range avoids both
+    # weak quality AND extreme/climactic late-stage names).
+    sc1, sc2, sc3, sc4, sc5 = st.columns([1.2, 1.2, 1.2, 1.2, 2.0])
     with sc1:
-        st.markdown(_slider_hover_label("MIN COMPOSITE RATING"), unsafe_allow_html=True)
-        min_composite = st.slider(
+        st.markdown(_slider_hover_label("COMPOSITE RATING"), unsafe_allow_html=True)
+        composite_range = st.slider(
             " ",
-            min_value=0, max_value=99, value=0, step=1,
+            min_value=0, max_value=99, value=(0, 99), step=1,
             label_visibility="collapsed",
             key="quality_slider_composite",
         )
     with sc2:
-        st.markdown(_slider_hover_label("MIN EPS RATING"), unsafe_allow_html=True)
-        min_eps = st.slider(
+        st.markdown(_slider_hover_label("EPS RATING"), unsafe_allow_html=True)
+        eps_range = st.slider(
             " ",
-            min_value=0, max_value=99, value=0, step=1,
+            min_value=0, max_value=99, value=(0, 99), step=1,
             label_visibility="collapsed",
             key="quality_slider_eps",
         )
     with sc3:
-        st.markdown(_slider_hover_label("MIN A/D"), unsafe_allow_html=True)
-        min_ad = st.select_slider(
+        st.markdown(_slider_hover_label("A/D"), unsafe_allow_html=True)
+        ad_range = st.select_slider(
             " ",
             options=_AD_ORDER,
-            value="E",
+            value=("E", "A+"),
             label_visibility="collapsed",
             key="quality_slider_ad",
         )
     with sc4:
-        st.markdown(_slider_hover_label("MIN U/D VOL RATIO"), unsafe_allow_html=True)
-        min_ud_vol = st.slider(
+        st.markdown(_slider_hover_label("U/D VOL RATIO"), unsafe_allow_html=True)
+        ud_vol_range = st.slider(
             " ",
-            min_value=0.0, max_value=5.0, value=0.0, step=0.1,
+            min_value=0.0, max_value=5.0, value=(0.0, 5.0), step=0.1,
             label_visibility="collapsed",
             key="quality_slider_ud_vol",
+        )
+    with sc5:
+        # Match the slider's hover-label height so the input lines up vertically
+        st.markdown(_slider_hover_label("SEARCH"), unsafe_allow_html=True)
+        search_q = st.text_input(
+            " ",
+            placeholder="e.g. NVDA or tech",
+            label_visibility="collapsed",
+            key="quality_search",
+            help="Filter rows by ticker, sector, or industry (case-insensitive).",
         )
 
     # ---- Apply filters ----
     filtered = df.copy()
-    if min_composite > 0:
-        filtered = filtered[filtered["Composite_Rating"].fillna(0) >= min_composite]
-    if min_eps > 0:
-        filtered = filtered[filtered["EPS_Rating"].fillna(0) >= min_eps]
-    if min_ad != "E":
-        min_rank = _AD_RANK[min_ad]
-        filtered = filtered[
-            filtered["Acc_Dis_Rating"]
-            .map(lambda v: _AD_RANK.get(v, -1) if v is not None else -1)
-            >= min_rank
-        ]
-    if min_ud_vol > 0:
-        filtered = filtered[filtered["UD_Vol_Ratio"].fillna(0) >= min_ud_vol]
+    # Composite range
+    cmin, cmax = composite_range
+    if cmin > 0 or cmax < 99:
+        comp = filtered["Composite_Rating"].fillna(0)
+        filtered = filtered[(comp >= cmin) & (comp <= cmax)]
+    # EPS range
+    emin, emax = eps_range
+    if emin > 0 or emax < 99:
+        eps = filtered["EPS_Rating"].fillna(0)
+        filtered = filtered[(eps >= emin) & (eps <= emax)]
+    # A/D range (ordinal — convert each row's letter grade to its rank, then
+    # check it falls inside [min_rank, max_rank]; missing values stay as -1
+    # and are excluded if either bound is set above E).
+    ad_lo, ad_hi = ad_range
+    if ad_lo != "E" or ad_hi != "A+":
+        lo_rank, hi_rank = _AD_RANK[ad_lo], _AD_RANK[ad_hi]
+        rank_series = filtered["Acc_Dis_Rating"].map(
+            lambda v: _AD_RANK.get(v, -1) if v is not None else -1
+        )
+        filtered = filtered[(rank_series >= lo_rank) & (rank_series <= hi_rank)]
+    # U/D Vol range
+    udmin, udmax = ud_vol_range
+    if udmin > 0.0 or udmax < 5.0:
+        udv = filtered["UD_Vol_Ratio"].fillna(0)
+        filtered = filtered[(udv >= udmin) & (udv <= udmax)]
+    # Ticker/sector/industry search
+    if search_q:
+        s = search_q.upper()
+        mask = filtered["Ticker"].astype(str).str.upper().str.contains(s, na=False)
+        if "Sector" in filtered.columns:
+            mask = mask | filtered["Sector"].astype(str).str.upper().str.contains(s, na=False)
+        if "Industry" in filtered.columns:
+            mask = mask | filtered["Industry"].astype(str).str.upper().str.contains(s, na=False)
+        filtered = filtered[mask]
 
     st.session_state["quality_filtered_df"] = filtered
 

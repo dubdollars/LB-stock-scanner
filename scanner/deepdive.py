@@ -111,50 +111,32 @@ class DeepDiveData:
     short_ratio: Optional[float] = None         # days to cover
 
 
-def _calc_vcp_zones(close: pd.Series) -> list:
-    """
-    Detect rolling windows where 20d stdev / 60d stdev < 0.85 (contraction)
-    AND 5d stdev / 20d stdev < 0.55 (current tightness).
+def _zones_from_contractions(contractions: list) -> list:
+    """Convert detect_vcp_contractions() output into chart-zone tuples.
 
-    Returns list of (start_idx, end_idx, contraction_pct).
-    Only the most recent ~5 distinct zones (merged if adjacent).
+    Earlier versions of this file had a separate `_calc_vcp_zones()` that used
+    rolling-stdev windows to draw chart annotations. That was wrong — it
+    surfaced "low-volatility windows" that had nothing to do with the
+    peak-trough contractions used by `vcp_quality_score` to grade the VCP.
+    The chart and the rating were telling different stories. (User caught
+    this on SKYT: chart showed expanding contractions while the table said
+    VCP-A.)
+
+    Now both the chart annotations and the grade come from the same
+    `detect_vcp_contractions()` output — what you see is what was graded.
+
+    Filtering: only show contractions >= 4% deep, matching the threshold
+    `vcp_quality_score` uses for grading (smaller wiggles are noise).
+    Each contraction's "zone" spans peak_date -> trough_date (the pullback
+    period itself); the depth_pct is the (peak - trough) / peak * 100.
     """
-    if len(close) < 60:
+    if not contractions:
         return []
-    std_5 = close.rolling(5).std()
-    std_20 = close.rolling(20).std()
-    std_60 = close.rolling(60).std()
-
-    contracting = (std_20 / std_60) < 0.85
-    tight = (std_5 / std_20) < 0.55
-    flag = (contracting & tight).fillna(False)
-
-    # Merge contiguous True regions into zones, only on the last 180 bars
-    flag = flag.iloc[-180:] if len(flag) > 180 else flag
-    zones = []
-    in_zone = False
-    start = None
-    for idx, val in flag.items():
-        if val and not in_zone:
-            in_zone = True
-            start = idx
-        elif not val and in_zone:
-            in_zone = False
-            zones.append((start, idx))
-    if in_zone and start is not None:
-        zones.append((start, flag.index[-1]))
-
     out = []
-    for start_dt, end_dt in zones[-5:]:
-        try:
-            window = close.loc[start_dt:end_dt]
-            if len(window) >= 3:
-                contraction_pct = float(
-                    (window.max() - window.min()) / window.max() * 100
-                )
-                out.append((start_dt, end_dt, round(contraction_pct, 2)))
-        except Exception:
-            continue
+    for c in contractions:
+        if c.get("depth_pct", 0) < 4.0:
+            continue  # noise — same threshold vcp_quality_score uses
+        out.append((c["peak_date"], c["trough_date"], c["depth_pct"]))
     return out
 
 
@@ -215,8 +197,12 @@ def fetch_deep_dive(
         rs_50d_max = rs_line.rolling(50, min_periods=10).max()
         new_high_dates = list(rs_line[rs_line >= rs_50d_max * 0.999].index[-30:])
 
-        # VCP zones
-        vcp_zones = _calc_vcp_zones(close)
+        # VCP contractions + chart zones — both derived from the same
+        # peak-trough detector that grades VCP_Quality. Previously the chart
+        # used a stdev-based detector that disagreed with the grade; now
+        # what you see is what was graded. (User-caught bug, 2026-06-02.)
+        vcp_contractions = detect_vcp_contractions(hist, lookback=80)
+        vcp_zones = _zones_from_contractions(vcp_contractions)
 
         # Fundamentals
         info = safe_get_info(t_obj)
@@ -310,7 +296,9 @@ def fetch_deep_dive(
         sma_50_now = float(hist["SMA50"].iloc[-1]) if not pd.isna(hist["SMA50"].iloc[-1]) else None
         avg_vol_50 = float(hist["Volume"].rolling(50).mean().iloc[-1])
 
-        contractions_v2 = detect_vcp_contractions(hist, lookback=80)
+        # Reuse the same contractions computed above for vcp_zones — the
+        # grade and the chart now share one source of truth.
+        contractions_v2 = vcp_contractions
         vcp_q = vcp_quality_score(contractions_v2)
 
         pivot_info = find_pivot_point(hist, lookback=60)

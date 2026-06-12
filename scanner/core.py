@@ -1849,6 +1849,19 @@ def run_filters(
             except Exception:
                 rs_new_high_bool = False
 
+            # RS-LEADING-PRICE divergence (the cleanest "early" signal we can
+            # detect without building EARLY mode). When the RS line makes a
+            # new 50-day high BUT price hasn't yet — that's institutions
+            # accumulating ahead of the obvious breakout. Surfaced as
+            # "RS_Leading" so the user can spot pre-breakout accumulation.
+            try:
+                price_50d_high = data["Close"].tail(50).max()
+                # Price is "at new high" if within 2% of recent 50d high
+                price_at_new_high = close >= price_50d_high * 0.98
+                rs_leading_bool = rs_new_high_bool and not price_at_new_high
+            except Exception:
+                rs_leading_bool = False
+
             power_play = detect_power_play(data)
             breakout = detect_breakout_today(data, pivot_price, float(avg_vol_50))
             extension = detect_extension_from_50ma(close, float(sma_50))
@@ -1901,6 +1914,9 @@ def run_filters(
                 "Held_Pct_Inst": inst_map.get(ticker),
                 "Avg_Volume": int(data["Volume"].rolling(50).mean().iloc[-1]) if len(data) >= 50 else None,
                 "RS_NH": "YES" if rs_new_high_bool else "-",
+                # RS line at new high while price still inside its base —
+                # institutional accumulation signal BEFORE the obvious breakout.
+                "RS_Leading": "YES" if rs_leading_bool else "-",
                 "VCP_Quality": vcp_quality.get("quality", "None"),
                 "VCP_Count": vcp_quality.get("count", 0),
                 "VDU": vdu_display,
@@ -1965,6 +1981,17 @@ def run_scan(settings: ScanSettings, progress: ProgressCallback = None) -> ScanR
         interval="1d",
     )
     spy_hist = clean_history(spy_hist)
+
+    # Persist SPY to the shared price cache so other scans (EARLY especially)
+    # can use a fresh benchmark. Previously SPY was downloaded for the scan
+    # but never saved, leaving the price cache's SPY.pkl stale by weeks.
+    # User-caught bug 2026-06-09: EARLY mode was using May 21 SPY data
+    # because Momentum had been refreshing every other ticker but not SPY.
+    try:
+        from .data_cache import save_price_history
+        save_price_history("SPY", spy_hist)
+    except Exception:
+        pass  # best-effort — don't fail the scan if cache write fails
 
     stock_cache, rs_df, rs_map, skipped_history, skipped_liquidity = download_history_and_rs(
         tickers, settings, progress=progress,

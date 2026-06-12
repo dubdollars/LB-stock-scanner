@@ -229,6 +229,10 @@ def compute_top_stocks(
             "Ticker":              ticker,
             "Sector":              q.get("Sector") or l.get("Sector", ""),
             "Industry":            q.get("Industry") or l.get("Industry", ""),
+            # Industry_Rank from the Momentum scan (1 = strongest industry).
+            # O'Neil: ~49% of a stock's price move is attributable to its
+            # industry group. Surfacing this lets the UI filter to top-N.
+            "Industry_Rank":       l.get("Industry_Rank"),
             "Composite_Rating":    comp,
             "EPS_Rating":          eps,
             "Acc_Dis_Rating":      q.get("Acc_Dis_Rating", ""),
