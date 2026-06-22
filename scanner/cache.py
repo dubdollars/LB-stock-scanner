@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,13 @@ SCANS_DIR = Path(__file__).resolve().parent.parent / "data" / "scans"
 LATEST_FILE = SCANS_DIR / "latest.json"
 LATEST_SHORT_FILE = SCANS_DIR / "latest_short.json"
 KEEP_LAST_N = 30
+
+# Momentum scan filenames match exactly scan_YYYYMMDD_HHMMSS.json — 8 digits,
+# underscore, 6 digits. Use this regex to filter out other scan types
+# (scan_quality_*, scan_mean_reversion_*, scan_short_*, scan_early_*) before
+# pruning. See _prune_old() for the bug this prevents.
+_MOMENTUM_SCAN_RE = re.compile(r"^scan_\d{8}_\d{6}\.json$")
+_SHORT_SCAN_RE = re.compile(r"^scan_short_\d{8}_\d{6}\.json$")
 
 
 def _ensure_dir() -> None:
@@ -107,8 +115,22 @@ def list_scans() -> list[dict]:
 
 
 def _prune_old() -> None:
-    scans = sorted(SCANS_DIR.glob("scan_*.json"), reverse=True)
-    for path in scans[KEEP_LAST_N:]:
+    """Prune old Momentum scan files — keep only the most recent KEEP_LAST_N.
+
+    CRITICAL: must filter to Momentum-only filename pattern before pruning.
+    glob('scan_*.json') matches EVERY scan type (quality, mean_reversion,
+    short, early). In reverse-alphabetical sort order Momentum scans
+    (scan_YYYYMMDD_*) sort LAST because digits come before letters in ASCII,
+    so an unfiltered prune deletes Momentum scans FIRST when total scans
+    exceed the keep limit. This bug silently wiped historical Momentum scans
+    and broke the Industry Rotation page's 1w/4w delta columns
+    (user-reported 2026-06-17).
+    """
+    momentum_scans = sorted(
+        (p for p in SCANS_DIR.glob("scan_*.json") if _MOMENTUM_SCAN_RE.match(p.name)),
+        reverse=True,
+    )
+    for path in momentum_scans[KEEP_LAST_N:]:
         try:
             path.unlink()
         except Exception:
@@ -175,8 +197,14 @@ def list_short_scans() -> list[dict]:
 
 
 def _prune_old_short() -> None:
-    scans = sorted(SCANS_DIR.glob("scan_short_*.json"), reverse=True)
-    for path in scans[KEEP_LAST_N:]:
+    """Prune old short-scan files. Same Momentum-style fix: filter to
+    short-scan-only pattern before pruning so we don't accidentally cull
+    other scan types."""
+    short_scans = sorted(
+        (p for p in SCANS_DIR.glob("scan_short_*.json") if _SHORT_SCAN_RE.match(p.name)),
+        reverse=True,
+    )
+    for path in short_scans[KEEP_LAST_N:]:
         try:
             path.unlink()
         except Exception:

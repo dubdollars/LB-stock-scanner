@@ -143,17 +143,18 @@ def _refresh_journal_prices(trades: list[Trade]) -> tuple[int, int]:
     return succ, fail
 
 
-def _last_close_for(ticker: str) -> Optional[float]:
-    """Read the most recent cached close from data/cache/prices/<ticker>.pkl.
+def _last_close_for(ticker: str) -> Optional[tuple[float, str]]:
+    """Read the most recent cached (close, date) from data/cache/prices/<ticker>.pkl.
 
-    The price cache is populated by every full scan (Momentum, Quality,
-    Mean Reversion). Most recent value = the close from the last bar yfinance
-    returned, which is end-of-prior-trading-day during market hours.
-
-    Returns None when:
+    Returns a (price, date_str) tuple where date_str is formatted DDmmmYYYY
+    (e.g. "13Jun2026"). Returns None when:
       - The ticker isn't cached yet (no scan ever fetched it)
       - The cached file is corrupt or empty
       - The Close column is NaN
+
+    The date is exposed as a separate column on the journal table so the user
+    can see whether the cached close is fresh (yesterday's date) or stale
+    (last Friday's date, last week's date) without having to hover or guess.
     """
     try:
         from scanner.data_cache import load_price_history
@@ -167,7 +168,14 @@ def _last_close_for(ticker: str) -> Optional[float]:
         val = float(close.iloc[-1])
         if pd.isna(val):
             return None
-        return round(val, 2)
+        # Extract the date of the last bar (DatetimeIndex)
+        last_idx = close.index[-1]
+        try:
+            date_str = last_idx.strftime("%d%b%Y")
+        except Exception:
+            # Fallback for non-datetime indexes — just slice the string
+            date_str = str(last_idx)[:10]
+        return round(val, 2), date_str
     except Exception:
         return None
 
@@ -196,6 +204,90 @@ def _negative_red(val) -> str:
         return "color: #FF4D6D; font-weight: 600;" if v < 0 else ""
     except (ValueError, TypeError):
         return ""
+
+
+def _render_held_totals(trades: list[Trade]) -> None:
+    """One-line summary strip showing aggregate totals across held positions.
+
+    Lives below the journal table. Sums the same per-row quantities the user
+    sees in the Cost $ / P&L $ / G/L % columns, so the totals row reconciles
+    line-by-line with the table above. Skipped silently if there are no held
+    positions (all closed).
+    """
+    held = [t for t in trades if t.net_shares > 0]
+    if not held:
+        return
+
+    cyan  = PALETTE["accent_cyan"]
+    muted = PALETTE["text_muted"]
+    up    = PALETTE["up_green"]
+    down  = PALETTE["down_red"]
+
+    total_cost_basis        = 0.0
+    total_current_value     = 0.0
+    total_lifetime_invested = 0.0
+    total_pnl               = 0.0
+    missing_price_count     = 0
+
+    for t in held:
+        total_cost_basis        += t.cost_basis
+        total_lifetime_invested += t.avg_entry_price * t.total_shares_bought
+        last_result = _last_close_for(t.ticker)
+        last_price  = last_result[0] if last_result else None
+        if last_price is not None:
+            total_current_value += last_price * t.net_shares
+            pnl = _open_pnl(t, last_price)
+            if pnl is not None:
+                total_pnl += pnl
+        else:
+            missing_price_count += 1
+
+    # G/L % denominator matches the per-row formula (lifetime invested capital).
+    gl_pct = (total_pnl / total_lifetime_invested * 100) if total_lifetime_invested > 0 else 0.0
+    pnl_color = up if total_pnl > 0 else (down if total_pnl < 0 else muted)
+
+    missing_note = ""
+    if missing_price_count:
+        missing_note = (
+            f" <span style='color:{muted};font-size:0.78rem'>"
+            f"(price missing on {missing_price_count} ticker{'s' if missing_price_count != 1 else ''} "
+            f"— click Refresh Prices in the sidebar)</span>"
+        )
+
+    st.markdown(
+        f"<div style='font-family:JetBrains Mono;font-size:0.92rem;"
+        f"background:#0F1620;border:1px solid #1F2937;border-radius:6px;"
+        f"padding:0.75rem 1rem;margin-top:0.6rem;line-height:1.7'>"
+        f"<b style='color:{cyan};letter-spacing:0.04em'>HELD POSITIONS ({len(held)})</b>"
+        f" &nbsp;&middot;&nbsp; Cost: <b>{_fmt_money(total_cost_basis, 0)}</b>"
+        f" &nbsp;&middot;&nbsp; Value: <b>{_fmt_money(total_current_value, 0)}</b>"
+        f" &nbsp;&middot;&nbsp; P&amp;L: "
+        f"<b style='color:{pnl_color}'>{_fmt_money(total_pnl, 0, signed=True)}</b>"
+        f" &nbsp;<b style='color:{pnl_color}'>({gl_pct:+.1f}%)</b>"
+        f"{missing_note}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _gain_loss_pct(trade: Trade, pnl: Optional[float]) -> Optional[float]:
+    """Total P&L as a % of capital invested across the life of the position.
+
+    Denominator = avg_entry_price × total_shares_bought (cost basis of ALL
+    shares ever bought, held or sold). One formula that's meaningful across
+    OPEN (return on currently-held cost), PARTIAL (return on full lifetime
+    invested), and CLOSED (realized return on capital).
+
+    Returns None when we can't compute (no buys, missing P&L, or zero cost).
+    """
+    if pnl is None:
+        return None
+    if trade.total_shares_bought == 0 or trade.avg_entry_price <= 0:
+        return None
+    total_invested = trade.avg_entry_price * trade.total_shares_bought
+    if total_invested <= 0:
+        return None
+    return round(pnl / total_invested * 100, 2)
 
 
 def _open_pnl(trade: Trade, last_close: Optional[float]) -> Optional[float]:
@@ -413,6 +505,12 @@ def _render_add_shares_form(trade: Trade):
                 "Shares to add", min_value=0, value=0, step=1,
                 key=f"add_sh_{trade.id}",
             )
+        add_note = st.text_area(
+            "Add to notes (optional)",
+            placeholder="e.g. confirmation on heavy volume — bumping to full size",
+            height=70, key=f"add_note_{trade.id}",
+            help="Appended to the position's Notes section as a timestamped line.",
+        )
         sub1, sub2 = st.columns(2)
         with sub1:
             do_add = st.form_submit_button("Add Shares", type="primary",
@@ -424,15 +522,104 @@ def _render_add_shares_form(trade: Trade):
             if add_price <= 0 or add_shares_n <= 0:
                 st.error("Price and shares must both be > 0")
             else:
-                update_trade(
-                    trade.id,
-                    lambda t: t.add_buy(str(add_date), add_price, int(add_shares_n)),
-                )
+                def _mutate(t):
+                    t.add_buy(str(add_date), add_price, int(add_shares_n))
+                    if add_note and add_note.strip():
+                        action = f"ADD {int(add_shares_n)} @ ${add_price:,.2f}"
+                        t.append_note(action, add_note, str(add_date))
+                update_trade(trade.id, _mutate)
                 st.session_state.pop(f"adding_{trade.id}", None)
                 st.success(f"Added {_fmt_int(int(add_shares_n))} shares of {trade.ticker} @ {_fmt_money(add_price, 2)}")
                 st.rerun()
         elif cancel:
             st.session_state.pop(f"adding_{trade.id}", None)
+            st.rerun()
+
+
+def _render_move_stop_form(trade: Trade):
+    """Form to update a position's stop. Records the change in stop_history."""
+    with st.form(f"move_stop_{trade.id}", clear_on_submit=True):
+        # Header showing current state
+        cur_stop_str = (_fmt_money(trade.stop_price, 2)
+                        if trade.stop_price > 0 else "no stop set")
+        init_stop_str = (_fmt_money(trade.initial_stop_price, 2)
+                         if trade.initial_stop_price > 0 else "—")
+        st.markdown(f"**Move stop on {trade.ticker}**")
+        st.caption(
+            f"Current stop: **{cur_stop_str}** · "
+            f"Initial stop (R-multiple anchor, immutable): **{init_stop_str}** · "
+            f"Avg entry: **{_fmt_money(trade.avg_entry_price, 2)}**"
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            update_date = st.date_input("Date", value=date.today(),
+                                         key=f"stop_dt_{trade.id}")
+        with c2:
+            # Default the input to the current stop so a single-character edit
+            # is fast (don't make user retype the whole number)
+            default_val = float(trade.stop_price) if trade.stop_price > 0 else float(trade.avg_entry_price)
+            new_stop = st.number_input(
+                "New stop ($)", min_value=0.0,
+                value=default_val, step=0.01, format="%.4f",
+                key=f"stop_px_{trade.id}",
+            )
+
+        note = st.text_area(
+            "Add to notes (optional)",
+            placeholder="e.g. trailed under last week's swing low at $42.18",
+            height=70, key=f"stop_note_{trade.id}",
+            help="Appears in the Stop history table AND appended to the "
+                 "position's Notes section as a timestamped line.",
+        )
+
+        # Pre-submit warnings — non-blocking but loud
+        if 0 < new_stop < trade.stop_price:
+            st.warning(
+                f"⚠ This LOWERS your stop from {_fmt_money(trade.stop_price, 2)} "
+                f"to {_fmt_money(new_stop, 2)}. Smart trading raises stops to "
+                f"protect profits, never lowers them. Override only if you have "
+                f"a very specific reason."
+            )
+        elif new_stop > 0 and trade.avg_entry_price > 0 and new_stop > trade.avg_entry_price * 1.01:
+            # Stop above entry = locking in profit (good)
+            locked_pct = (new_stop / trade.avg_entry_price - 1) * 100
+            st.info(
+                f"✓ This sets the stop above your avg entry "
+                f"({_fmt_money(trade.avg_entry_price, 2)}) — you're locking in "
+                f"≈{locked_pct:.1f}% profit on the held shares."
+            )
+
+        sub1, sub2 = st.columns(2)
+        with sub1:
+            do_update = st.form_submit_button(
+                "Move Stop", type="primary", use_container_width=True,
+            )
+        with sub2:
+            cancel = st.form_submit_button("Cancel", use_container_width=True)
+
+        if do_update:
+            ok_msg = {"ok": True, "msg": ""}
+            def _mutate(t):
+                ok, msg = t.update_stop(str(update_date), float(new_stop), note)
+                ok_msg["ok"] = ok
+                ok_msg["msg"] = msg
+                # Also append to the position-level Notes so the running
+                # narrative captures the stop move alongside add/sell events.
+                if ok and note and note.strip():
+                    action = f"STOP → ${float(new_stop):,.2f}"
+                    t.append_note(action, note, str(update_date))
+            update_trade(trade.id, _mutate)
+            if not ok_msg["ok"]:
+                st.error(ok_msg["msg"])
+            else:
+                st.session_state.pop(f"moving_stop_{trade.id}", None)
+                st.success(
+                    f"Moved {trade.ticker} stop to {_fmt_money(float(new_stop), 2)}"
+                )
+                st.rerun()
+        elif cancel:
+            st.session_state.pop(f"moving_stop_{trade.id}", None)
             st.rerun()
 
 
@@ -460,6 +647,12 @@ def _render_sell_shares_form(trade: Trade):
                 help=f"Max {trade.net_shares} (your current holding). "
                      "Leave at max to close the entire position.",
             )
+        sell_note = st.text_area(
+            "Add to notes (optional)",
+            placeholder="e.g. taking 1/3 off at first measured-move target — letting rest run",
+            height=70, key=f"sell_note_{trade.id}",
+            help="Appended to the position's Notes section as a timestamped line.",
+        )
         sub1, sub2 = st.columns(2)
         with sub1:
             do_sell = st.form_submit_button("Sell Shares", type="primary",
@@ -476,6 +669,9 @@ def _render_sell_shares_form(trade: Trade):
                     ok, msg = t.add_sell(str(sell_date), sell_price, int(sell_shares_n))
                     ok_msg["ok"] = ok
                     ok_msg["msg"] = msg
+                    if ok and sell_note and sell_note.strip():
+                        action = f"SELL {int(sell_shares_n)} @ ${sell_price:,.2f}"
+                        t.append_note(action, sell_note, str(sell_date))
                 update_trade(trade.id, _mutate)
                 if not ok_msg["ok"]:
                     st.error(ok_msg["msg"])
@@ -497,9 +693,13 @@ def _render_sell_shares_form(trade: Trade):
 # ---------------------------------------------------------------------------
 
 def _render_trade_actions(trade: Trade):
-    """Inline action panel — add shares (if not closed), sell shares (if shares held), delete."""
-    is_adding = st.session_state.get(f"adding_{trade.id}", False)
-    is_selling = st.session_state.get(f"selling_{trade.id}", False)
+    """Inline action panel — Add Shares / Sell Shares / Move Stop / Delete.
+
+    Move Stop only renders when the position has held shares; closed positions
+    can't trail a stop on nothing."""
+    is_adding   = st.session_state.get(f"adding_{trade.id}", False)
+    is_selling  = st.session_state.get(f"selling_{trade.id}", False)
+    is_moving   = st.session_state.get(f"moving_stop_{trade.id}", False)
     is_confirming_delete = st.session_state.get(f"confirm_del_{trade.id}", False)
 
     if is_adding:
@@ -507,6 +707,9 @@ def _render_trade_actions(trade: Trade):
         return
     if is_selling:
         _render_sell_shares_form(trade)
+        return
+    if is_moving:
+        _render_move_stop_form(trade)
         return
     if is_confirming_delete:
         st.warning(f"Delete trade {trade.ticker} ({trade.id})? This removes ALL "
@@ -525,7 +728,7 @@ def _render_trade_actions(trade: Trade):
                 st.rerun()
         return
 
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 4])
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 3])
     with c1:
         if trade.status != "closed":
             if st.button("➕ Add Shares", key=f"add_btn_{trade.id}",
@@ -539,6 +742,14 @@ def _render_trade_actions(trade: Trade):
                 st.session_state[f"selling_{trade.id}"] = True
                 st.rerun()
     with c3:
+        if trade.net_shares > 0:
+            if st.button("🎯 Move Stop", key=f"stop_btn_{trade.id}",
+                         type="primary", use_container_width=True,
+                         help="Update the live stop. Initial-stop anchor for "
+                              "R-multiple math stays unchanged."):
+                st.session_state[f"moving_stop_{trade.id}"] = True
+                st.rerun()
+    with c4:
         if st.button("🗑 Delete", key=f"del_btn_{trade.id}",
                      use_container_width=True):
             st.session_state[f"confirm_del_{trade.id}"] = True
@@ -576,7 +787,7 @@ def _render_transaction_history(trade: Trade):
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Position totals — Risk shown as both $ and %
+    # Position totals — Risk shown as both $ and %, plus current vs initial stop
     r_str = f"{trade.realized_r:+.2f}R" if trade.realized_r is not None else "— (no stop)"
     rp = _risk_pct(trade)
     if trade.initial_risk_dollars > 0:
@@ -584,6 +795,19 @@ def _render_transaction_history(trade: Trade):
         risk_str = f"{_fmt_money(trade.initial_risk_dollars, 0)}{rp_str}"
     else:
         risk_str = "no stop set"
+    # Show current vs initial stop side-by-side so the trailing journey is visible
+    cur_stop_str = (_fmt_money(trade.stop_price, 2)
+                    if trade.stop_price > 0 else "—")
+    init_stop_str = (_fmt_money(trade.initial_stop_price, 2)
+                     if trade.initial_stop_price > 0 else "—")
+    stop_moved = (trade.initial_stop_price > 0
+                  and trade.stop_price > 0
+                  and abs(trade.stop_price - trade.initial_stop_price) > 0.001)
+    stop_line = (
+        f"&nbsp;&nbsp;Stop: <span style='color:{cyan}'>{cur_stop_str}</span> (current)"
+    )
+    if stop_moved:
+        stop_line += f" · initial {init_stop_str}"
     st.markdown(
         f"<div style='font-family:JetBrains Mono;font-size:0.85rem;line-height:1.7;"
         f"margin-top:0.5rem'>"
@@ -594,12 +818,33 @@ def _render_transaction_history(trade: Trade):
         f"avg exit  <span style='color:{cyan}'>{_fmt_money(trade.avg_exit_price, 2)}</span><br>"
         f"&nbsp;&nbsp;Currently holding: <b>{_fmt_int(trade.net_shares)}</b> shares "
         f"(cost basis {_fmt_money(trade.cost_basis, 0)})<br>"
-        f"&nbsp;&nbsp;Initial risk:  {risk_str}<br>"
+        f"{stop_line}<br>"
+        f"&nbsp;&nbsp;Initial risk:  {risk_str} <span style='color:{muted}'>(R-multiple anchor — does not change when you trail the stop)</span><br>"
         f"&nbsp;&nbsp;Realized P&L: <b style='color:{up if trade.realized_pnl > 0 else down}'>"
         f"{_fmt_money(trade.realized_pnl, 0, signed=True)}</b> · R-multiple: <b>{r_str}</b>"
         f"</div>",
         unsafe_allow_html=True,
     )
+
+    # Stop history table — only shown when the user has trailed the stop
+    if trade.stop_history:
+        st.markdown(
+            f"<div style='font-family:JetBrains Mono;font-size:0.85rem;"
+            f"font-weight:700;color:{cyan};margin-top:0.8rem;margin-bottom:0.2rem'>"
+            f"Stop history</div>",
+            unsafe_allow_html=True,
+        )
+        sh_rows = []
+        for i, su in enumerate(trade.stop_history, start=1):
+            sh_rows.append({
+                "#": i,
+                "Date": _fmt_date(su.date),
+                "From": _fmt_money(su.old_stop, 2) if su.old_stop > 0 else "—",
+                "To": _fmt_money(su.new_stop, 2),
+                "Δ": _fmt_money(su.new_stop - su.old_stop, 2, signed=True) if su.old_stop > 0 else "—",
+                "Note": su.note or "",
+            })
+        st.dataframe(pd.DataFrame(sh_rows), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -612,12 +857,17 @@ def _trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
     for t in trades:
         r_str = f"{t.realized_r:+.2f}" if t.realized_r is not None else "—"
         risk_pct = _risk_pct(t)
-        # Last close from the local price cache. Blank for closed positions
-        # (no held shares — last close isn't decision-relevant for the row).
-        last = _last_close_for(t.ticker) if t.net_shares > 0 else None
+        # Last close + its date from the local price cache. Blank for closed
+        # positions (no held shares — last close isn't decision-relevant).
+        last_result = _last_close_for(t.ticker) if t.net_shares > 0 else None
+        last_price = last_result[0] if last_result else None
+        last_date  = last_result[1] if last_result else ""
         # Total P&L = realized + unrealized for held shares. For closed
         # positions this collapses to realized.
-        pnl = _open_pnl(t, last)
+        pnl = _open_pnl(t, last_price)
+        # Gain/Loss % = P&L $ as a % of total capital invested. Same denominator
+        # for open/partial/closed positions so the metric is comparable.
+        gl_pct = _gain_loss_pct(t, pnl)
         rows.append({
             "id": t.id,
             "Ticker": t.ticker,
@@ -633,13 +883,15 @@ def _trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
             # For CLOSED positions this is 0 (no held shares); for OPEN/PARTIAL
             # it's the dollar value of the position at cost basis.
             "Cost $": t.cost_basis,
-            "Last $": last if last is not None else 0.0,
+            "Last $": last_price if last_price is not None else 0.0,
+            "Last Date": last_date,
             "Avg Exit": t.avg_exit_price if t.total_shares_sold > 0 else 0.0,
             "Stop": t.stop_price if t.stop_price > 0 else 0.0,
             "Risk $": t.initial_risk_dollars,
             "Risk %": risk_pct if risk_pct is not None else None,
             "Realized $": t.realized_pnl,
             "P&L $": pnl if pnl is not None else 0.0,
+            "G/L %": gl_pct if gl_pct is not None else None,
             "R": r_str,
             "Notes": t.notes,
         })
@@ -690,9 +942,14 @@ def _render_trades_table(trades: list[Trade]):
         ),
         "Last $":     st.column_config.NumberColumn(
             "Last $", format="$%,.2f", width="small", alignment="center",
-            help="Most recent close from the local price cache (populated by every full scan). "
-                 "Blank/0 for closed positions and any ticker that hasn't been in a scan yet. "
-                 "Approximate — refreshed only when you run a scan.",
+            help="Most recent close from the local price cache (populated by every full scan or "
+                 "the Refresh Prices sidebar button). Blank/0 for closed positions and any "
+                 "ticker that hasn't been in a scan yet.",
+        ),
+        "Last Date":  st.column_config.TextColumn(
+            "Last Date", width="small", alignment="center",
+            help="Date of the cached close shown in Last $. If this is older than yesterday, "
+                 "your data is stale — click the Refresh Prices button in the sidebar to fetch fresh closes.",
         ),
         "Avg Exit":   st.column_config.NumberColumn("Avg Exit", format="$%,.2f", width="small", alignment="center"),
         "Stop":       st.column_config.NumberColumn("Stop", format="$%,.2f", width="small", alignment="center"),
@@ -709,6 +966,11 @@ def _render_trades_table(trades: list[Trade]):
                  "For CLOSED positions this equals Realized. For OPEN/PARTIAL positions it includes "
                  "the unrealized swing on currently-held shares using the last cached close.",
         ),
+        "G/L %":      st.column_config.NumberColumn(
+            "G/L %", format="%+.1f%%", width="small", alignment="center",
+            help="Gain/Loss as % of total capital invested: P&L $ ÷ (Avg Entry × Total Shares Bought) × 100. "
+                 "Return on capital across the full life of the position — comparable across open/partial/closed.",
+        ),
         "R":          st.column_config.TextColumn(
             "R-Multiple", width="small", alignment="center",
             help="Realized R-multiple: Realized $ ÷ Initial Risk $. "
@@ -722,7 +984,7 @@ def _render_trades_table(trades: list[Trade]):
     # use a callback that handles both shapes. Streamlit composes the Styler
     # CSS on top of the column_config format strings — they don't conflict.
     # Use .map() (pandas 2.1+); fall back to .applymap() for older pandas.
-    pnl_cols = [c for c in ("Realized $", "P&L $", "R") if c in display.columns]
+    pnl_cols = [c for c in ("Realized $", "P&L $", "G/L %", "R") if c in display.columns]
     if pnl_cols:
         try:
             styled = display.style.map(_negative_red, subset=pnl_cols)
@@ -742,6 +1004,11 @@ def _render_trades_table(trades: list[Trade]):
         selection_mode="single-row",
         key="journal_table",
     )
+
+    # Aggregate totals for held positions (sum of P&L on open holdings).
+    # Renders right below the table so it's always visible, regardless of
+    # whether a row is selected for the detail expander below.
+    _render_held_totals(trades)
 
     # On row click — show transaction history + actions for that trade
     if selection and "selection" in selection and selection["selection"].get("rows"):
@@ -764,7 +1031,21 @@ def _render_trades_table(trades: list[Trade]):
                     unsafe_allow_html=True)
 
         if trade.notes:
-            st.markdown(f"**Notes:** {trade.notes}")
+            # white-space: pre-wrap preserves the \n line breaks that
+            # append_note inserts between timestamped action entries, while
+            # still wrapping long lines naturally. The dark panel + monospace
+            # font keep the running log visually distinct from chart prose.
+            import html as _html
+            notes_html = _html.escape(trade.notes)
+            st.markdown(
+                f"<div style='font-family:JetBrains Mono;font-size:0.82rem;"
+                f"white-space:pre-wrap;background:#0F1620;padding:0.6rem 0.8rem;"
+                f"border-radius:4px;border:1px solid #1F2937;margin-top:0.3rem;"
+                f"line-height:1.55'>"
+                f"<b style='color:{cyan}'>Notes</b>\n{notes_html}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
         # Transaction history table
         st.markdown("##### Transactions")
@@ -845,11 +1126,36 @@ def _journal_toc_dialog():
         "R-multiple anchored to your initial risk."
     )
     st.markdown(
-        "**Click any row** to see its full transaction history and the per-row "
-        "action buttons:\n"
+        "**Click any row** to see its full transaction history, stop history, "
+        "and the per-row action buttons:\n"
         "- **➕ Add Shares** — log a pyramid add (new BUY transaction)\n"
         "- **➖ Sell Shares** — log a partial exit or close (new SELL transaction)\n"
+        "- **🎯 Move Stop** — trail your stop higher as the trade progresses "
+        "(the initial-stop anchor for R-multiple math doesn't change — see Stop tracking below)\n"
         "- **🗑 Delete** — remove the whole position (with confirmation)"
+    )
+
+    st.markdown("---")
+    st.markdown("### Stop tracking — initial vs current")
+    st.markdown(
+        "The journal tracks **two** stops per position:\n\n"
+        "- **Initial stop** (`initial_stop_price`) — set once at trade entry, "
+        "never changes. This is what `Risk $` / `Risk %` / `R-Multiple` are "
+        "anchored to. The whole point: if you raise your stop to lock in "
+        "profit, you don't want the risk basis to shrink retroactively — that "
+        "would inflate every winning trade's R-multiple to absurd levels and "
+        "ruin the expectancy math.\n\n"
+        "- **Current stop** (`stop_price`, the one shown in the **Stop** column) — "
+        "the live trailing stop. Update it via **🎯 Move Stop** whenever you "
+        "tighten. Each change is logged with date + old/new value + optional note, "
+        "and you can see the full progression in the **Stop history** table that "
+        "appears in the row's detail area.\n\n"
+        "**Why this matters for Minervini-style trading:** the discipline of "
+        "progressive stop-tightening (move to breakeven once you're +10-15%, "
+        "trail under successive higher lows, lock in 50% gains at the right "
+        "moment) is half of what separates winners from losers. The journal "
+        "lets you replay your stop decisions later and ask: did I tighten too "
+        "early? Too late? Did I give back too much profit before the trail caught?"
     )
 
     st.markdown("---")
@@ -863,13 +1169,15 @@ def _journal_toc_dialog():
         "Held":       "Net shares currently held (total bought − total sold).",
         "Avg Entry":  "Weighted-average price across all BUY transactions.",
         "Cost $":     "Cost basis of currently-held shares (Held × Avg Entry). Position size in dollars at cost. 0 for closed positions.",
-        "Last $":     "Most recent close from the local price cache (populated by every full scan). Blank/0 for closed positions or tickers that haven't been in a scan yet.",
+        "Last $":     "Most recent close from the local price cache (populated by every full scan or the Refresh Prices sidebar button). Blank/0 for closed positions or tickers that haven't been in a scan yet.",
+        "Last Date":  "Date of the cached close shown in Last $. If older than yesterday, your data is stale — use the Refresh Prices button in the sidebar.",
         "Avg Exit":   "Weighted-average price across all SELL transactions (0 if nothing sold).",
         "Stop":       "Initial stop price. 0 means no stop was set — R-multiple won't compute.",
         "Risk $":     "Initial dollar risk: (starter entry − stop) × starter shares. 0 if no stop set.",
         "Risk %":     "Stop distance as % of starter entry: (entry − stop) / entry × 100. Minervini caps at ~7-8% max; tighter (3-5%) is preferred on clean VCPs.",
         "Realized $": "Realized P&L using weighted-average-cost (proceeds − avg_entry × shares_sold).",
         "P&L $":      "Total P&L right now: Realized + (Last − Avg Entry) × Held. For CLOSED positions equals Realized. For OPEN/PARTIAL adds the unrealized swing on currently-held shares.",
+        "G/L %":      "Gain/Loss as % of total capital invested: P&L $ ÷ (Avg Entry × Total Shares Bought) × 100. Return on capital comparable across open/partial/closed positions.",
         "R-Multiple": "Realized R-multiple: Realized $ ÷ Initial Risk $. +2 means the trade returned 2× your initial risk; −1 means you lost the full risked amount. Shows \"—\" if no stop was set.",
     }
     for col, doc in cols_docs.items():

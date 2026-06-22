@@ -21,6 +21,7 @@ from scanner.quality import (
     load_latest_quality_scan,
     QUALITY_SCANS_DIR,
 )
+from scanner.system_helpers import keep_awake, allow_sleep
 from .style import PALETTE, panel
 from .excel_export import format_dataframe_to_excel
 
@@ -560,7 +561,11 @@ def render_quality_sidebar():
 
 
 def _run_quality_scan_with_progress():
-    """Execute run_quality_scan with a Streamlit progress bar in the sidebar."""
+    """Execute run_quality_scan with a Streamlit progress bar in the sidebar.
+
+    Wrapped in keep_awake/allow_sleep so Windows doesn't put the laptop to
+    sleep mid-scan (Quality scans take ~15-25 minutes — stepping away with
+    no power-management override means a sleep event kills the scan)."""
     bar = st.progress(0.0, text="Quality scan starting…")
 
     stage_weights = {
@@ -586,11 +591,14 @@ def _run_quality_scan_with_progress():
         last_pct = global_pct
         bar.progress(global_pct, text=f"[QUALITY · {stage.upper()}] {msg}")
 
+    keep_awake()
     try:
         result = run_quality_scan(progress=_prog)
         bar.progress(1.0, text=f"Quality scan complete — {len(result.candidates)} stocks rated")
     except Exception as e:
         st.error(f"Quality scan failed: {e}")
+    finally:
+        allow_sleep()
 
 
 # ---------------------------------------------------------------------------

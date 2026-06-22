@@ -24,6 +24,7 @@ from scanner.mean_reversion import (
     DEFAULT_PULLBACK_TOLERANCE_PCT,
     DEFAULT_MIN_COMPOSITE,
 )
+from scanner.system_helpers import keep_awake, allow_sleep
 from .style import PALETTE, panel
 from .excel_export import format_dataframe_to_excel
 
@@ -473,18 +474,23 @@ def render_mean_reversion_sidebar():
 
 
 def _run_mr_scan_with_progress():
-    """Run the scan with a sidebar progress bar."""
+    """Run the scan with a sidebar progress bar. Wrapped in keep_awake/allow_sleep
+    for consistency with the other scans — MR is usually 10-30 sec but the
+    sleep override is cheap insurance against an unexpectedly slow run."""
     bar = st.progress(0.0, text="Mean Reversion scan starting…")
 
     def _prog(stage, completed, total, msg):
         pct = (completed / max(1, total)) if total else 0.0
         bar.progress(min(1.0, pct), text=f"[MR · {stage.upper()}] {msg}")
 
+    keep_awake()
     try:
         result = run_mean_reversion_scan(progress=_prog)
         bar.progress(1.0, text=f"Mean Reversion scan complete — {len(result.candidates)} candidates")
     except Exception as e:
         st.error(f"Mean Reversion scan failed: {e}")
+    finally:
+        allow_sleep()
 
 
 # ---------------------------------------------------------------------------

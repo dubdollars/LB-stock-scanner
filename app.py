@@ -396,11 +396,13 @@ def _trigger_rescan(settings: ScanSettings, demo: bool = False):
 def _trigger_social_rescan(settings: SocialScanSettings):
     """Run a fresh social scan and update session state. UI-thin wrapper that
     surfaces progress + errors via the same Streamlit primitives used by the
-    long/short rescan helpers. Sleep-prevention isn't worth it here — social
-    scans take ~30-60 sec, not 30+ min."""
+    long-side rescan helper. Sleep-prevention added 2026-06-15 for parity
+    with all other scan runners — social is usually ~30-60 sec but the
+    override is cheap insurance if Apewisdom or yfinance hangs."""
     progress_container = st.empty()
     bar = progress_container.progress(0.0, text="Starting social scan...")
     status = st.empty()
+    _keep_awake()
 
     PHASES = ["apewisdom", "enrich", "spike", "done"]
 
@@ -426,6 +428,7 @@ def _trigger_social_rescan(settings: SocialScanSettings):
         raise
     finally:
         progress_container.empty()
+        _allow_sleep()
 
 
 # ---------------------------------------------------------------------------
@@ -2187,20 +2190,34 @@ def render_rotation_page():
     cyan = PALETTE["accent_cyan"]
     muted = PALETTE["text_muted"]
 
-    # Need a long scan to anchor the rotation table
+    # Rotation now sources from Quality scans (broader universe, more history
+    # available). The Momentum scan is still used for Layer 2 (industry-leader
+    # drill-down) since those candidates have the actual SEPA setups.
     scan = st.session_state.latest_scan or {}
-    if not scan or not scan.get("candidates"):
-        st.warning(
-            "No momentum scan loaded — rotation analysis needs a recent scan to anchor on. "
-            "Switch to MOMENTUM mode and click Run Scan first, then come back."
-        )
-        return
 
-    # Compute the rotation table (cheap — reads cached scan JSONs)
-    from scanner.rotation import compute_rotation_table
+    # Compute the rotation table — internally prefers Quality scans, falls
+    # back to Momentum if no Quality scans exist.
+    from scanner.rotation import compute_rotation_table, list_quality_scans
     result = compute_rotation_table(scan)
     rot_df = result["df"]
     history = result["history"]
+    rotation_source = result.get("source", "none")
+
+    # If rotation couldn't compute at all, tell the user what's needed
+    if rot_df.empty:
+        if not list_quality_scans() and not (scan and scan.get("candidates")):
+            st.warning(
+                "Rotation analysis needs a scan to anchor on. Run a Quality scan "
+                "(QUALITY tab → ▶ Run Scan) — that gives the rotation table the "
+                "broadest, most statistically meaningful industry universe. "
+                "Momentum scans also work as a fallback if you've run one."
+            )
+        else:
+            st.warning(
+                "Rotation couldn't compute industry rankings. The most recent scan "
+                "may not have enough industry-tagged data."
+            )
+        return
 
     selected = st.session_state.get("rotation_selected_industry")
 
@@ -2366,14 +2383,18 @@ def render_rotation_page():
         )
         st.markdown(signal_banner(sig, subtitle), unsafe_allow_html=True)
 
-    # History availability note
+    # History availability note + source label
     short_hist = history.get("short")
     long_hist = history.get("long")
     short_note = "1w data: ✓" if short_hist else "1w data: not yet (need a scan from ~7 days ago)"
     long_note = "4w data: ✓" if long_hist else "4w data: not yet (need a scan from ~28 days ago)"
+    source_label = {
+        "quality":  "Source: Quality scans",
+        "momentum": "Source: Momentum scans (fallback — run a Quality scan for better history)",
+    }.get(rotation_source, "Source: —")
     st.markdown(
         f"<div style='color:{muted};font-size:0.78rem;margin:0.5rem 0 0.8rem 0;font-family:JetBrains Mono'>"
-        f"History: {short_note} · {long_note}"
+        f"{source_label} · {short_note} · {long_note}"
         f"</div>",
         unsafe_allow_html=True,
     )

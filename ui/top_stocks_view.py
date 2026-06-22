@@ -453,11 +453,15 @@ def render_top_stocks_page():
     )
 
     # ---- Pull the user's slider state (with default fallbacks) ----
-    min_comp = st.session_state.get("ts_min_composite", DEFAULT_MIN_COMPOSITE)
-    min_eps  = st.session_state.get("ts_min_eps", DEFAULT_MIN_EPS)
-    min_ad   = st.session_state.get("ts_min_ad", DEFAULT_MIN_AD)
-    min_ud   = st.session_state.get("ts_min_ud_vol", DEFAULT_MIN_UD_VOL)
-    max_rsi  = st.session_state.get("ts_max_rsi", DEFAULT_MAX_RSI)
+    # Industry-rank slider is read here too so we can apply its filter BEFORE
+    # rendering the ELITE PICKS tile (fixes 2026-06-17 bug where the tile
+    # showed the pre-industry-filter count and disagreed with the table below).
+    min_comp     = st.session_state.get("ts_min_composite", DEFAULT_MIN_COMPOSITE)
+    min_eps      = st.session_state.get("ts_min_eps", DEFAULT_MIN_EPS)
+    min_ad       = st.session_state.get("ts_min_ad", DEFAULT_MIN_AD)
+    min_ud       = st.session_state.get("ts_min_ud_vol", DEFAULT_MIN_UD_VOL)
+    max_rsi      = st.session_state.get("ts_max_rsi", DEFAULT_MAX_RSI)
+    max_ind_rank = int(st.session_state.get("ts_max_ind_rank", 150))
 
     # ---- Compute ----
     result = compute_top_stocks(
@@ -467,6 +471,20 @@ def render_top_stocks_page():
         min_ud_vol=min_ud,
         max_rsi=max_rsi,
     )
+
+    # ---- Apply the industry-rank slider BEFORE tile rendering ----
+    # compute_top_stocks() doesn't know about Industry_Rank, so the industry
+    # filter has to be applied here. The post-filter count is what feeds BOTH
+    # the ELITE PICKS tile AND the table below — keeping them in sync.
+    candidates_filtered = result.candidates or []
+    if max_ind_rank < 150:
+        candidates_filtered = [
+            c for c in candidates_filtered
+            if c.get("Industry_Rank") is None
+            or (isinstance(c.get("Industry_Rank"), (int, float))
+                and c["Industry_Rank"] <= max_ind_rank)
+        ]
+    elite_count_after_all_filters = len(candidates_filtered)
 
     # ---- Freshness warning (your answer #3: warning + empty until both fresh) ----
     if not result.both_fresh:
@@ -521,9 +539,12 @@ def render_top_stocks_page():
         return
 
     # ---- Tiles ----
+    # ELITE PICKS uses the post-industry-filter count so the tile matches the
+    # table row count exactly. The other tiles are scan-level and unaffected
+    # by per-page filters.
     _render_top_stocks_tiles(
         result.long_count, result.quality_count,
-        result.intersection_count, result.elite_count,
+        result.intersection_count, elite_count_after_all_filters,
     )
 
     # ---- Filter sliders ----
@@ -572,7 +593,9 @@ def render_top_stocks_page():
     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
     # ---- The table ----
-    candidates = result.candidates
+    # Use the already-industry-filtered list from above so the table count
+    # matches the ELITE PICKS tile exactly.
+    candidates = candidates_filtered
     if not candidates:
         st.info(
             f"No stocks pass the current filters. "
@@ -580,18 +603,6 @@ def render_top_stocks_page():
             "loosen the sliders to see more."
         )
         return
-
-    # Apply Industry filter (added 2026-06-07): drop rows whose Industry_Rank
-    # exceeds the user's slider value. Rows with missing Industry_Rank are
-    # kept (graceful — don't filter out stocks just because rank wasn't computed).
-    max_ind_rank = int(st.session_state.get("ts_max_ind_rank", 150))
-    if max_ind_rank < 150:
-        candidates = [
-            c for c in candidates
-            if c.get("Industry_Rank") is None
-            or (isinstance(c.get("Industry_Rank"), (int, float))
-                and c["Industry_Rank"] <= max_ind_rank)
-        ]
 
     # Build the dataframe — drop the carried-along _long/_quality private cols.
     # Also drop Buy_Trigger and Stop per user request (2026-06-02): the row

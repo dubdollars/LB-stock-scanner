@@ -85,6 +85,18 @@ class Transaction:
 
 
 @dataclass
+class StopUpdate:
+    """One stop-adjustment event. Logs every time the user trails their stop
+    so the journal can show the progression: entry stop → breakeven → first
+    pullback low → etc. Useful for post-trade analysis ('did I tighten too
+    early?' / 'did I get stopped on noise?')."""
+    date: str = ""              # YYYY-MM-DD
+    old_stop: float = 0.0
+    new_stop: float = 0.0
+    note: str = ""              # optional rationale ("under prior swing low", etc.)
+
+
+@dataclass
 class Trade:
     """One position. Multiple transactions accumulate inside it.
 
@@ -92,15 +104,24 @@ class Trade:
     entry. Additional BUYs are pyramid adds. SELLs are partial exits (with
     the final SELL being the close).
 
+    Stop fields:
+      stop_price: the CURRENT (live, mutable) stop. Updated by update_stop().
+      initial_stop_price: the ORIGINAL stop set at entry. Immutable. Used as
+        the R-multiple anchor — raising your stop to lock profit shouldn't
+        retroactively shrink your initial-risk basis (that would inflate R
+        and make the expectancy math meaningless).
+
     All money in dollars. Dates are 'YYYY-MM-DD' strings.
     """
     id: str = ""
     ticker: str = ""
     setup_tag: str = "Other"
-    stop_price: float = 0.0      # 0 = no stop / N/A (R-multiple won't compute)
+    stop_price: float = 0.0           # CURRENT stop (mutable; updated as you trail)
+    initial_stop_price: float = 0.0   # IMMUTABLE anchor for R-multiple math
     notes: str = ""
-    created_at: str = ""         # ISO timestamp when row was first written
+    created_at: str = ""              # ISO timestamp when row was first written
     transactions: list = field(default_factory=list)
+    stop_history: list = field(default_factory=list)  # list[StopUpdate]
 
     # ---- Constructors ----
 
@@ -108,12 +129,18 @@ class Trade:
     def new(cls, ticker: str, setup_tag: str, entry_date: str,
             entry_price: float, stop_price: float, shares: int,
             notes: str = "") -> "Trade":
-        """Construct a fresh trade with one BUY transaction (the starter)."""
+        """Construct a fresh trade with one BUY transaction (the starter).
+
+        Sets BOTH stop_price (current/mutable) AND initial_stop_price (immutable
+        R-multiple anchor) to the same value at entry.
+        """
+        sp = round(float(stop_price), 4) if stop_price else 0.0
         t = cls(
             id=str(uuid.uuid4())[:8],
             ticker=ticker.strip().upper(),
             setup_tag=setup_tag if setup_tag in SETUP_TAGS else "Other",
-            stop_price=round(float(stop_price), 4) if stop_price else 0.0,
+            stop_price=sp,
+            initial_stop_price=sp,
             notes=notes.strip(),
             created_at=datetime.utcnow().isoformat() + "Z",
             transactions=[
@@ -155,6 +182,63 @@ class Trade:
             price=round(float(price), 4),
             shares=sh,
         ))
+        return True, ""
+
+    def append_note(self, action: str, text: str, date: str = "") -> None:
+        """Append a timestamped, action-tagged line to self.notes.
+
+        Used by Add Shares / Sell Shares / Move Stop to grow the position's
+        Notes into a running narrative. No-op if text is empty/whitespace.
+
+        Format: '[14Jun2026 · ADD 50 @ $43.20] confirmation on volume'
+        """
+        if not text or not text.strip():
+            return
+        # Format date as DDmmmYYYY to match the UI's date display
+        date_str = ""
+        if date:
+            try:
+                d = datetime.strptime(str(date)[:10], "%Y-%m-%d")
+                date_str = d.strftime("%d%b%Y")
+            except Exception:
+                date_str = str(date)[:10]
+        prefix = f"[{date_str} · {action}]" if date_str else f"[{action}]"
+        line = f"{prefix} {text.strip()}"
+        self.notes = (self.notes.rstrip() + "\n" + line) if self.notes else line
+
+    def update_stop(self, date: str, new_stop: float, note: str = "") -> tuple[bool, str]:
+        """Move the live stop to a new level and log the change.
+
+        Rules:
+          - Position must still be open or partial (net_shares > 0). No stop
+            updates on closed positions.
+          - new_stop must be > 0. Use 0 / no-stop only at trade construction.
+          - initial_stop_price is NOT touched. R-multiple math stays anchored
+            to the original risk so that a trailing-stop tighten doesn't
+            retroactively inflate the realized-R reading.
+
+        Returns (ok, error_message). Caller should check the return.
+        """
+        try:
+            new_sp = round(float(new_stop), 4)
+        except (TypeError, ValueError):
+            return False, "Invalid stop value"
+        if new_sp <= 0:
+            return False, "New stop must be > 0 (use 0 only at trade entry to mean 'no stop')"
+        if self.net_shares == 0:
+            return False, "Can't update stop on a closed position"
+        old_sp = self.stop_price
+        # Backfill initial_stop_price for legacy trades that don't have it
+        # (loaded via _trade_from_row should already cover this, but belt-and-braces)
+        if not self.initial_stop_price or self.initial_stop_price <= 0:
+            self.initial_stop_price = old_sp if old_sp > 0 else new_sp
+        self.stop_history.append(StopUpdate(
+            date=date,
+            old_stop=round(float(old_sp), 4),
+            new_stop=new_sp,
+            note=note.strip(),
+        ))
+        self.stop_price = new_sp
         return True, ""
 
     # ---- Computed properties ----
@@ -210,16 +294,22 @@ class Trade:
 
     @property
     def initial_risk_dollars(self) -> float:
-        """Risk anchored to the starter trade: (starter_price - stop) × starter_shares.
+        """Risk anchored to the ORIGINAL stop: (starter_price - initial_stop) × starter_shares.
+
+        Uses initial_stop_price (not the current stop) so that trailing the
+        stop up doesn't shrink the risk basis and inflate realized R-multiples.
+        Falls back to stop_price for legacy trades that don't have
+        initial_stop_price recorded yet.
 
         Returns 0 if no stop was set (or stop >= entry).
         """
         if not self.buys:
             return 0.0
         starter = self.buys[0]
-        if self.stop_price <= 0 or self.stop_price >= starter.price:
+        anchor = self.initial_stop_price if self.initial_stop_price > 0 else self.stop_price
+        if anchor <= 0 or anchor >= starter.price:
             return 0.0
-        return round((starter.price - self.stop_price) * starter.shares, 2)
+        return round((starter.price - anchor) * starter.shares, 2)
 
     @property
     def realized_r(self) -> Optional[float]:
@@ -294,15 +384,28 @@ def _migrate_v1_record(row: dict) -> dict:
 
 
 def _trade_from_row(row: dict) -> Trade:
-    """Build a Trade from a JSON row, handling Transaction conversion."""
+    """Build a Trade from a JSON row, handling Transaction + StopUpdate conversion.
+
+    Backwards-compat: trades saved before initial_stop_price + stop_history
+    existed (anything before 2026-06-17) get those fields backfilled:
+      - initial_stop_price defaults to stop_price (so R-multiple math keeps
+        the same anchor as before)
+      - stop_history defaults to empty list
+    """
     row = _migrate_v1_record(row)
     raw_txs = row.pop("transactions", [])
     txs = [Transaction(**tx) if isinstance(tx, dict) else tx for tx in raw_txs]
+    raw_sh = row.pop("stop_history", []) or []
+    stop_hist = [StopUpdate(**su) if isinstance(su, dict) else su for su in raw_sh]
     # Defensive: fill any missing top-level fields with defaults
     for fld in ("id", "ticker", "setup_tag", "notes", "created_at"):
         row.setdefault(fld, "")
     row.setdefault("stop_price", 0.0)
-    return Trade(transactions=txs, **row)
+    # Backfill initial_stop_price from stop_price for legacy trades that
+    # pre-date the field's existence.
+    if "initial_stop_price" not in row or not row.get("initial_stop_price"):
+        row["initial_stop_price"] = row.get("stop_price", 0.0)
+    return Trade(transactions=txs, stop_history=stop_hist, **row)
 
 
 def _row_from_trade(t: Trade) -> dict:
