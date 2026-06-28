@@ -33,7 +33,9 @@ import yfinance as yf
 from .setups import (
     calc_atr,
     detect_breakout_today,
+    detect_cheat_setup,
     detect_extension_from_50ma,
+    detect_gap_up_today,
     detect_power_play,
     detect_vcp_contractions,
     find_pivot_point,
@@ -1729,13 +1731,46 @@ def _build_signals_warnings(
     days_to_earnings: Optional[int],
     risk_pct: float,
     squat_today: bool,
+    cheat: Optional[dict] = None,
+    gap_up: Optional[dict] = None,
+    pressure_20d: float = 1.0,
 ) -> tuple[list[str], list[str]]:
+    """Build the green-signal + red-warning tag lists for a candidate.
+
+    Signal priority order (left-to-right in the table):
+      BUY ZONE → BO TODAY → CHEAT → POWER PLAY → GAP UP → RS✓ → VCP-A → VCP-B
+
+    BUY ZONE (added 2026-06-30 — Minervini Triple Barrel equivalent):
+      Anticipatory pre-breakout entry window. Fires when ALL four are true:
+        - Trend template intact (free — every Momentum candidate has this)
+        - Pressure_20d >= 1.3 (20-day up-vol/down-vol confirms accumulation)
+        - Pct_Above_50MA in [-3, +10] (near support, not chasing)
+        - VCP_Quality is A, B, or C (some pattern structure exists)
+      The point: catch stocks while they're STILL in their base with
+      institutions accumulating — before the obvious BO TODAY signal fires
+      at the breakout (where stops are wide and you're already extended).
+    """
     signals = []
     warnings_list = []
+    # BUY ZONE — anticipatory composite, surfaced FIRST in the priority order
+    # because it's the highest-leverage entry signal (low risk, before crowd).
+    pct_50ma = extension.get("pct_above_50ma", 0.0) if extension else 0.0
+    vcp_quality = vcp.get("quality") if vcp else None
+    in_buy_zone = (
+        pressure_20d >= 1.3
+        and -3.0 <= pct_50ma <= 10.0
+        and vcp_quality in ("A", "B", "C")
+    )
+    if in_buy_zone:
+        signals.append("BUY ZONE")
     if breakout.get("is_breakout"):
         signals.append("BO TODAY")
+    if cheat and cheat.get("is_cheat"):
+        signals.append("CHEAT")
     if power_play.get("is_power_play"):
         signals.append("POWER PLAY")
+    if gap_up and gap_up.get("is_gap_up"):
+        signals.append("GAP UP")
     if rs_new_high:
         signals.append("RS✓")
     if vcp.get("quality") == "A":
@@ -1865,6 +1900,37 @@ def run_filters(
             power_play = detect_power_play(data)
             breakout = detect_breakout_today(data, pivot_price, float(avg_vol_50))
             extension = detect_extension_from_50ma(close, float(sma_50))
+            # CHEAT and GAP UP — added 2026-06-30 as Minervini-style early-entry
+            # and catalyst-day setups. CHEAT needs the VCP contraction list; if
+            # no qualifying VCP, it returns is_cheat=False harmlessly.
+            cheat = detect_cheat_setup(
+                data, vcp_quality.get("contractions") or [],
+                pivot_price, float(avg_vol_50),
+            )
+            gap_up = detect_gap_up_today(data, float(avg_vol_50))
+
+            # 20-day Pressure (Minervini accumulation gauge) — sum of volume on
+            # up days vs down days over the last 20 sessions. Ratio > 1 means
+            # institutional accumulation; the actual signal threshold for
+            # BUY ZONE is 1.3+. Cheap to compute (~0.1ms per ticker).
+            pressure_20d = 1.0
+            try:
+                if len(data) >= 21:
+                    last_21 = data.tail(21)
+                    closes = last_21["Close"]
+                    vols   = last_21["Volume"]
+                    diff   = closes.diff()
+                    up_vol_sum   = float(vols[diff > 0].sum())
+                    down_vol_sum = float(vols[diff < 0].sum())
+                    if down_vol_sum > 0:
+                        pressure_20d = round(up_vol_sum / down_vol_sum, 2)
+                    elif up_vol_sum > 0:
+                        # All up-days in the last 20 — saturate at a high value
+                        # rather than reporting infinity. 5.0 reads cleanly as
+                        # "very strong accumulation."
+                        pressure_20d = 5.0
+            except Exception:
+                pass
 
             squat_today = False
             try:
@@ -1885,6 +1951,8 @@ def run_filters(
                 rs_new_high=rs_new_high_bool, vcp=vcp_quality,
                 extension=extension, days_to_earnings=days_to_er,
                 risk_pct=risk_pct, squat_today=squat_today,
+                cheat=cheat, gap_up=gap_up,
+                pressure_20d=pressure_20d,
             )
 
             sector_val, industry_val = sector_map.get(ticker, ("N/A", "N/A"))
@@ -1921,6 +1989,7 @@ def run_filters(
                 "VCP_Count": vcp_quality.get("count", 0),
                 "VDU": vdu_display,
                 "Pct_Above_50MA": extension.get("pct_above_50ma", 0.0),
+                "Pressure_20d": pressure_20d,
                 "Power_Play": power_play.get("is_power_play", False),
                 "Breakout_Today": breakout.get("is_breakout", False),
                 "Vol_vs_Avg": breakout.get("vol_ratio", 0.0),

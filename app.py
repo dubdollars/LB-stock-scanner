@@ -1136,7 +1136,7 @@ def _candidates_dataframe(candidates: list[dict]) -> pd.DataFrame:
     # in the EARLY scan against the full universe.
     column_order = [
         "Ticker", "Tier", "RS", "RSI", "PEG", "Signals_Display", "Warnings_Display",
-        "RS_NH", "VCP_Quality", "VDU", "Fundamentals",
+        "RS_NH", "VCP_Quality", "VDU", "Pressure_20d", "Fundamentals",
         "Price", "Buy_Trigger", "Stop", "Risk_Pct",
         "Pct_Above_50MA", "Vol_vs_Avg", "Days_To_Earnings", "Earnings_Date",
         "Index", "Industry_Rank", "Sector", "Market_Cap", "Industry",
@@ -1152,8 +1152,9 @@ def _render_results_table(scan: dict):
         st.info("No candidates passed the screen. The market may be in a bad regime, or settings are too strict.")
         return
 
-    # Initialize toggle state for the 5 filter buttons (persists across reruns)
-    for _k in ("flt_trade_now", "flt_watch_list", "flt_vcp_ab", "flt_vcp_b", "flt_breakout"):
+    # Initialize toggle state for the 6 filter buttons (persists across reruns)
+    for _k in ("flt_trade_now", "flt_watch_list", "flt_vcp_ab", "flt_vcp_b",
+                "flt_breakout", "flt_buy_zone"):
         if _k not in st.session_state:
             st.session_state[_k] = False
 
@@ -1180,6 +1181,10 @@ def _render_results_table(scan: dict):
         _count(df["Signals_Display"].astype(str).str.contains("BO TODAY", na=False))
         if "Signals_Display" in df.columns else 0
     )
+    n_buy_zone = (
+        _count(df["Signals_Display"].astype(str).str.contains("BUY ZONE", na=False))
+        if "Signals_Display" in df.columns else 0
+    )
 
     def _btn_label(base: str, active: bool, count: int) -> str:
         # When active, append "(N)" instead of a checkmark. When inactive,
@@ -1190,15 +1195,17 @@ def _render_results_table(scan: dict):
     # and text input (which have labels above them taking ~1.6rem of height)
     _BTN_SPACER = "<div style='height:1.65rem'></div>"
 
-    # Filters row — Index | Industry | 5 toggle buttons | Search.
+    # Filters row — Index | Industry | 6 toggle buttons | Search.
     # Industry filter added 2026-06-07: filter to stocks in top-N industry
     # groups by RS rank. O'Neil's research: ~49% of a stock's price move is
     # attributable to its industry group, so filtering to top industries is
     # the cleanest single-knob quality bump available.
     # VCP B Only added 2026-06-11 — A-grade is rare; B-grade is the practical
     # daily watchlist filter.
-    fcol1, fcol_ind, fcol2, fcol3, fcol4, fcol_b, fcol5, fcol6 = st.columns(
-        [1.6, 1.6, 1.3, 1.3, 1.2, 1.2, 1.3, 1.8]
+    # BUY ZONE added 2026-06-30 — Minervini Triple Barrel composite (Pressure +
+    # near-50MA + VCP). Anticipatory pre-breakout entry filter.
+    fcol1, fcol_ind, fcol2, fcol3, fcol4, fcol_b, fcol5, fcol_bz, fcol6 = st.columns(
+        [1.5, 1.5, 1.2, 1.2, 1.1, 1.1, 1.2, 1.2, 1.6]
     )
     with fcol1:
         idx_filter = st.multiselect("Index", options=sorted(df["Index"].unique()), default=None, placeholder="All")
@@ -1263,6 +1270,18 @@ def _render_results_table(scan: dict):
             st.session_state.flt_breakout = not st.session_state.flt_breakout
             st.rerun()
         breakout_only = st.session_state.flt_breakout
+    with fcol_bz:
+        st.markdown(_BTN_SPACER, unsafe_allow_html=True)
+        label = _btn_label("BUY ZONE", st.session_state.flt_buy_zone, n_buy_zone)
+        if st.button(label, type="primary", use_container_width=True, key="btn_buy_zone",
+                     help="Minervini Triple Barrel composite — accumulation building "
+                          "(Pressure 20d ≥1.3) while still near 50MA (-3% to +10%) "
+                          "with a VCP pattern forming. Anticipatory pre-breakout "
+                          "entry window — buy near support with tight stop, before "
+                          "the obvious breakout when you'd be extended."):
+            st.session_state.flt_buy_zone = not st.session_state.flt_buy_zone
+            st.rerun()
+        buy_zone_only = st.session_state.flt_buy_zone
     with fcol6:
         search = st.text_input("Search", placeholder="e.g. NVDA or tech")
 
@@ -1283,6 +1302,8 @@ def _render_results_table(scan: dict):
         filtered = filtered[filtered["VCP_Quality"].isin(accepted_vcp)]
     if breakout_only and "Signals_Display" in filtered.columns:
         filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("BO TODAY", na=False)]
+    if buy_zone_only and "Signals_Display" in filtered.columns:
+        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("BUY ZONE", na=False)]
     # Tier filters — if both Trade Now AND Watch List are checked, show A+B
     if (trade_now or watch_list) and "Tier" in filtered.columns:
         accepted_tiers = []
@@ -1337,6 +1358,13 @@ def _render_results_table(scan: dict):
             help="A = 3+ contractions, decreasing depth, current <10% · B = 2+ contractions, current <15% · C = 1+ contraction · None = no contraction detected",
         ),
         "VDU": st.column_config.TextColumn("VDU", width="small", help="Volume dry-up: Extreme < 50% avg · Yes < avg · No > avg (No is fine on a breakout day!)"),
+        "Pressure_20d": st.column_config.NumberColumn(
+            "PRESSURE", format="%.2fx", width="small",
+            help="20-day Pressure (Minervini accumulation gauge): sum of up-volume "
+                 "÷ sum of down-volume over the last 20 sessions. >1.3 = strong "
+                 "accumulation (a BUY ZONE prerequisite). 1.0-1.3 = neutral. "
+                 "<1.0 = distribution.",
+        ),
         "Fundamentals": st.column_config.TextColumn("FUND", width="small"),
         "Price": st.column_config.NumberColumn("PRICE", format="$%.2f", width="small"),
         "Buy_Trigger": st.column_config.NumberColumn("BUY >", format="$%.2f", width="small"),
@@ -2403,8 +2431,26 @@ def render_rotation_page():
         st.info("Not enough industries in the latest scan (need ≥3 candidates per industry).")
         return
 
-    # Filter row — sector dropdown + search
-    fcol1, fcol2 = st.columns([2, 5])
+    # Filter row — sector dropdown + search + BUDDING LEADERS toggle.
+    # BUDDING LEADERS (added 2026-06-30) is the actionable rotation filter:
+    # industries with Δ4w ≥ +15 (confirmed positive rotation) AND current
+    # rank between 15-50 (still in mid-pack, NOT yet the obvious leaders).
+    # This is the "early-but-confirmed" zone — the rotation has begun and
+    # capital is flowing, but the names haven't become consensus yet.
+    if "rot_flt_budding" not in st.session_state:
+        st.session_state["rot_flt_budding"] = False
+
+    # Pre-compute the BUDDING count so the button label can show it
+    budding_count = 0
+    if "Delta_4w" in rot_df.columns and "Rank" in rot_df.columns:
+        try:
+            d4 = pd.to_numeric(rot_df["Delta_4w"], errors="coerce")
+            rk = pd.to_numeric(rot_df["Rank"], errors="coerce")
+            budding_count = int(((d4 >= 15) & rk.between(15, 50)).sum())
+        except Exception:
+            budding_count = 0
+
+    fcol1, fcol2, fcol3 = st.columns([2, 4, 1.5])
     with fcol1:
         sectors = sorted(rot_df["Sector"].dropna().unique().tolist())
         sector_filter = st.selectbox(
@@ -2416,6 +2462,23 @@ def render_rotation_page():
             "Search industry", placeholder="e.g. semi or oil",
             help="Filter rows by partial industry-name match (case-insensitive).",
         )
+    with fcol3:
+        # Vertical-align button with the input labels above
+        st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
+        bud_label = (
+            f"🌱 BUDDING ({budding_count})"
+            if st.session_state["rot_flt_budding"] else "🌱 BUDDING LEADERS"
+        )
+        if st.button(
+            bud_label, type="primary", use_container_width=True, key="btn_rot_budding",
+            help="Industries with confirmed 4-week rotation IN (Δ4w ≥ +15) that are "
+                 "still in the mid-pack (current rank 15-50) — NOT yet the obvious "
+                 "leaders. The actionable rotation zone: capital is flowing here but "
+                 "the consensus hasn't caught up. Drill in to find clean Stage 2 "
+                 "stocks within these industries.",
+        ):
+            st.session_state["rot_flt_budding"] = not st.session_state["rot_flt_budding"]
+            st.rerun()
 
     filtered = rot_df.copy()
     if sector_filter and sector_filter != "All sectors":
@@ -2423,6 +2486,11 @@ def render_rotation_page():
     if search:
         s = search.upper()
         filtered = filtered[filtered["Industry"].astype(str).str.upper().str.contains(s, na=False)]
+    if st.session_state["rot_flt_budding"]:
+        if "Delta_4w" in filtered.columns and "Rank" in filtered.columns:
+            d4 = pd.to_numeric(filtered["Delta_4w"], errors="coerce")
+            rk = pd.to_numeric(filtered["Rank"], errors="coerce")
+            filtered = filtered[(d4 >= 15) & rk.between(15, 50)]
 
     # Default sort: Rotation Score desc
     if "RotationScore" in filtered.columns:

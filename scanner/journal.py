@@ -313,11 +313,44 @@ class Trade:
 
     @property
     def realized_r(self) -> Optional[float]:
-        """Realized R-multiple. None if no stop / can't compute."""
-        risk = self.initial_risk_dollars
-        if risk <= 0 or self.total_shares_sold == 0:
+        """Realized R-multiple on the shares ACTUALLY SOLD.
+
+        Formula: realized_pnl / (risk_per_share × total_shares_sold)
+        where risk_per_share = initial_risk_dollars / starter_shares.
+
+        This is the standard Van Tharp / Minervini / O'Neil interpretation —
+        R measures *per-unit-of-risk exit quality*, not a position-completion
+        ratio. Partial exits report their true per-share R immediately rather
+        than a diluted "you've earned 50% of your max R so far" reading.
+
+        Example (the user-reported bug 2026-06-25):
+          KRYS — 8 starter shares @ $321.98, stop $308 → risk per share $13.98.
+          Sold 4 shares @ $361.05 → realized PnL $156.28.
+
+          OLD math (wrong):  156.28 / 111.84 (risk on all 8) = +1.40R
+          NEW math (right):  156.28 / (13.98 × 4)            = +2.79R
+                             (which equals (361.05 − 321.98) / 13.98 per share)
+
+        When the remaining 4 sell at, say, $400:
+          Total realized = 156.28 + 4×(400 − 321.98) = $468.36
+          Risk on all sold = 8 × $13.98 = $111.84
+          R = 468.36 / 111.84 = +4.19 (weighted average of the two exits)
+
+        Returns None when no stop was set or nothing's been sold yet.
+        """
+        if not self.buys:
             return None
-        return round(self.realized_pnl / risk, 3)
+        starter_shares = self.buys[0].shares
+        if starter_shares == 0 or self.total_shares_sold == 0:
+            return None
+        risk_total = self.initial_risk_dollars
+        if risk_total <= 0:
+            return None
+        risk_per_share = risk_total / starter_shares
+        risk_on_sold_shares = risk_per_share * self.total_shares_sold
+        if risk_on_sold_shares <= 0:
+            return None
+        return round(self.realized_pnl / risk_on_sold_shares, 3)
 
     @property
     def status(self) -> str:

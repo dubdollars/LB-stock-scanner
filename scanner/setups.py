@@ -410,64 +410,291 @@ def calculate_smart_stop(
 # ---------------------------------------------------------------------------
 
 def detect_power_play(df: pd.DataFrame) -> dict:
-    """Minervini Power Play setup detection.
+    """Minervini Power Play (high-tight-flag) setup — TIGHTENED 2026-06-30.
 
-    Definition (paraphrased from "Trade Like a Stock Market Wizard"):
-      1. Stock has advanced 100%+ in 8 weeks (40 trading bars)
-      2. Following the run, price has consolidated within ~20% of its
-         peak for at least 3 weeks (15 bars)
+    Original logic (gain ≥100%, ≥3 weeks since peak, ≤25% off peak) caught
+    failed climax patterns like HPE 2026-06: stock had a parabolic 220% run,
+    peaked, then broke down on heavy volume — all three loose checks passed
+    while the actual price action was the OPPOSITE of a high-tight flag.
 
-    Returns {is_power_play, gain_8wk_pct, weeks_consolidating, distance_from_peak_pct}.
+    Real high-tight flag (Minervini, "Trade Like a Stock Market Wizard"):
+      - Quiet, tight consolidation after the big move
+      - Volume DRYING UP during consolidation
+      - Volatility CONTRACTING (5-day range < prior 20-day range)
+      - Stock HOLDING above its short-term moving average
+      - NO major distribution days during the pause
+
+    All SEVEN conditions required for is_power_play = True:
+      1. Gain ≥ 100% in last 40 bars (~8 weeks) — original criterion
+      2. At least 10 trading bars since the peak (3-week pause, in BARS)
+      3. Distance from peak to recent low ≤ 15% (tight flag, was 25%)
+      4. Last 5-day average daily range ≤ prior 20-day average range
+         (volatility contracting — the actual "high-tight" part)
+      5. Last 5-day average volume < 80% of 50-day average (volume drying up)
+      6. Today's close above 10-EMA (still holding the flag, not collapsing)
+      7. No distribution day in last 5 sessions
+         (no down day >2% on volume >1.5× 50-day avg)
+
+    Returns the full diagnostic dict — even when is_power_play is False you
+    can see WHICH check failed, useful for debugging false positives.
     """
+    base_result = {
+        "is_power_play": False, "gain_8wk_pct": 0.0,
+        "bars_since_peak": 0, "distance_from_peak_pct": 0.0,
+        "range_ratio": None, "volume_ratio": None,
+        "above_10ema": None, "distribution_days_5": None,
+        "fail_reason": "insufficient_data",
+    }
     if len(df) < 60:
-        return {"is_power_play": False, "gain_8wk_pct": 0.0,
-                "weeks_consolidating": 0.0, "distance_from_peak_pct": 0.0}
+        return base_result
 
     close = df["Close"]
+    high  = df["High"]
+    low   = df["Low"]
+    vol   = df["Volume"]
 
-    # Look at recent 40 bars (~8 weeks)
+    # ---- Condition 1: gain ≥100% in last 8 weeks vs prior 8 weeks' low ----
     recent_40 = close.tail(40)
     pre_run_idx = max(0, len(close) - 80)
     pre_run_window = close.iloc[pre_run_idx: len(close) - 40]
     if len(pre_run_window) == 0:
-        return {"is_power_play": False, "gain_8wk_pct": 0.0,
-                "weeks_consolidating": 0.0, "distance_from_peak_pct": 0.0}
+        base_result["fail_reason"] = "no_pre_run_window"
+        return base_result
 
     pre_run_low = float(pre_run_window.min())
     peak_in_window = float(recent_40.max())
-
     if pre_run_low <= 0:
-        return {"is_power_play": False, "gain_8wk_pct": 0.0,
-                "weeks_consolidating": 0.0, "distance_from_peak_pct": 0.0}
+        base_result["fail_reason"] = "invalid_pre_run_low"
+        return base_result
 
     gain_pct = (peak_in_window - pre_run_low) / pre_run_low * 100
+    base_result["gain_8wk_pct"] = round(gain_pct, 2)
 
-    # Find when peak occurred
-    peak_idx_in_recent = recent_40.idxmax()
-    bars_since_peak = (df.index[-1] - peak_idx_in_recent).days
-    weeks_consolidating = bars_since_peak / 7  # rough calendar weeks
+    # ---- Condition 2: peak ≥10 trading bars ago (in BARS, not calendar days) ----
+    peak_idx = recent_40.idxmax()
+    try:
+        peak_pos = close.index.get_loc(peak_idx)
+        bars_since_peak = (len(close) - 1) - peak_pos
+    except Exception:
+        bars_since_peak = 0
+    base_result["bars_since_peak"] = int(bars_since_peak)
 
-    # Check consolidation tightness (within 20% of peak since peak)
-    post_peak = close.loc[peak_idx_in_recent:]
+    # ---- Condition 3: distance from peak to recent low ≤15% ----
+    post_peak = close.iloc[peak_pos:]
     if len(post_peak) < 5:
-        return {"is_power_play": False, "gain_8wk_pct": round(gain_pct, 2),
-                "weeks_consolidating": round(weeks_consolidating, 1),
-                "distance_from_peak_pct": 0.0}
-
+        base_result["fail_reason"] = "post_peak_too_short"
+        return base_result
     distance_from_peak = (peak_in_window - float(post_peak.min())) / peak_in_window * 100
+    base_result["distance_from_peak_pct"] = round(distance_from_peak, 2)
 
-    is_power_play = (
-        gain_pct >= 100
-        and weeks_consolidating >= 3
-        and distance_from_peak <= 25
-    )
+    # ---- Condition 4: volatility contracting (5d range vs prior 20d) ----
+    daily_range = (high - low).abs()
+    if len(daily_range) < 25:
+        base_result["fail_reason"] = "insufficient_range_history"
+        return base_result
+    last5_range = float(daily_range.tail(5).mean())
+    prior20_range = float(daily_range.iloc[-25:-5].mean())
+    range_ratio = (last5_range / prior20_range) if prior20_range > 0 else 999.0
+    base_result["range_ratio"] = round(range_ratio, 2)
 
-    return {
-        "is_power_play": bool(is_power_play),
-        "gain_8wk_pct": round(gain_pct, 2),
-        "weeks_consolidating": round(weeks_consolidating, 1),
-        "distance_from_peak_pct": round(distance_from_peak, 2),
+    # ---- Condition 5: volume drying up (5d vs 50d avg) ----
+    if len(vol) < 50:
+        base_result["fail_reason"] = "insufficient_volume_history"
+        return base_result
+    last5_vol = float(vol.tail(5).mean())
+    last50_vol = float(vol.tail(50).mean())
+    volume_ratio = (last5_vol / last50_vol) if last50_vol > 0 else 999.0
+    base_result["volume_ratio"] = round(volume_ratio, 2)
+
+    # ---- Condition 6: last close above 10-EMA ----
+    ema_10 = float(close.ewm(span=10, adjust=False).mean().iloc[-1])
+    last_close = float(close.iloc[-1])
+    above_10ema = last_close > ema_10
+    base_result["above_10ema"] = bool(above_10ema)
+
+    # ---- Condition 7: no distribution day in last 5 sessions ----
+    prev_close = close.shift(1)
+    pct_change = (close - prev_close) / prev_close * 100
+    rolling_avg_vol_50 = vol.rolling(50).mean()
+    distribution_mask = (pct_change < -2.0) & (vol > rolling_avg_vol_50 * 1.5)
+    distribution_days_5 = int(distribution_mask.tail(5).sum())
+    base_result["distribution_days_5"] = distribution_days_5
+
+    # ---- ALL SEVEN must pass ----
+    checks = {
+        "gain": gain_pct >= 100,
+        "bars_since_peak": bars_since_peak >= 10,
+        "distance": distance_from_peak <= 15,
+        "range_contracting": range_ratio <= 1.0,
+        "volume_drying": volume_ratio < 0.8,
+        "above_10ema": above_10ema,
+        "no_distribution": distribution_days_5 == 0,
     }
+    is_power_play = all(checks.values())
+
+    if not is_power_play:
+        # First failing check goes into fail_reason for quick debugging
+        for name, passed in checks.items():
+            if not passed:
+                base_result["fail_reason"] = f"failed_{name}"
+                break
+    else:
+        base_result["fail_reason"] = ""
+
+    base_result["is_power_play"] = bool(is_power_play)
+    return base_result
+
+
+# ---------------------------------------------------------------------------
+# CHEAT setup detection (Minervini "Volatility Contraction Cheat" entry)
+# ---------------------------------------------------------------------------
+
+def detect_cheat_setup(df: pd.DataFrame, vcp_contractions: list,
+                        pivot: Optional[float], avg_vol_50: Optional[float]) -> dict:
+    """Minervini "cheat" entry — slightly inside the base, before formal pivot.
+
+    Definition (from "Trade Like a Stock Market Wizard"):
+      The cheat is an earlier entry on a clean VCP setup. Rather than waiting
+      for the formal breakout above the WHOLE base's high (the pivot), you
+      enter when price clears the most recent CONTRACTION's high on volume.
+      Cuts down the wait time but requires a tight, clean VCP for the setup
+      to be valid — otherwise you're just early to a breakout that doesn't fire.
+
+    All conditions required:
+      - VCP detected with ≥2 contractions (we need a "most recent" contraction)
+      - Today's close > the most recent contraction's high
+      - Today's close < pivot (otherwise it's BO TODAY, not CHEAT)
+      - Today's volume > avg_vol_50 × 1.0 (confirmation, lighter bar than BO)
+      - Stock not already extended (close not >20% above the most recent
+        contraction's low — otherwise we're chasing, not cheating)
+
+    Returns {is_cheat, last_contraction_high, distance_to_pivot_pct, fail_reason}.
+    """
+    out = {
+        "is_cheat": False,
+        "last_contraction_high": None,
+        "distance_to_pivot_pct": None,
+        "fail_reason": "",
+    }
+    if df is None or len(df) < 30:
+        out["fail_reason"] = "insufficient_data"
+        return out
+    if not vcp_contractions or len(vcp_contractions) < 2:
+        out["fail_reason"] = "needs_2plus_contractions"
+        return out
+    if pivot is None or pivot <= 0:
+        out["fail_reason"] = "no_pivot"
+        return out
+    if avg_vol_50 is None or avg_vol_50 <= 0:
+        out["fail_reason"] = "no_avg_volume"
+        return out
+
+    try:
+        # The "most recent contraction" — last item in the VCP list
+        last_contraction = vcp_contractions[-1]
+        # Contractions track {peak_price, trough_price, ...} so the contraction's
+        # high is the peak that started it
+        last_contr_high = float(last_contraction.get("peak_price", 0))
+        last_contr_low  = float(last_contraction.get("trough_price", 0))
+        if last_contr_high <= 0 or last_contr_low <= 0:
+            out["fail_reason"] = "invalid_contraction"
+            return out
+        out["last_contraction_high"] = round(last_contr_high, 2)
+
+        last_close = float(df["Close"].iloc[-1])
+        last_vol   = float(df["Volume"].iloc[-1])
+
+        # Above last contraction high (the cheat trigger)?
+        above_last_contr = last_close > last_contr_high
+        # But still below the full-base pivot (otherwise it's BO TODAY)?
+        below_pivot = last_close < pivot
+        # Volume confirmation (lighter than a full BO is fine)
+        vol_ok = last_vol > avg_vol_50 * 1.0
+        # Not extended from the contraction low
+        if last_contr_low > 0:
+            pct_above_contr_low = (last_close / last_contr_low - 1) * 100
+        else:
+            pct_above_contr_low = 0.0
+        not_extended = pct_above_contr_low < 20.0
+
+        out["distance_to_pivot_pct"] = round((pivot - last_close) / last_close * 100, 2)
+
+        checks = {
+            "above_last_contraction": above_last_contr,
+            "below_pivot": below_pivot,
+            "volume_ok": vol_ok,
+            "not_extended": not_extended,
+        }
+        is_cheat = all(checks.values())
+        if not is_cheat:
+            for name, passed in checks.items():
+                if not passed:
+                    out["fail_reason"] = f"failed_{name}"
+                    break
+        out["is_cheat"] = bool(is_cheat)
+    except Exception as e:
+        out["fail_reason"] = f"error:{type(e).__name__}"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# GAP UP TODAY detection
+# ---------------------------------------------------------------------------
+
+def detect_gap_up_today(df: pd.DataFrame, avg_vol_50: Optional[float]) -> dict:
+    """Gap-up entry: today's open >2% above yesterday's close, held through
+    the day on above-average volume.
+
+    Often catalyst-driven (earnings, news, upgrade). Tradable when the gap
+    HOLDS — fillers are head-fakes. Requires:
+      - Today's open ≥ prior close × 1.02 (gap ≥ 2%)
+      - Today's close ≥ today's open (gap held, didn't fill)
+      - Today's volume > avg_vol_50 × 1.5 (real institutional interest)
+
+    Returns {is_gap_up, gap_pct, held_gap, volume_ratio, fail_reason}.
+    """
+    out = {
+        "is_gap_up": False, "gap_pct": 0.0, "held_gap": False,
+        "volume_ratio": None, "fail_reason": "",
+    }
+    if df is None or len(df) < 2:
+        out["fail_reason"] = "insufficient_data"
+        return out
+    if avg_vol_50 is None or avg_vol_50 <= 0:
+        out["fail_reason"] = "no_avg_volume"
+        return out
+
+    try:
+        today_open  = float(df["Open"].iloc[-1])
+        today_close = float(df["Close"].iloc[-1])
+        today_vol   = float(df["Volume"].iloc[-1])
+        prev_close  = float(df["Close"].iloc[-2])
+        if prev_close <= 0:
+            out["fail_reason"] = "invalid_prev_close"
+            return out
+
+        gap_pct = (today_open - prev_close) / prev_close * 100
+        out["gap_pct"] = round(gap_pct, 2)
+        held_gap = today_close >= today_open
+        out["held_gap"] = bool(held_gap)
+        vol_ratio = today_vol / avg_vol_50 if avg_vol_50 > 0 else 0.0
+        out["volume_ratio"] = round(vol_ratio, 2)
+
+        checks = {
+            "gap_at_least_2pct": gap_pct >= 2.0,
+            "gap_held": held_gap,
+            "volume_above_1_5x": vol_ratio > 1.5,
+        }
+        is_gap_up = all(checks.values())
+        if not is_gap_up:
+            for name, passed in checks.items():
+                if not passed:
+                    out["fail_reason"] = f"failed_{name}"
+                    break
+        out["is_gap_up"] = bool(is_gap_up)
+    except Exception as e:
+        out["fail_reason"] = f"error:{type(e).__name__}"
+    return out
 
 
 # ---------------------------------------------------------------------------

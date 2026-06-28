@@ -77,15 +77,49 @@ def _fmt_int(value) -> str:
 
 
 def _risk_pct(trade: Trade) -> Optional[float]:
-    """Initial risk as a % of starter entry price: (entry - stop) / entry × 100.
-    Returns None if no stop was set or stop is invalid (matching the same
-    'can't compute' semantics as initial_risk_dollars)."""
+    """INITIAL risk as % of starter entry: (starter - initial_stop) / starter × 100.
+
+    Anchored to initial_stop_price (immutable), NOT the current trailing stop.
+    Pairs with initial_risk_dollars — both reflect the R-multiple anchor, not
+    current exposure. Falls back to stop_price for legacy trades with no
+    initial_stop_price recorded.
+
+    Returns None when no stop was set or stop >= starter price.
+    """
     if not trade.buys:
         return None
     starter = trade.buys[0]
-    if trade.stop_price <= 0 or trade.stop_price >= starter.price:
+    anchor = trade.initial_stop_price if trade.initial_stop_price > 0 else trade.stop_price
+    if anchor <= 0 or anchor >= starter.price:
         return None
-    return round((starter.price - trade.stop_price) / starter.price * 100, 2)
+    return round((starter.price - anchor) / starter.price * 100, 2)
+
+
+def _live_risk_dollars(trade: Trade) -> Optional[float]:
+    """LIVE dollar exposure if the position were stopped right now.
+
+    Formula: (avg_entry - current_stop) × net_shares
+      - Positive: dollars currently at risk
+      - Zero: stop exactly at avg entry (breakeven)
+      - Negative: stop above avg entry → locked-in profit ("PROTECTED")
+
+    Updates as you trail stops, add shares, or scale out — unlike initial
+    risk which is frozen at trade inception for R-multiple integrity.
+
+    Returns None when there's no current stop or no held shares.
+    """
+    if trade.stop_price <= 0 or trade.net_shares == 0 or trade.avg_entry_price <= 0:
+        return None
+    return round((trade.avg_entry_price - trade.stop_price) * trade.net_shares, 2)
+
+
+def _live_risk_pct(trade: Trade) -> Optional[float]:
+    """LIVE stop distance from current avg entry as a percentage:
+    (avg_entry - current_stop) / avg_entry × 100. Negative when stop is
+    above avg entry (locked-in profit). Updates with every stop trail."""
+    if trade.stop_price <= 0 or trade.avg_entry_price <= 0:
+        return None
+    return round((trade.avg_entry_price - trade.stop_price) / trade.avg_entry_price * 100, 2)
 
 
 def _refresh_journal_prices(trades: list[Trade]) -> tuple[int, int]:
@@ -180,6 +214,20 @@ def _last_close_for(ticker: str) -> Optional[tuple[float, str]]:
         return None
 
 
+def _protected_green(val) -> str:
+    """Pandas Styler callback for the LIVE risk columns: color non-positive
+    values green to flag the position as PROTECTED (stop above avg entry —
+    can't take a loss from here, only a smaller-than-expected gain).
+    Positive (still-at-risk) values stay at the default color."""
+    if val is None:
+        return ""
+    try:
+        v = float(val)
+        return "color: #00FF88; font-weight: 600;" if v <= 0 else ""
+    except (ValueError, TypeError):
+        return ""
+
+
 def _negative_red(val) -> str:
     """Pandas Styler callback: color negatives red, leave non-negatives default.
 
@@ -227,6 +275,8 @@ def _render_held_totals(trades: list[Trade]) -> None:
     total_current_value     = 0.0
     total_lifetime_invested = 0.0
     total_pnl               = 0.0
+    total_live_risk         = 0.0
+    positions_protected     = 0
     missing_price_count     = 0
 
     for t in held:
@@ -241,10 +291,20 @@ def _render_held_totals(trades: list[Trade]) -> None:
                 total_pnl += pnl
         else:
             missing_price_count += 1
+        # Sum live risk across all held positions. Negative entries (protected
+        # positions where stop is above avg entry) reduce the at-risk total —
+        # that's intentional. The number answers "if EVERY stop hit today, how
+        # much would I lose net?" — which is the real account-level exposure.
+        lr = _live_risk_dollars(t)
+        if lr is not None:
+            total_live_risk += lr
+            if lr <= 0:
+                positions_protected += 1
 
     # G/L % denominator matches the per-row formula (lifetime invested capital).
     gl_pct = (total_pnl / total_lifetime_invested * 100) if total_lifetime_invested > 0 else 0.0
-    pnl_color = up if total_pnl > 0 else (down if total_pnl < 0 else muted)
+    pnl_color  = up if total_pnl > 0 else (down if total_pnl < 0 else muted)
+    risk_color = up if total_live_risk <= 0 else cyan
 
     missing_note = ""
     if missing_price_count:
@@ -252,6 +312,12 @@ def _render_held_totals(trades: list[Trade]) -> None:
             f" <span style='color:{muted};font-size:0.78rem'>"
             f"(price missing on {missing_price_count} ticker{'s' if missing_price_count != 1 else ''} "
             f"— click Refresh Prices in the sidebar)</span>"
+        )
+    protected_tag = ""
+    if positions_protected:
+        protected_tag = (
+            f" <span style='color:{up};font-size:0.78rem'>"
+            f"({positions_protected} protected)</span>"
         )
 
     st.markdown(
@@ -264,6 +330,9 @@ def _render_held_totals(trades: list[Trade]) -> None:
         f" &nbsp;&middot;&nbsp; P&amp;L: "
         f"<b style='color:{pnl_color}'>{_fmt_money(total_pnl, 0, signed=True)}</b>"
         f" &nbsp;<b style='color:{pnl_color}'>({gl_pct:+.1f}%)</b>"
+        f" &nbsp;&middot;&nbsp; Live Risk: "
+        f"<b style='color:{risk_color}'>{_fmt_money(total_live_risk, 0, signed=True)}</b>"
+        f"{protected_tag}"
         f"{missing_note}"
         f"</div>",
         unsafe_allow_html=True,
@@ -536,6 +605,418 @@ def _render_add_shares_form(trade: Trade):
             st.rerun()
 
 
+def _snapshot_compute(trade: Trade) -> dict:
+    """Compute all Decision Snapshot metrics for one position.
+
+    Returns a dict with four sections (trade_state, stock_state, recent, context),
+    each a list of {label, value, color, note} dicts, plus a tally count.
+
+    'color' is one of: 'green' / 'yellow' / 'red' / 'info' / 'neutral'.
+    'info' and 'neutral' don't count toward the tally — green/yellow/red do.
+
+    Recomputes every call (~50ms per ticker) so the snapshot always reflects
+    the freshest data in the cache. No caching — keeps things simple and
+    ensures Refresh Prices changes show up immediately.
+    """
+    out = {
+        "available": False, "reason": "",
+        "trade_state": [], "stock_state": [], "recent": [], "context": [],
+        "tally": {"green": 0, "yellow": 0, "red": 0},
+    }
+
+    try:
+        from scanner.data_cache import load_price_history
+    except Exception:
+        out["reason"] = "Couldn't load price-cache module."
+        return out
+
+    price_df = load_price_history(trade.ticker)
+    if price_df is None or price_df.empty or "Close" not in price_df.columns:
+        out["reason"] = (
+            f"**{trade.ticker} isn't in the local price cache yet.** "
+            f"This ticker hasn't been touched by any scan. Either run a Momentum "
+            f"or Quality scan (which will pull every Russell 3000 stock), or click "
+            f"**Refresh Prices** in the sidebar (which just pulls your held tickers). "
+            f"Then re-open the Snapshot."
+        )
+        return out
+
+    def _flat(col_name):
+        s = price_df[col_name]
+        if hasattr(s, "columns") or s.ndim > 1:
+            s = s.iloc[:, 0]
+        return s
+    close = _flat("Close")
+    if len(close) < 50:
+        out["reason"] = (
+            f"Not enough cached price history for {trade.ticker} "
+            f"(need 50+ bars, have {len(close)}). Run a fresh scan first."
+        )
+        return out
+    high   = _flat("High")
+    low    = _flat("Low")
+    volume = _flat("Volume")
+
+    out["available"] = True
+    last_close = float(close.iloc[-1])
+
+    # ============================================================
+    # SECTION 1 — TRADE STATE
+    # ============================================================
+    r_val = trade.realized_r
+    r_str = f"{r_val:+.2f}R" if r_val is not None else "—"
+    out["trade_state"].append({
+        "label": "Realized R-multiple", "value": r_str,
+        "color": "info", "note": "Per-share R on shares already sold",
+    })
+
+    # Days since entry
+    try:
+        from datetime import datetime as _dt, date as _dt_date
+        entry_d = _dt.strptime(trade.entry_date, "%Y-%m-%d").date()
+        days_held = (_dt_date.today() - entry_d).days
+    except Exception:
+        days_held = 0
+    if days_held < 15:
+        col, note = "neutral", "Early in the trade"
+    elif days_held <= 40:
+        col, note = "yellow", "Mid-cycle"
+    else:
+        col, note = "neutral", "Mature trend — let it tell you"
+    out["trade_state"].append({
+        "label": "Days since entry", "value": f"{days_held} days",
+        "color": col, "note": note,
+    })
+
+    # Stop relative to entry
+    starter_price = trade.buys[0].price if trade.buys else 0.0
+    if trade.stop_price <= 0:
+        col, val, note = "yellow", "no stop set", "Define a protective stop"
+    elif starter_price > 0 and trade.stop_price < starter_price - 0.005:
+        diff_pct = (starter_price - trade.stop_price) / starter_price * 100
+        col, val, note = "yellow", f"-{diff_pct:.1f}% below entry", "Original protective stop"
+    elif starter_price > 0 and abs(trade.stop_price - starter_price) / starter_price < 0.005:
+        col, val, note = "green", "at entry", "Breakeven — cannot become a loser"
+    else:
+        diff_pct = (trade.stop_price - starter_price) / starter_price * 100 if starter_price > 0 else 0
+        col, val, note = "green", f"+{diff_pct:.1f}% above entry", "Profit locked in"
+    out["trade_state"].append({
+        "label": "Stop relative to entry", "value": val,
+        "color": col, "note": note,
+    })
+
+    # % of starter sold
+    if trade.buys and trade.buys[0].shares > 0:
+        sold_pct = trade.total_shares_sold / trade.buys[0].shares * 100
+        if sold_pct == 0:
+            col, note = "neutral", "Nothing scaled yet"
+        elif sold_pct < 50:
+            col, note = "green", "Partial profit taken"
+        elif sold_pct < 100:
+            col, note = "green", "Mostly scaled"
+        else:
+            col, note = "neutral", "Fully scaled / closed"
+        out["trade_state"].append({
+            "label": "% of starter sold", "value": f"{sold_pct:.0f}%",
+            "color": col, "note": note,
+        })
+
+    # ============================================================
+    # SECTION 2 — STOCK STATE
+    # ============================================================
+    sma_50 = float(close.tail(50).mean())
+    ema_21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
+
+    pct_above_50 = ((last_close / sma_50) - 1) * 100 if sma_50 > 0 else 0.0
+    if pct_above_50 < 5:
+        col, note = "green", "Near support — room to add"
+    elif pct_above_50 < 15:
+        col, note = "yellow", "Healthy distance"
+    elif pct_above_50 < 20:
+        col, note = "yellow", "Getting extended"
+    else:
+        col, note = "red", "Extended — consider scaling"
+    out["stock_state"].append({
+        "label": "% above 50MA", "value": f"{pct_above_50:+.1f}%",
+        "color": col, "note": note,
+    })
+
+    pct_above_21 = ((last_close / ema_21) - 1) * 100 if ema_21 > 0 else 0.0
+    if pct_above_21 < 5:
+        col, note = "green", "At trend support"
+    elif pct_above_21 < 10:
+        col, note = "yellow", "Moderate distance"
+    else:
+        col, note = "red", "Short-term extended"
+    out["stock_state"].append({
+        "label": "% above 21EMA", "value": f"{pct_above_21:+.1f}%",
+        "color": col, "note": note,
+    })
+
+    # RSI(14) inline
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0).ewm(span=14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0.0)).ewm(span=14, adjust=False).mean()
+    rs = gain / loss.replace(0, 1e-10)
+    rsi_val = float((100 - 100 / (1 + rs)).iloc[-1])
+    if rsi_val < 60:
+        col, note = "green", "Room to run"
+    elif rsi_val < 70:
+        col, note = "yellow", "Moderate momentum"
+    elif rsi_val < 80:
+        col, note = "yellow", "Approaching overbought"
+    else:
+        col, note = "red", "Overbought"
+    out["stock_state"].append({
+        "label": "RSI(14)", "value": f"{rsi_val:.1f}",
+        "color": col, "note": note,
+    })
+
+    # Distance from avg entry (proxy for breakout pivot)
+    if trade.avg_entry_price > 0:
+        dist_pct = ((last_close / trade.avg_entry_price) - 1) * 100
+        if dist_pct < 10:
+            col, note = "yellow", "Mid-cycle"
+        elif dist_pct < 25:
+            col, note = "yellow", "Climbing"
+        else:
+            col, note = "red", "Extended from pivot"
+        out["stock_state"].append({
+            "label": "Distance from avg entry", "value": f"{dist_pct:+.1f}%",
+            "color": col, "note": note,
+        })
+
+    # ============================================================
+    # SECTION 3 — RECENT ACTION (last 5 days)
+    # ============================================================
+    daily_range = (high - low).abs()
+    if len(daily_range) >= 25:
+        last5_rng = float(daily_range.tail(5).mean())
+        prior20_rng = float(daily_range.iloc[-25:-5].mean())
+        if prior20_rng > 0:
+            rng_ratio = last5_rng / prior20_rng
+            if rng_ratio < 1.0:
+                col, note = "green", "Contracting — constructive"
+            elif rng_ratio < 1.3:
+                col, note = "yellow", "Slightly widening"
+            else:
+                col, note = "red", "Widening — climactic risk"
+            out["recent"].append({
+                "label": "5d range vs prior 20d", "value": f"{rng_ratio:.2f}x",
+                "color": col, "note": note,
+            })
+
+    # Volume last 5d vs 50d avg
+    if len(volume) >= 50:
+        last5_vol = float(volume.tail(5).mean())
+        last50_vol = float(volume.tail(50).mean())
+        if last50_vol > 0:
+            vol_ratio = last5_vol / last50_vol
+            if vol_ratio < 1.0:
+                col, note = "green", "Drying up — constructive"
+            elif vol_ratio < 1.5:
+                col, note = "yellow", "Elevated"
+            else:
+                col, note = "red", "Heavy — check for distribution"
+            out["recent"].append({
+                "label": "5d vol vs 50d avg", "value": f"{vol_ratio:.2f}x",
+                "color": col, "note": note,
+            })
+
+    # Closes in upper-half of daily range
+    last_5_high = high.tail(5).values
+    last_5_low = low.tail(5).values
+    last_5_close = close.tail(5).values
+    upper_half = 0
+    for h_, l_, c_ in zip(last_5_high, last_5_low, last_5_close):
+        if h_ > l_ and float(c_) > (float(h_) + float(l_)) / 2:
+            upper_half += 1
+    if upper_half >= 4:
+        col, note = "green", "Buyers in control"
+    elif upper_half >= 2:
+        col, note = "yellow", "Mixed control"
+    else:
+        col, note = "red", "Sellers in control"
+    out["recent"].append({
+        "label": "Closes in upper half", "value": f"{upper_half} of 5",
+        "color": col, "note": note,
+    })
+
+    # Up-day count (informational)
+    up_days = 0
+    last_6_close = close.tail(6).values
+    for i in range(1, len(last_6_close)):
+        if float(last_6_close[i]) > float(last_6_close[i - 1]):
+            up_days += 1
+    out["recent"].append({
+        "label": "Up days last 5", "value": f"{up_days} of 5",
+        "color": "info", "note": "Informational",
+    })
+
+    # ============================================================
+    # SECTION 4 — CONTEXT
+    # ============================================================
+    industry_rank = None
+    market_signal = ""
+    in_long = False
+    in_quality_elite = False
+    try:
+        from scanner.cache import load_latest_scan
+        long_scan = load_latest_scan() or {}
+        market_signal = (long_scan.get("breadth_status", "")
+                          or long_scan.get("market_signal", ""))
+        for c in long_scan.get("candidates", []):
+            if c.get("Ticker") == trade.ticker:
+                in_long = True
+                industry_rank = c.get("Industry_Rank")
+                break
+    except Exception:
+        pass
+    try:
+        from scanner.quality import load_latest_quality_scan
+        q_scan = load_latest_quality_scan() or {}
+        for c in q_scan.get("candidates", []):
+            if c.get("Ticker") == trade.ticker:
+                if (c.get("Composite_Rating") or 0) >= 80:
+                    in_quality_elite = True
+                break
+    except Exception:
+        pass
+
+    if industry_rank is not None:
+        if industry_rank <= 15:
+            col, note = "green", "Leading group"
+        elif industry_rank <= 50:
+            col, note = "yellow", "Mid-pack"
+        else:
+            col, note = "red", "Lagging group"
+        out["context"].append({
+            "label": "Industry rank", "value": f"#{int(industry_rank)}",
+            "color": col, "note": note,
+        })
+    else:
+        out["context"].append({
+            "label": "Industry rank", "value": "—",
+            "color": "info", "note": f"{trade.ticker} not in latest Momentum scan",
+        })
+
+    sig_upper = market_signal.upper()
+    if "GREEN" in sig_upper:
+        col, val, note = "green", market_signal, "Supportive backdrop"
+    elif "YELLOW" in sig_upper:
+        col, val, note = "yellow", market_signal, "Mixed market"
+    elif "RED" in sig_upper:
+        col, val, note = "red", market_signal, "Defensive — be cautious adding"
+    else:
+        col, val, note = "info", "—", "No market signal available"
+    out["context"].append({
+        "label": "Market signal", "value": val,
+        "color": col, "note": note,
+    })
+
+    if in_long and in_quality_elite:
+        col, val, note = "green", "YES", "On the elite intersection list"
+    elif in_long or in_quality_elite:
+        col, val, note = "yellow", "PARTIAL", "On one side but not both"
+    else:
+        col, val, note = "yellow", "NO", "Outside the elite intersection"
+    out["context"].append({
+        "label": "In Top Stocks intersection", "value": val,
+        "color": col, "note": note,
+    })
+
+    # ============================================================
+    # TALLY
+    # ============================================================
+    for section in (out["trade_state"], out["stock_state"], out["recent"], out["context"]):
+        for item in section:
+            c = item["color"]
+            if c == "green":
+                out["tally"]["green"] += 1
+            elif c == "yellow":
+                out["tally"]["yellow"] += 1
+            elif c == "red":
+                out["tally"]["red"] += 1
+
+    return out
+
+
+def _render_decision_snapshot(trade: Trade) -> None:
+    """Render the inline Decision Snapshot panel for a position."""
+    cyan   = PALETTE["accent_cyan"]
+    muted  = PALETTE["text_muted"]
+    up     = PALETTE["up_green"]
+    down   = PALETTE["down_red"]
+    yellow = PALETTE["signal_yellow"]
+
+    st.markdown(f"##### 📊 Decision Snapshot — {trade.ticker}")
+    data = _snapshot_compute(trade)
+
+    if not data["available"]:
+        st.info(data["reason"])
+        if st.button("Close", key=f"snap_close_{trade.id}", use_container_width=True):
+            st.session_state.pop(f"showing_snapshot_{trade.id}", None)
+            st.rerun()
+        return
+
+    color_map = {"green": "🟢", "yellow": "🟡", "red": "🔴",
+                  "info": "·", "neutral": "·"}
+
+    def _section_html(title: str, items: list) -> str:
+        rows = []
+        for item in items:
+            dot = color_map.get(item["color"], "·")
+            rows.append(
+                f"<tr>"
+                f"<td style='padding:0.22rem 0.6rem 0.22rem 0;color:#E5E7EB;"
+                f"font-size:0.85rem'>{item['label']}</td>"
+                f"<td style='padding:0.22rem 0.6rem;font-family:JetBrains Mono;"
+                f"font-size:0.85rem;color:#FFFFFF;text-align:right;white-space:nowrap'>{item['value']}</td>"
+                f"<td style='padding:0.22rem 0.4rem;font-size:0.95rem;"
+                f"text-align:center;width:30px'>{dot}</td>"
+                f"<td style='padding:0.22rem 0.4rem;color:{muted};"
+                f"font-size:0.78rem;font-style:italic'>{item['note']}</td>"
+                f"</tr>"
+            )
+        return (
+            f"<div style='font-family:JetBrains Mono;font-size:0.75rem;"
+            f"font-weight:700;color:{cyan};letter-spacing:0.06em;"
+            f"margin-top:0.7rem;margin-bottom:0.25rem'>{title}</div>"
+            f"<table style='width:100%;border-collapse:collapse'>"
+            + "".join(rows) +
+            f"</table>"
+        )
+
+    panel_html = (
+        f"<div style='background:#0F1620;border:1px solid #1F2937;border-radius:6px;"
+        f"padding:0.8rem 1rem;margin-top:0.4rem'>"
+        + _section_html("TRADE STATE", data["trade_state"])
+        + _section_html("STOCK STATE", data["stock_state"])
+        + _section_html("RECENT ACTION (last 5 days)", data["recent"])
+        + _section_html("CONTEXT", data["context"])
+        + "</div>"
+    )
+    st.markdown(panel_html, unsafe_allow_html=True)
+
+    t = data["tally"]
+    st.markdown(
+        f"<div style='font-family:JetBrains Mono;font-size:1.0rem;text-align:center;"
+        f"margin-top:0.7rem;letter-spacing:0.05em'>"
+        f"<b style='color:{cyan}'>TALLY:</b> &nbsp;&nbsp;"
+        f"<span style='color:{up};font-weight:700'>{t['green']} 🟢</span> &nbsp;·&nbsp;"
+        f"<span style='color:{yellow};font-weight:700'>{t['yellow']} 🟡</span> &nbsp;·&nbsp;"
+        f"<span style='color:{down};font-weight:700'>{t['red']} 🔴</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("")
+    if st.button("Close Snapshot", key=f"snap_close_{trade.id}",
+                  use_container_width=True):
+        st.session_state.pop(f"showing_snapshot_{trade.id}", None)
+        st.rerun()
+
+
 def _render_move_stop_form(trade: Trade):
     """Form to update a position's stop. Records the change in stop_history."""
     with st.form(f"move_stop_{trade.id}", clear_on_submit=True):
@@ -693,13 +1174,15 @@ def _render_sell_shares_form(trade: Trade):
 # ---------------------------------------------------------------------------
 
 def _render_trade_actions(trade: Trade):
-    """Inline action panel — Add Shares / Sell Shares / Move Stop / Delete.
+    """Inline action panel — Add Shares / Sell Shares / Move Stop / Snapshot / Delete.
 
     Move Stop only renders when the position has held shares; closed positions
-    can't trail a stop on nothing."""
+    can't trail a stop on nothing. Snapshot is always available — useful even
+    on closed positions for post-hoc review."""
     is_adding   = st.session_state.get(f"adding_{trade.id}", False)
     is_selling  = st.session_state.get(f"selling_{trade.id}", False)
     is_moving   = st.session_state.get(f"moving_stop_{trade.id}", False)
+    is_snapshot = st.session_state.get(f"showing_snapshot_{trade.id}", False)
     is_confirming_delete = st.session_state.get(f"confirm_del_{trade.id}", False)
 
     if is_adding:
@@ -710,6 +1193,9 @@ def _render_trade_actions(trade: Trade):
         return
     if is_moving:
         _render_move_stop_form(trade)
+        return
+    if is_snapshot:
+        _render_decision_snapshot(trade)
         return
     if is_confirming_delete:
         st.warning(f"Delete trade {trade.ticker} ({trade.id})? This removes ALL "
@@ -728,7 +1214,7 @@ def _render_trade_actions(trade: Trade):
                 st.rerun()
         return
 
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 3])
+    c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 2])
     with c1:
         if trade.status != "closed":
             if st.button("➕ Add Shares", key=f"add_btn_{trade.id}",
@@ -750,6 +1236,14 @@ def _render_trade_actions(trade: Trade):
                 st.session_state[f"moving_stop_{trade.id}"] = True
                 st.rerun()
     with c4:
+        if st.button("📊 Snapshot", key=f"snap_btn_{trade.id}",
+                     type="primary", use_container_width=True,
+                     help="Decision Snapshot — surfaces the metrics that should "
+                          "inform a scale-out-vs-pyramid decision. Not a "
+                          "recommendation; you make the call."):
+            st.session_state[f"showing_snapshot_{trade.id}"] = True
+            st.rerun()
+    with c5:
         if st.button("🗑 Delete", key=f"del_btn_{trade.id}",
                      use_container_width=True):
             st.session_state[f"confirm_del_{trade.id}"] = True
@@ -787,14 +1281,31 @@ def _render_transaction_history(trade: Trade):
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Position totals — Risk shown as both $ and %, plus current vs initial stop
+    # Position totals — show BOTH initial risk (R-multiple anchor) AND live
+    # risk (current exposure). Initial is frozen; live updates as you trail.
     r_str = f"{trade.realized_r:+.2f}R" if trade.realized_r is not None else "— (no stop)"
-    rp = _risk_pct(trade)
+    rp_initial = _risk_pct(trade)
     if trade.initial_risk_dollars > 0:
-        rp_str = f" ({rp:.1f}%)" if rp is not None else ""
+        rp_str = f" ({rp_initial:.1f}%)" if rp_initial is not None else ""
         risk_str = f"{_fmt_money(trade.initial_risk_dollars, 0)}{rp_str}"
     else:
         risk_str = "no stop set"
+    live_rd = _live_risk_dollars(trade)
+    live_rp = _live_risk_pct(trade)
+    if live_rd is not None:
+        live_color = up if live_rd <= 0 else cyan
+        live_rp_str = f" ({live_rp:+.1f}%)" if live_rp is not None else ""
+        protected_tag = " <b style='color:" + up + "'>— PROTECTED</b>" if live_rd <= 0 else ""
+        live_risk_line = (
+            f"&nbsp;&nbsp;Live risk:     "
+            f"<b style='color:{live_color}'>{_fmt_money(live_rd, 0, signed=True)}</b>"
+            f"{live_rp_str}{protected_tag}"
+        )
+    else:
+        live_risk_line = (
+            f"&nbsp;&nbsp;Live risk:     "
+            f"<span style='color:{muted}'>—</span>"
+        )
     # Show current vs initial stop side-by-side so the trailing journey is visible
     cur_stop_str = (_fmt_money(trade.stop_price, 2)
                     if trade.stop_price > 0 else "—")
@@ -819,7 +1330,8 @@ def _render_transaction_history(trade: Trade):
         f"&nbsp;&nbsp;Currently holding: <b>{_fmt_int(trade.net_shares)}</b> shares "
         f"(cost basis {_fmt_money(trade.cost_basis, 0)})<br>"
         f"{stop_line}<br>"
-        f"&nbsp;&nbsp;Initial risk:  {risk_str} <span style='color:{muted}'>(R-multiple anchor — does not change when you trail the stop)</span><br>"
+        f"&nbsp;&nbsp;Initial risk:  {risk_str} <span style='color:{muted}'>(R-multiple anchor — frozen at entry, does not change when you trail the stop)</span><br>"
+        f"{live_risk_line} <span style='color:{muted}'>(current exposure if stopped today — updates with stop trails / adds / scales)</span><br>"
         f"&nbsp;&nbsp;Realized P&L: <b style='color:{up if trade.realized_pnl > 0 else down}'>"
         f"{_fmt_money(trade.realized_pnl, 0, signed=True)}</b> · R-multiple: <b>{r_str}</b>"
         f"</div>",
@@ -856,7 +1368,11 @@ def _trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
     rows = []
     for t in trades:
         r_str = f"{t.realized_r:+.2f}" if t.realized_r is not None else "—"
-        risk_pct = _risk_pct(t)
+        # Live risk (current exposure) — shown in the Risk $/Risk % columns.
+        # Initial-risk values (frozen R-multiple anchor) live in the per-row
+        # detail panel only.
+        live_risk_d = _live_risk_dollars(t)
+        live_risk_p = _live_risk_pct(t)
         # Last close + its date from the local price cache. Blank for closed
         # positions (no held shares — last close isn't decision-relevant).
         last_result = _last_close_for(t.ticker) if t.net_shares > 0 else None
@@ -887,8 +1403,10 @@ def _trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
             "Last Date": last_date,
             "Avg Exit": t.avg_exit_price if t.total_shares_sold > 0 else 0.0,
             "Stop": t.stop_price if t.stop_price > 0 else 0.0,
-            "Risk $": t.initial_risk_dollars,
-            "Risk %": risk_pct if risk_pct is not None else None,
+            # Risk $/Risk % show CURRENT exposure (live). Initial-risk
+            # anchor (used by R-multiple) is displayed in the row detail panel.
+            "Risk $": live_risk_d if live_risk_d is not None else 0.0,
+            "Risk %": live_risk_p if live_risk_p is not None else None,
             "Realized $": t.realized_pnl,
             "P&L $": pnl if pnl is not None else 0.0,
             "G/L %": gl_pct if gl_pct is not None else None,
@@ -953,11 +1471,18 @@ def _render_trades_table(trades: list[Trade]):
         ),
         "Avg Exit":   st.column_config.NumberColumn("Avg Exit", format="$%,.2f", width="small", alignment="center"),
         "Stop":       st.column_config.NumberColumn("Stop", format="$%,.2f", width="small", alignment="center"),
-        "Risk $":     st.column_config.NumberColumn("Risk $", format="$%,.0f", width="small", alignment="center"),
+        "Risk $":     st.column_config.NumberColumn(
+            "Risk $", format="$%,.0f", width="small", alignment="center",
+            help="LIVE exposure if stopped right now: (avg_entry − current_stop) × held_shares. "
+                 "Updates as you trail stops, add shares, or scale out. Green = NEGATIVE "
+                 "(stop above avg entry — locked-in profit, can't take a loss from here). "
+                 "Initial-commitment risk (R-multiple anchor) is shown in the per-row detail panel.",
+        ),
         "Risk %":     st.column_config.NumberColumn(
             "Risk %", format="%.1f%%", width="small", alignment="center",
-            help="Stop distance as % of starter entry: (entry − stop) / entry × 100. "
-                 "Minervini's max acceptable is ~7-8%; tighter (3-5%) is preferred on clean VCPs.",
+            help="LIVE stop distance from current avg entry as %: "
+                 "(avg_entry − current_stop) / avg_entry × 100. "
+                 "Negative when stop is above avg entry (locked-in profit).",
         ),
         "Realized $": st.column_config.NumberColumn("Realized $", format="$%+,.0f", width="small", alignment="center"),
         "P&L $":      st.column_config.NumberColumn(
@@ -979,20 +1504,25 @@ def _render_trades_table(trades: list[Trade]):
         ),
     }
 
-    # Apply red-on-negative styling to the P&L-bearing columns. Styler runs
-    # over the underlying values (floats for $-columns, strings for R) so we
-    # use a callback that handles both shapes. Streamlit composes the Styler
-    # CSS on top of the column_config format strings — they don't conflict.
+    # Apply two coloring rules:
+    #   - Red-on-negative for P&L-bearing columns (loss visualization)
+    #   - Green-on-non-positive for live Risk columns (protected visualization)
+    # Streamlit composes both styler rules on top of the column_config formats.
     # Use .map() (pandas 2.1+); fall back to .applymap() for older pandas.
-    pnl_cols = [c for c in ("Realized $", "P&L $", "G/L %", "R") if c in display.columns]
-    if pnl_cols:
+    pnl_cols  = [c for c in ("Realized $", "P&L $", "G/L %", "R") if c in display.columns]
+    risk_cols = [c for c in ("Risk $", "Risk %") if c in display.columns]
+
+    def _apply(styler, fn, subset):
         try:
-            styled = display.style.map(_negative_red, subset=pnl_cols)
+            return styler.map(fn, subset=subset)
         except AttributeError:
-            # pandas < 2.1 — Styler.map doesn't exist yet, use deprecated applymap
-            styled = display.style.applymap(_negative_red, subset=pnl_cols)
-    else:
-        styled = display
+            return styler.applymap(fn, subset=subset)  # pandas < 2.1 fallback
+
+    styled = display.style
+    if pnl_cols:
+        styled = _apply(styled, _negative_red, pnl_cols)
+    if risk_cols:
+        styled = _apply(styled, _protected_green, risk_cols)
 
     selection = st.dataframe(
         styled,

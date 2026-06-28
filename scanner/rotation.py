@@ -77,8 +77,29 @@ def _quality_scan_timestamp(path: Path) -> Optional[datetime]:
         return None
 
 
+# Minimum file size for a scan to be considered a valid full scan.
+# Real Momentum scans are 100KB-2MB; real Quality scans are 2-4MB. A failed
+# or partial scan (e.g. one that errored after only computing a few tickers)
+# is typically <10KB. This threshold cleanly separates them and prevents the
+# rotation merge from picking a broken file as its historical reference,
+# which would silently produce empty Rank_1w/Rank_4w columns.
+# User-reported bug 2026-06-26: the May 29 partial scan (3KB, 5 candidates)
+# was being picked as every 4w-target match for weeks, killing 91/92 industry
+# rank merges.
+_MIN_SCAN_FILE_BYTES = 100_000  # 100KB
+
+
+def _is_valid_scan_file(path: Path) -> bool:
+    """True if the scan file is at least the minimum size to be a real scan."""
+    try:
+        return path.stat().st_size >= _MIN_SCAN_FILE_BYTES
+    except Exception:
+        return False
+
+
 def list_long_scans() -> list[tuple[datetime, Path]]:
-    """Return (timestamp, path) tuples for every Momentum scan on disk, newest first."""
+    """Return (timestamp, path) tuples for every Momentum scan on disk, newest first.
+    Skips partial/failed scan files (<100KB)."""
     out = []
     if not SCANS_DIR.exists():
         return out
@@ -86,19 +107,24 @@ def list_long_scans() -> list[tuple[datetime, Path]]:
         ts = _scan_timestamp(path)
         if ts is None:
             continue
+        if not _is_valid_scan_file(path):
+            continue
         out.append((ts, path))
     out.sort(key=lambda x: x[0], reverse=True)
     return out
 
 
 def list_quality_scans() -> list[tuple[datetime, Path]]:
-    """Return (timestamp, path) tuples for every Quality scan on disk, newest first."""
+    """Return (timestamp, path) tuples for every Quality scan on disk, newest first.
+    Skips partial/failed scan files (<100KB)."""
     out = []
     if not SCANS_DIR.exists():
         return out
     for path in SCANS_DIR.glob("scan_quality_*.json"):
         ts = _quality_scan_timestamp(path)
         if ts is None:
+            continue
+        if not _is_valid_scan_file(path):
             continue
         out.append((ts, path))
     out.sort(key=lambda x: x[0], reverse=True)

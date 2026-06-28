@@ -375,6 +375,91 @@ _AD_LADDER = ["E", "D-", "D", "D+", "C-", "C", "C+", "B-", "B", "B+", "A-", "A",
 # TOC dialog
 # ---------------------------------------------------------------------------
 
+_TS_SIGNAL_DOCS = {
+    "BUY ZONE": (
+        "Minervini Triple Barrel composite — the ANTICIPATORY entry signal "
+        "(fires BEFORE the obvious breakout). All four required: "
+        "(1) trend template intact (free for every Momentum candidate), "
+        "(2) 20-day Pressure ≥1.3 (up-volume / down-volume — institutional "
+        "accumulation), "
+        "(3) price within -3% to +10% of 50MA (near support, NOT chasing), "
+        "(4) VCP pattern present (any grade — structure is forming). "
+        "The point: take a defined-risk entry near 50MA with a tight stop "
+        "underneath, BEFORE the breakout fires when stops would be wide and "
+        "you'd already be extended. This is the highest-leverage signal in "
+        "the app for finding low-risk entries early."
+    ),
+    "BO TODAY": (
+        "Breakout above the buy pivot TODAY on volume ≥1.5× the 50-day average. "
+        "Actionable signal if you're stalking the name — entry near the pivot, "
+        "stop below the last contraction low."
+    ),
+    "CHEAT": (
+        "Minervini \"Volatility Contraction Cheat\" entry — earlier than a full "
+        "breakout. Today's close cleared the high of the MOST RECENT contraction "
+        "(not yet the full base pivot) on confirmation volume. Cuts down wait "
+        "time on the cleanest VCPs, but only valid when the VCP is tight. "
+        "Risk: stop goes below the contraction low; pivot is your second target."
+    ),
+    "POWER PLAY": (
+        "Minervini high-tight-flag setup — TIGHTENED 2026-06-30. Requires ALL of: "
+        "(1) +100% in 8 weeks, (2) ≥10 trading bars since peak, (3) ≤15% off peak, "
+        "(4) 5-day daily range ≤ prior 20-day range (volatility contracting), "
+        "(5) 5-day avg volume < 80% of 50-day avg (volume drying up), "
+        "(6) close above 10-EMA (holding the flag), (7) no distribution day in "
+        "last 5 sessions. Rare and powerful when it fires cleanly."
+    ),
+    "GAP UP": (
+        "Today's open gapped ≥2% above prior close, held the gap (close ≥ open), "
+        "and traded on volume >1.5× the 50-day average. Usually a catalyst day "
+        "(earnings beat, news, upgrade). Tradable when the gap HOLDS — fillers "
+        "are head-fakes. Pair with strong fundamentals before sizing in."
+    ),
+    "RS✓": (
+        "Relative Strength line at a new 50-day high. Tells you the stock is "
+        "leading the market even within its base — classic institutional-"
+        "accumulation signal that often precedes the obvious breakout."
+    ),
+    "VCP-A": (
+        "Grade-A Volatility Contraction Pattern: 3+ progressively tighter "
+        "contractions, each ≤75% of the prior, current contraction <6% deep, "
+        "volume drying up on each successive low. The cleanest Minervini "
+        "setup — usually best risk/reward."
+    ),
+    "VCP-B": (
+        "Grade-B VCP: 2+ contractions, final contraction <10% deep. Solid "
+        "multi-contraction structure but less pristine than A. Still tradable, "
+        "often the workhorse signal when A-grade setups are scarce."
+    ),
+}
+
+_TS_WARNING_DOCS = {
+    "EXT": (
+        "Extended: price >20% above the 50-day moving average. Late-stage "
+        "entries here carry significant giveback risk. The stop typically "
+        "has to sit too far below the entry, blowing the risk budget."
+    ),
+    "ER Nd": (
+        "Earnings in N days (0-7 only — beyond 7 days isn't flagged). "
+        "Binary catalyst risk: stocks can gap 10-20% on the print. Most "
+        "Minervini-style traders avoid initiating new swings within ~7 days "
+        "of earnings, holding existing winners through if they have profit cushion."
+    ),
+    "WIDE": (
+        "Risk % from buy pivot to stop is >7%. For a $10k account at 1.25% "
+        "risk per trade ($125), this means very small position size. Either "
+        "wait for a tighter setup or accept the smaller size — don't loosen "
+        "the stop to take a bigger position."
+    ),
+    "SQUAT": (
+        "Bearish reversal candle today — close in the lower half of the "
+        "daily range with the high above recent highs. Classic distribution "
+        "pattern: stock pushed higher intraday, sellers stepped in, close "
+        "near the lows. Avoid initiating; existing positions watch closely."
+    ),
+}
+
+
 _TS_COLUMN_DOCS = {
     "Ticker": "Stock symbol. Click a row to open the full deep dive (Chart, Execution, Fundamentals, Social, IBD).",
     "Sector": "Top-level GICS sector (e.g. Tech, Industrials, Healthcare).",
@@ -387,8 +472,8 @@ _TS_COLUMN_DOCS = {
     "RSI": "14-day Relative Strength Index from the Momentum scan. Default filter: ≤ 80 (avoid starting new positions in overbought names).",
     "Price": "Last closing price from the Momentum scan.",
     "Risk_Pct": "Percentage risk from buy pivot to stop. Lower is better for position sizing. Open the deep dive (click the row) to see the actual Buy and Stop prices in the Execution tab.",
-    "Signals": "Momentum-scan tags (e.g. VCP-A, BO TODAY, POWER PLAY). Green = bullish setup.",
-    "Warnings": "Momentum-scan caution tags (e.g. EXT = extended, ER = earnings imminent, SQUAT = bearish reversal).",
+    "Signals": "Bullish setup tags from the Momentum scan. See the SIGNALS section below for definitions of each tag (BO TODAY, CHEAT, POWER PLAY, GAP UP, RS✓, VCP-A, VCP-B).",
+    "Warnings": "Caution tags from the Momentum scan. See the WARNINGS section below for definitions of each tag (EXT, ER Nd, WIDE, SQUAT).",
     "Fwd_EPS_Growth": "Forward EPS growth percentage from the Quality scan's estimates.",
 }
 
@@ -422,6 +507,16 @@ def _ts_toc_dialog():
     st.markdown("<h4 style='margin-bottom:0.5rem'>📋 Table columns</h4>", unsafe_allow_html=True)
     for col, doc in _TS_COLUMN_DOCS.items():
         st.markdown(f"- **{col}** — {doc}")
+
+    st.markdown("---")
+    st.markdown("<h4 style='margin-bottom:0.5rem'>🟢 SIGNALS (bullish setup tags)</h4>", unsafe_allow_html=True)
+    for tag, doc in _TS_SIGNAL_DOCS.items():
+        st.markdown(f"- **{tag}** — {doc}")
+
+    st.markdown("---")
+    st.markdown("<h4 style='margin-bottom:0.5rem'>🔴 WARNINGS (caution tags)</h4>", unsafe_allow_html=True)
+    for tag, doc in _TS_WARNING_DOCS.items():
+        st.markdown(f"- **{tag}** — {doc}")
 
 
 # ---------------------------------------------------------------------------
