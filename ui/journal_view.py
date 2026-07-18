@@ -22,12 +22,14 @@ from scanner.journal import (
     Trade,
     Transaction,
     SETUP_TAGS,
+    SOURCE_OPTIONS,
     load_trades,
     save_trades,
     add_trade,
     update_trade,
     delete_trade,
     expectancy_by_setup,
+    expectancy_by_source,
 )
 from .style import PALETTE, panel
 from .excel_export import format_dataframe_to_excel
@@ -218,12 +220,17 @@ def _protected_green(val) -> str:
     """Pandas Styler callback for the LIVE risk columns: color non-positive
     values green to flag the position as PROTECTED (stop above avg entry —
     can't take a loss from here, only a smaller-than-expected gain).
-    Positive (still-at-risk) values stay at the default color."""
+    Positive (still-at-risk) values stay at the default color.
+
+    Color choice: #15803D (deep forest green, Tailwind green-700) — chosen
+    over the previous neon #00FF88 because the bright neon read as 'thin'
+    against the Bloomberg dark background. The deeper green has more visual
+    weight and is easier to read at a glance."""
     if val is None:
         return ""
     try:
         v = float(val)
-        return "color: #00FF88; font-weight: 600;" if v <= 0 else ""
+        return "color: #15803D; font-weight: 700;" if v <= 0 else ""
     except (ValueError, TypeError):
         return ""
 
@@ -286,9 +293,13 @@ def _render_held_totals(trades: list[Trade]) -> None:
         last_price  = last_result[0] if last_result else None
         if last_price is not None:
             total_current_value += last_price * t.net_shares
-            pnl = _open_pnl(t, last_price)
-            if pnl is not None:
-                total_pnl += pnl
+            # P&L on the HELD SHARES only — pure unrealized mark-to-market.
+            # Changed 2026-07-10 from _open_pnl() (which sums realized + unrealized)
+            # to just unrealized, so this matches the OPEN P&L dashboard tile
+            # AND is consistent with the strip's own Value − Cost arithmetic.
+            # Realized profit from PARTIAL trades still counts in the REALIZED
+            # P&L tile at the top — just no longer double-counted here.
+            total_pnl += (last_price - t.avg_entry_price) * t.net_shares
         else:
             missing_price_count += 1
         # Sum live risk across all held positions. Negative entries (protected
@@ -301,8 +312,11 @@ def _render_held_totals(trades: list[Trade]) -> None:
             if lr <= 0:
                 positions_protected += 1
 
-    # G/L % denominator matches the per-row formula (lifetime invested capital).
-    gl_pct = (total_pnl / total_lifetime_invested * 100) if total_lifetime_invested > 0 else 0.0
+    # G/L % denominator: cost basis of currently-held shares (not lifetime
+    # invested). Matches the unrealized-only P&L so the % reads as
+    # "how much am I up/down on what I currently hold?" — comparable to what
+    # a broker shows on the open positions view.
+    gl_pct = (total_pnl / total_cost_basis * 100) if total_cost_basis > 0 else 0.0
     pnl_color  = up if total_pnl > 0 else (down if total_pnl < 0 else muted)
     risk_color = up if total_live_risk <= 0 else cyan
 
@@ -376,6 +390,81 @@ def _open_pnl(trade: Trade, last_close: Optional[float]) -> Optional[float]:
     return round(trade.realized_pnl + unrealized, 2)
 
 
+def _total_r_contribution(trade: Trade, last_close: Optional[float]) -> Optional[float]:
+    """R contribution from this trade to the portfolio-wide TOTAL R.
+
+    Formula: (realized_pnl + unrealized_pnl) / initial_risk_dollars
+      where unrealized_pnl = (last_close − avg_entry) × net_shares_held.
+
+    Rationale (user request 2026-07-10): the Journal's Expectancy tile only
+    counts CLOSED trades with resolved R, which biases pessimistic because
+    losing trades close fast (and hit the tile immediately) while winning
+    trades can run for months (their gains never contribute until sold).
+    Total R fixes that by including UNREALIZED gains on open/partial
+    positions in the R total, giving a realistic snapshot of how the
+    portfolio has actually performed relative to committed risk.
+
+    Interpretation examples:
+      • CLOSED trade at +2R realized → contributes +2R
+      • OPEN trade currently up +3R unrealized → contributes +3R
+      • PARTIAL trade: sold 30 shares at +2R, holding 20 shares now +1R →
+        realized_pnl=$300 + unrealized=$100 = $400, ÷ $250 initial_risk
+        → contributes +1.6R
+
+    Returns None when the trade had no stop set (no risk basis) OR when
+    net_shares > 0 but no last_close is available (can't compute unrealized).
+    Portfolio sum then simply ignores these trades — same treatment as
+    the existing Expectancy calc, so the numbers stay comparable.
+    """
+    initial_risk = trade.initial_risk_dollars
+    if initial_risk <= 0:
+        return None  # no stop → no R basis
+    unrealized_pnl = 0.0
+    if trade.net_shares > 0:
+        if last_close is None:
+            return None  # holding shares but can't price them
+        unrealized_pnl = (last_close - trade.avg_entry_price) * trade.net_shares
+    total_pnl = trade.realized_pnl + unrealized_pnl
+    return round(total_pnl / initial_risk, 3)
+
+
+def _live_r(trade: Trade, last_close: Optional[float]) -> Optional[float]:
+    """Live (unrealized) R-multiple on currently-held shares.
+
+    Formula: (last_close − avg_entry) / risk_per_share
+      where risk_per_share = avg_entry − initial_stop_price.
+
+    Anchored to initial_stop_price (NOT current trailing stop) so the value
+    is directly comparable to realized_r — both measure "where am I in terms
+    of the ORIGINAL risk basis I committed to at entry?". Trailing the stop
+    up doesn't retroactively inflate this number, same discipline as
+    realized R.
+
+    Decision triggers this number surfaces:
+      • +1R → consider moving stop to breakeven
+      • +2R → consider taking a partial profit
+      • +3R → trail aggressively; locked-in profits are now significant
+      • −0.5R → halfway to your stop; watch for follow-through
+
+    Returns None when:
+      • Position has no held shares (closed)
+      • No last_close available (ticker not in cache yet)
+      • Trade had no stop set (no risk basis to compute R against)
+      • initial_stop_price >= avg_entry (broken risk basis)
+    """
+    if trade.net_shares == 0:
+        return None
+    if last_close is None:
+        return None
+    if not trade.buys:
+        return None
+    anchor = trade.initial_stop_price if trade.initial_stop_price > 0 else trade.stop_price
+    risk_per_share = trade.avg_entry_price - anchor
+    if risk_per_share <= 0:
+        return None
+    return round((last_close - trade.avg_entry_price) / risk_per_share, 3)
+
+
 # ---------------------------------------------------------------------------
 # Summary tiles
 # ---------------------------------------------------------------------------
@@ -399,6 +488,56 @@ def _render_summary_tiles(trades: list[Trade]):
     # Realized P&L sums over ALL closed + partial trades (they have real P&L)
     total_pnl = sum(t.realized_pnl for t in (closed + partial))
 
+    # Held-position aggregates (added 2026-07-10 per user request) — dashboard
+    # boxes for Open P&L, Total P&L, Value, and Live Risk. Loop over held
+    # positions once, pulling cached last close per ticker; skip any trade
+    # whose price cache is missing (won't corrupt the totals with garbage).
+    open_pnl_total  = 0.0        # unrealized P&L on shares still held
+    value_total     = 0.0        # sum of net_shares × last_close (held only)
+    live_risk_total = 0.0        # sum of (avg_entry − current_stop) × held; neg = protected
+    for t in trades:
+        if t.net_shares > 0:
+            _lr = _last_close_for(t.ticker)
+            last_price = _lr[0] if _lr else None
+            if last_price is not None:
+                open_pnl_total  += (last_price - t.avg_entry_price) * t.net_shares
+                value_total     += last_price * t.net_shares
+            # Live risk uses current (trailing) stop, matches HELD POSITIONS strip
+            lr_d = _live_risk_dollars(t)
+            if lr_d is not None:
+                live_risk_total += lr_d
+    # Total P&L = realized (closed + partial) + open (unrealized on held).
+    # Complete picture of "how much money has this journal made or lost right now".
+    total_pnl_all = total_pnl + open_pnl_total
+
+    # LIVE EXPECTANCY (added 2026-07-10, revised same day per user feedback) —
+    # AVERAGE R per trade across EVERY trade (closed + partial + open), counting
+    # realized_pnl + unrealized_pnl per trade divided by its own
+    # initial_risk_dollars. This is directly comparable to the Expectancy tile
+    # because both are averages, not sums:
+    #   • Expectancy: mean realized_r across CLOSED rated trades
+    #   • Live Exp:   mean total_r across ALL rated trades (closed + open+partial),
+    #                 counting unrealized gains on shares still held
+    # If open winners are running while closed losers are done, Live Exp > Expectancy.
+    # Trades without a stop set are excluded (no risk basis).
+    live_exp_r_sum = 0.0
+    live_exp_r_counted = 0
+    for t in trades:
+        # Fetch cached last close for held-share trades (needed for unrealized R).
+        last_price = None
+        if t.net_shares > 0:
+            _lr = _last_close_for(t.ticker)
+            if _lr:
+                last_price = _lr[0]
+        r_contrib = _total_r_contribution(t, last_price)
+        if r_contrib is None:
+            continue
+        live_exp_r_sum += r_contrib
+        live_exp_r_counted += 1
+    live_exp_r_value = (
+        live_exp_r_sum / live_exp_r_counted if live_exp_r_counted > 0 else None
+    )
+
     css = """
 <style>
 .jr-grid {
@@ -413,6 +552,45 @@ def _render_summary_tiles(trades: list[Trade]):
     border-radius: 6px;
     padding: 0.7rem 0.6rem 0.75rem 0.6rem;
     text-align: center;
+    position: relative;
+}
+/* Tiles with a data-tooltip attribute get a subtle hover state so the user
+   discovers the tooltip is available. Cursor turns into a help pointer. */
+.jr-card[data-tooltip] {
+    cursor: help;
+    transition: border-color 0.15s, background 0.15s;
+}
+.jr-card[data-tooltip]:hover {
+    border-color: #3B82F6;
+    background: #131826;
+}
+/* ⓘ hint removed 2026-07-10 per user request — kept hover behavior only.
+   User discovers tooltips by hovering; no persistent icon clutters the tile. */
+/* The tooltip itself: pops up above the tile on hover.
+   White-space: normal wraps the text, width caps it at 280px so it's
+   readable. z-index puts it above everything below. Pointer-events: none
+   so the tooltip doesn't accidentally block hovers on the tile below. */
+.jr-card[data-tooltip]:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #131826;
+    color: #E5E7EB;
+    padding: 0.7rem 0.85rem;
+    border-radius: 6px;
+    border: 1px solid #3B82F6;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 0.75rem;
+    font-weight: 400;
+    line-height: 1.55;
+    white-space: normal;
+    width: 300px;
+    text-align: left;
+    z-index: 1000;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.55);
+    pointer-events: none;
 }
 .jr-label {
     font-family: 'JetBrains Mono', monospace;
@@ -441,11 +619,91 @@ def _render_summary_tiles(trades: list[Trade]):
 """
     pnl_class = "up" if total_pnl > 0 else ("down" if total_pnl < 0 else "")
     exp_class = "up" if expectancy > 0 else ("down" if expectancy < 0 else "")
+    # LIVE EXP styling — green when positive, red when negative, muted when 0/None
+    if live_exp_r_value is None:
+        live_exp_r_class = ""
+        live_exp_r_display = "—"
+    else:
+        live_exp_r_class = "up" if live_exp_r_value > 0 else ("down" if live_exp_r_value < 0 else "")
+        live_exp_r_display = f"{live_exp_r_value:+.2f}"
+    # Held-position dashboard tiles — colors follow the same up/down convention
+    # for P&L values. Live Risk uses "up" (green) when value is <= 0 to signal
+    # "protected" (stop above entry), same convention as the HELD POSITIONS strip.
+    open_pnl_class  = "up" if open_pnl_total > 0 else ("down" if open_pnl_total < 0 else "")
+    total_all_class = "up" if total_pnl_all > 0 else ("down" if total_pnl_all < 0 else "")
+    # Live Risk: negative = locked-in profit ("protected"), positive = exposure at risk
+    live_risk_class = "up" if live_risk_total <= 0 else "down"
 
     # Open count combines fully-open + partial (both still have shares held)
     open_count = len(open_full) + len(partial)
     partial_note = f"({len(partial)} partial)" if partial else ""
 
+    # Tooltip copy — kept as short plain-text strings so they render cleanly
+    # in the CSS ::after pseudo-element. HTML attribute values so no fancy
+    # formatting available; just crisp prose explaining what + how-calculated.
+    tip_win_rate = (
+        "% of your CLOSED, RATED trades that made money. "
+        "Only counts closed trades that had a stop set at entry — without a stop the R-multiple can't compute, "
+        "so those trades are excluded. "
+        "Formula: wins ÷ rated. "
+        "Needs 30-50 rated trades before it's statistically meaningful."
+    )
+    tip_expectancy = (
+        "Your average R-multiple per rated trade — the single most important number in this table. "
+        "Positive = the setup pays you on average. Negative = it bleeds. "
+        "Formula: (win_rate × avg_win_R) + (loss_rate × avg_loss_R). "
+        "Example: 40% wins @ +2R plus 60% losses @ -1R = +0.20R per trade average. "
+        "Only counts closed, rated trades."
+    )
+    tip_pnl = (
+        "Total dollars you've actually POCKETED from sales — across closed AND partial positions. "
+        "Does NOT include unrealized gains on shares you still hold (those live in P&L $ per row). "
+        "Formula: sum of (proceeds − avg_entry × shares_sold) across every SELL transaction."
+    )
+    tip_live_exp = (
+        "Average R per trade across EVERY trade (closed + partial + open), counting "
+        "unrealized gains on shares still held. Directly comparable to EXPECTANCY: "
+        "both are per-trade averages. If open winners are running while closed "
+        "losers are already done, LIVE EXP will be HIGHER than EXPECTANCY. "
+        "Per-trade R = (realized_pnl + unrealized_pnl) ÷ initial_risk_dollars. "
+        "Fixes the pessimism bias in Expectancy — losers close fast, winners take "
+        "months, so Expectancy alone underestimates real portfolio performance. "
+        "Trades without a stop set are excluded (no risk basis)."
+    )
+    tip_open_pnl = (
+        "Unrealized P&L on currently held shares — sum of (last close − avg entry) × "
+        "held shares across every open and partial position. Updates whenever the "
+        "price cache updates (use the sidebar Refresh Prices button to force a "
+        "fresh pull). Does NOT include already-realized gains from sold shares "
+        "(those live in REALIZED P&L). Positions without a cached last close "
+        "are skipped."
+    )
+    tip_total_pnl_all = (
+        "Total P&L across the whole journal — REALIZED (from sales) + OPEN (unrealized "
+        "on shares still held). This is the complete picture: how much money the "
+        "journal has made or lost right now, if every open position were marked to "
+        "market at its last cached close. The single number that answers 'am I up "
+        "or down overall?'."
+    )
+    tip_value = (
+        "Total dollar value of currently held shares at latest cached prices. "
+        "Formula: sum of (held_shares × last_close) across every open and partial "
+        "position. Represents the current 'if I sold everything at last close, "
+        "how much cash would I get?' figure. Missing prices default to 0 in the sum."
+    )
+    tip_live_risk = (
+        "Live dollar exposure: sum of (avg_entry − current_stop) × held_shares "
+        "across every open/partial position. Answers 'if every stop hit today, "
+        "how much do I lose net?'. Positive = at risk. Zero = at breakeven. "
+        "Negative (green) = PROTECTED — stops are above avg entry, locking in a "
+        "minimum profit. Updates as you trail stops or add/sell shares."
+    )
+
+    # Two-row 5-column dashboard grid.
+    # Row 1: counts + R metrics.
+    # Row 2: dollar-value metrics (realized/open/total P&L, value, live risk).
+    # Splitting like this keeps the visual grouping semantically meaningful and
+    # avoids one 10-across strip that would compress the values too small to read.
     html = f"""
 {css}
 <div class='jr-grid'>
@@ -458,18 +716,41 @@ def _render_summary_tiles(trades: list[Trade]):
     <div class='jr-label'>CLOSED</div>
     <div class='jr-value'>{len(closed)}</div>
   </div>
-  <div class='jr-card'>
+  <div class='jr-card' data-tooltip="{tip_win_rate}">
     <div class='jr-label'>WIN RATE</div>
     <div class='jr-value'>{win_rate:.0f}%</div>
     <div class='jr-sub'>({len(rated)} rated)</div>
   </div>
-  <div class='jr-card'>
+  <div class='jr-card' data-tooltip="{tip_expectancy}">
     <div class='jr-label'>EXPECTANCY (R)</div>
     <div class='jr-value {exp_class}'>{expectancy:+.2f}</div>
   </div>
-  <div class='jr-card'>
+  <div class='jr-card' data-tooltip="{tip_live_exp}">
+    <div class='jr-label'>LIVE EXP (R)</div>
+    <div class='jr-value {live_exp_r_class}'>{live_exp_r_display}</div>
+    <div class='jr-sub'>({live_exp_r_counted} trades)</div>
+  </div>
+</div>
+<div class='jr-grid'>
+  <div class='jr-card' data-tooltip="{tip_pnl}">
     <div class='jr-label'>REALIZED P&L</div>
     <div class='jr-value {pnl_class}'>${total_pnl:,.0f}</div>
+  </div>
+  <div class='jr-card' data-tooltip="{tip_open_pnl}">
+    <div class='jr-label'>OPEN P&L</div>
+    <div class='jr-value {open_pnl_class}'>${open_pnl_total:+,.0f}</div>
+  </div>
+  <div class='jr-card' data-tooltip="{tip_total_pnl_all}">
+    <div class='jr-label'>TOTAL P&L</div>
+    <div class='jr-value {total_all_class}'>${total_pnl_all:+,.0f}</div>
+  </div>
+  <div class='jr-card' data-tooltip="{tip_value}">
+    <div class='jr-label'>VALUE</div>
+    <div class='jr-value'>${value_total:,.0f}</div>
+  </div>
+  <div class='jr-card' data-tooltip="{tip_live_risk}">
+    <div class='jr-label'>LIVE RISK</div>
+    <div class='jr-value {live_risk_class}'>${live_risk_total:+,.0f}</div>
   </div>
 </div>
 """
@@ -505,6 +786,21 @@ def _render_add_form():
                     "Shares *", min_value=0, value=0, step=1,
                 )
 
+            # Source dropdown — which scan/filter surfaced the candidate.
+            # Distinct from Setup tag (chart pattern). Defaults to "Manual /
+            # Eyeball" since most trades begin with a candidate sighting
+            # from somewhere specific the user can name.
+            source = st.selectbox(
+                "Source — where did this candidate come from? *",
+                SOURCE_OPTIONS,
+                index=SOURCE_OPTIONS.index("Manual / Eyeball")
+                      if "Manual / Eyeball" in SOURCE_OPTIONS else 0,
+                help="Tracks which scan/filter surfaced this ticker. "
+                     "Lets you later compare hit rates across sources "
+                     "(e.g. BUY ZONE trades vs Top Stocks trades vs manual picks). "
+                     "Distinct from Setup tag, which describes the chart pattern.",
+            )
+
             notes = st.text_area("Notes (optional)",
                                   placeholder="What's the thesis? What confirmed it?",
                                   height=70)
@@ -539,6 +835,7 @@ def _render_add_form():
                         stop_price=stop_price,  # 0 is fine — means "no stop"
                         shares=int(shares),
                         notes=notes,
+                        source=source,
                     )
                     add_trade(t)
                     if t.initial_risk_dollars > 0:
@@ -547,7 +844,7 @@ def _render_add_form():
                         stop_msg = f" — risk {_fmt_money(t.initial_risk_dollars, 0)}{rp_str}"
                     else:
                         stop_msg = " (no stop — R-multiple won't compute)"
-                    st.success(f"Logged {t.ticker} ({t.setup_tag}){stop_msg}")
+                    st.success(f"Logged {t.ticker} ({t.setup_tag} · {t.source}){stop_msg}")
                     st.rerun()
 
 
@@ -1368,6 +1665,10 @@ def _trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
     rows = []
     for t in trades:
         r_str = f"{t.realized_r:+.2f}" if t.realized_r is not None else "—"
+        # Open R = live R-multiple on held shares vs initial stop anchor.
+        # "—" for closed positions, no-stop trades, or missing prices.
+        # NOTE: last_price is computed a few lines below this point; we'll
+        # build the open_r string after last_price is available.
         # Live risk (current exposure) — shown in the Risk $/Risk % columns.
         # Initial-risk values (frozen R-multiple anchor) live in the per-row
         # detail panel only.
@@ -1384,13 +1685,22 @@ def _trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
         # Gain/Loss % = P&L $ as a % of total capital invested. Same denominator
         # for open/partial/closed positions so the metric is comparable.
         gl_pct = _gain_loss_pct(t, pnl)
+        # Open R = live R-multiple on held shares vs initial-stop anchor.
+        # Decision signal: +1R → breakeven stop, +2R → consider partial,
+        # +3R → trail tight. "—" for closed/no-stop/no-price.
+        open_r_val = _live_r(t, last_price)
+        open_r_str = f"{open_r_val:+.2f}" if open_r_val is not None else "—"
         rows.append({
             "id": t.id,
             "Ticker": t.ticker,
             "Setup": t.setup_tag,
+            "Source": t.source or "Other",
             "Status": t.status.upper(),
             # Dates rendered as 11Jun2026; keep raw "Closed_Raw" for the sort key
             "Opened": _fmt_date(t.entry_date),
+            # Days = calendar days since starter BUY. Still accruing for open/partial;
+            # frozen at total trade duration once closed.
+            "Days":   t.days_held,
             "Closed": _fmt_date(t.last_exit_date) if t.status == "closed" else "",
             "Closed_Raw": t.last_exit_date if t.status == "closed" else "",
             "Held": t.net_shares,
@@ -1410,7 +1720,10 @@ def _trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
             "Realized $": t.realized_pnl,
             "P&L $": pnl if pnl is not None else 0.0,
             "G/L %": gl_pct if gl_pct is not None else None,
-            "R": r_str,
+            # Realized R (shares already sold) paired with Open R (live on held).
+            # Both anchored to initial_stop_price so they're directly comparable.
+            "Realized R": r_str,
+            "Open R": open_r_str,
             "Notes": t.notes,
         })
     df = pd.DataFrame(rows)
@@ -1426,6 +1739,80 @@ def _trades_to_dataframe(trades: list[Trade]) -> pd.DataFrame:
         )
         df = df.sort_values("_sort_key").drop(columns=["_sort_key", "Closed_Raw"]).reset_index(drop=True)
     return df
+
+
+def _render_status_filter_buttons(trades: list[Trade]) -> str:
+    """Render three status-filter buttons above the trades table and return the
+    currently-selected filter: "all" | "open" | "closed".
+
+    Defaults to "all" — user sees everything when landing on the Journal page.
+    Selection persists in st.session_state.journal_status_filter across
+    reruns within a session; a Streamlit restart resets to "all", which is
+    fine because the default IS the most-inclusive view.
+
+    Buttons render primary/blue when active and secondary/dark when inactive,
+    matching the pattern used by the Momentum-tab filter row (TRADE NOW /
+    VCP-A / etc.). Each button label includes the count of matching trades
+    so the user has quick totals visible.
+    """
+    if "journal_status_filter" not in st.session_state:
+        st.session_state.journal_status_filter = "all"
+
+    current = st.session_state.journal_status_filter
+    # Pre-compute counts so button labels can show them
+    n_open   = sum(1 for t in trades if t.status in ("open", "partial"))
+    n_closed = sum(1 for t in trades if t.status == "closed")
+    n_all    = len(trades)
+
+    # All three buttons render as primary (blue) regardless of which is
+    # selected — per user preference 2026-07-02. Active selection is still
+    # indicated by the ✓ prefix in the button label, so the user knows
+    # which filter is currently applied without a color change.
+    c1, c2, c3, _spacer = st.columns([1.2, 1.2, 1.2, 6.4])
+    with c1:
+        if st.button(
+            f"✓ ALL ({n_all})" if current == "all" else f"ALL ({n_all})",
+            key="jr_filter_all",
+            type="primary",
+            use_container_width=True,
+            help="Show every trade — open, partial, and closed.",
+        ):
+            if current != "all":
+                st.session_state.journal_status_filter = "all"
+                st.rerun()
+    with c2:
+        if st.button(
+            f"✓ OPEN ({n_open})" if current == "open" else f"OPEN ({n_open})",
+            key="jr_filter_open",
+            type="primary",
+            use_container_width=True,
+            help="Show only trades still holding shares — full OPEN and PARTIAL positions.",
+        ):
+            if current != "open":
+                st.session_state.journal_status_filter = "open"
+                st.rerun()
+    with c3:
+        if st.button(
+            f"✓ CLOSED ({n_closed})" if current == "closed" else f"CLOSED ({n_closed})",
+            key="jr_filter_closed",
+            type="primary",
+            use_container_width=True,
+            help="Show only trades that have been fully exited (no shares held).",
+        ):
+            if current != "closed":
+                st.session_state.journal_status_filter = "closed"
+                st.rerun()
+
+    return st.session_state.journal_status_filter
+
+
+def _apply_status_filter(trades: list[Trade], status_filter: str) -> list[Trade]:
+    """Slice trades by the status-filter selection from _render_status_filter_buttons."""
+    if status_filter == "open":
+        return [t for t in trades if t.status in ("open", "partial")]
+    if status_filter == "closed":
+        return [t for t in trades if t.status == "closed"]
+    return trades  # "all" — no filter
 
 
 def _render_trades_table(trades: list[Trade]):
@@ -1448,8 +1835,21 @@ def _render_trades_table(trades: list[Trade]):
     column_config = {
         "Ticker":     st.column_config.TextColumn("Ticker", pinned=True, width="small"),
         "Setup":      st.column_config.TextColumn("Setup", width="small"),
+        "Source":     st.column_config.TextColumn(
+            "Source", width="small",
+            help="Where this candidate originated (BUY ZONE filter, Top Stocks, "
+                 "Manual eyeball, etc.). Distinct from Setup tag (which describes "
+                 "the chart pattern). Use the source-expectancy view to see which "
+                 "scans surface your best winners.",
+        ),
         "Status":     st.column_config.TextColumn("Status", width="small", alignment="center"),
         "Opened":     st.column_config.TextColumn("Opened", width="small"),
+        "Days":       st.column_config.NumberColumn(
+            "Days", format="%,d", width="small", alignment="center",
+            help="Calendar days held since the starter (first BUY) transaction. "
+                 "For OPEN/PARTIAL positions: still accruing day-by-day (today − entry date). "
+                 "For CLOSED positions: total trade duration (last exit − entry date), frozen.",
+        ),
         "Closed":     st.column_config.TextColumn("Closed", width="small"),
         "Held":       st.column_config.NumberColumn("Held", format="%,d", width="small", alignment="center"),
         "Avg Entry":  st.column_config.NumberColumn("Avg Entry", format="$%,.2f", width="small", alignment="center"),
@@ -1496,11 +1896,22 @@ def _render_trades_table(trades: list[Trade]):
             help="Gain/Loss as % of total capital invested: P&L $ ÷ (Avg Entry × Total Shares Bought) × 100. "
                  "Return on capital across the full life of the position — comparable across open/partial/closed.",
         ),
-        "R":          st.column_config.TextColumn(
-            "R-Multiple", width="small", alignment="center",
-            help="Realized R-multiple: Realized $ ÷ Initial Risk $. "
-                 "A +2 means the trade returned 2× your initial risk; -1 means you lost the full risked amount. "
-                 "Shows '—' when no stop was set (R can't compute without a risk basis).",
+        "Realized R": st.column_config.TextColumn(
+            "Realized R", width="small", alignment="center",
+            help="Realized R-multiple on shares ALREADY SOLD. Formula: "
+                 "realized_pnl ÷ (risk_per_share × shares_sold). "
+                 "A +2 means the closed portion of the trade returned 2× your initial risk. "
+                 "Locked in / frozen — doesn't change once shares are sold. "
+                 "Shows '—' when no stop was set or nothing has been sold yet.",
+        ),
+        "Open R":     st.column_config.TextColumn(
+            "Open R", width="small", alignment="center",
+            help="LIVE R-multiple on currently HELD shares vs your initial stop anchor. "
+                 "Formula: (last_close − avg_entry) ÷ (avg_entry − initial_stop_price). "
+                 "Updates every time the cached close updates. "
+                 "Decision signals: +1R → consider moving stop to breakeven · "
+                 "+2R → consider taking a partial · +3R → trail tight to lock in. "
+                 "Shows '—' for closed positions, trades with no stop, or tickers missing a cached price.",
         ),
     }
 
@@ -1509,7 +1920,7 @@ def _render_trades_table(trades: list[Trade]):
     #   - Green-on-non-positive for live Risk columns (protected visualization)
     # Streamlit composes both styler rules on top of the column_config formats.
     # Use .map() (pandas 2.1+); fall back to .applymap() for older pandas.
-    pnl_cols  = [c for c in ("Realized $", "P&L $", "G/L %", "R") if c in display.columns]
+    pnl_cols  = [c for c in ("Realized $", "P&L $", "G/L %", "Realized R", "Open R") if c in display.columns]
     risk_cols = [c for c in ("Risk $", "Risk %") if c in display.columns]
 
     def _apply(styler, fn, subset):
@@ -1535,10 +1946,10 @@ def _render_trades_table(trades: list[Trade]):
         key="journal_table",
     )
 
-    # Aggregate totals for held positions (sum of P&L on open holdings).
-    # Renders right below the table so it's always visible, regardless of
-    # whether a row is selected for the detail expander below.
-    _render_held_totals(trades)
+    # Removed 2026-07-10 — the HELD POSITIONS totals strip duplicated the
+    # OPEN P&L / TOTAL P&L / VALUE / LIVE RISK dashboard tiles at the top
+    # of the page. Kept _render_held_totals() defined above in case we
+    # ever want to bring it back, but no longer called.
 
     # On row click — show transaction history + actions for that trade
     if selection and "selection" in selection and selection["selection"].get("rows"):
@@ -1557,8 +1968,10 @@ def _render_trades_table(trades: list[Trade]):
             f"Created: {_fmt_date(trade.created_at) if trade.created_at else '—'}"
             f"</div>"
         )
-        st.markdown(panel(f"{trade.ticker} — {trade.setup_tag} — {trade.status.upper()}", body),
-                    unsafe_allow_html=True)
+        st.markdown(panel(
+            f"{trade.ticker} — {trade.setup_tag} — {trade.source or 'Other'} — {trade.status.upper()}",
+            body,
+        ), unsafe_allow_html=True)
 
         if trade.notes:
             # white-space: pre-wrap preserves the \n line breaks that
@@ -1692,9 +2105,11 @@ def _journal_toc_dialog():
     st.markdown("### Table columns")
     cols_docs = {
         "Ticker":     "Stock symbol (uppercased).",
-        "Setup":      "The setup tag chosen at entry. Drives the expectancy-by-setup grouping.",
+        "Setup":      "The setup tag chosen at entry — describes the CHART PATTERN (VCP, Power Play, Pullback, etc.). Drives the expectancy-by-setup grouping.",
+        "Source":     "Where the candidate was surfaced from — Top Stocks, Momentum BUY ZONE, Quality scan, Manual eyeball, etc. Distinct from Setup; a single source (e.g. BUY ZONE) can produce many different setup types.",
         "Status":     "OPEN = nothing sold yet · PARTIAL = some sold, some still held · CLOSED = fully exited.",
         "Opened":     "Date of the starter (first) BUY transaction.",
+        "Days":       "Calendar days held since the starter BUY. Still accruing for OPEN/PARTIAL positions (today − entry); frozen at total trade duration for CLOSED positions (last exit − entry).",
         "Closed":     "Date of the final SELL (blank for OPEN/PARTIAL).",
         "Held":       "Net shares currently held (total bought − total sold).",
         "Avg Entry":  "Weighted-average price across all BUY transactions.",
@@ -1708,7 +2123,8 @@ def _journal_toc_dialog():
         "Realized $": "Realized P&L using weighted-average-cost (proceeds − avg_entry × shares_sold).",
         "P&L $":      "Total P&L right now: Realized + (Last − Avg Entry) × Held. For CLOSED positions equals Realized. For OPEN/PARTIAL adds the unrealized swing on currently-held shares.",
         "G/L %":      "Gain/Loss as % of total capital invested: P&L $ ÷ (Avg Entry × Total Shares Bought) × 100. Return on capital comparable across open/partial/closed positions.",
-        "R-Multiple": "Realized R-multiple: Realized $ ÷ Initial Risk $. +2 means the trade returned 2× your initial risk; −1 means you lost the full risked amount. Shows \"—\" if no stop was set.",
+        "Realized R": "R-multiple on shares ALREADY SOLD. Formula: realized_pnl ÷ (risk_per_share × shares_sold). Locked-in / frozen once shares are sold. +2 means the closed portion returned 2× your initial risk; −1 means you lost the full risked amount on that portion. Shows \"—\" if no stop was set or nothing has been sold yet.",
+        "Open R":     "LIVE R-multiple on currently HELD shares vs your initial stop anchor. Formula: (last_close − avg_entry) ÷ (avg_entry − initial_stop_price). Updates with every cached close. Decision triggers: +1R → consider breakeven stop · +2R → consider taking a partial · +3R → trail aggressively. Shows \"—\" for closed/no-stop/missing-price.",
     }
     for col, doc in cols_docs.items():
         st.markdown(f"- **{col}** — {doc}")
@@ -1741,6 +2157,37 @@ def _journal_toc_dialog():
     }
     for tag, doc in tag_docs.items():
         st.markdown(f"- **{tag}** — {doc}")
+
+    st.markdown("---")
+    st.markdown("### Source — where the candidate came from")
+    st.markdown(
+        "**Setup vs Source — two different questions.** Setup answers *\"what does the "
+        "chart look like?\"* (VCP, Power Play, Pullback). Source answers *\"how did "
+        "this ticker land on my radar?\"* (Top Stocks, BUY ZONE filter, manual eyeball). "
+        "Both fields are logged separately so you can slice the journal two ways:"
+    )
+    st.markdown(
+        "- **By Setup** — *\"do my VCP-A trades pay better than my Pullback-to-50MA trades?\"*\n"
+        "- **By Source** — *\"do trades I find through the BUY ZONE filter outperform trades I "
+        "find through manual chart scanning?\"*\n\n"
+        "Over time the Source breakdown tells you which scans are pulling their weight. "
+        "If your Manual-eyeball trades have a +0.8R expectancy and your Social-mode trades "
+        "are −0.2R, that's actionable: spend more time on charts, less time on Reddit."
+    )
+    src_docs = {
+        "Top Stocks":             "Picked from the ⭐ TOP STOCKS intersection list (highest-conviction overlap).",
+        "Momentum - BUY ZONE":    "Surfaced by the BUY ZONE filter on Momentum tab (Pressure positive + near 50MA + VCP grade).",
+        "Momentum - Power Play":  "Surfaced by the Power Play filter on Momentum tab (high-tight setup).",
+        "Momentum - Other Filter":"Came from a different Momentum-tab filter (Trade Now, Watch List, VCP-A/B, Breakout).",
+        "Quality":                "Came from the Quality scan (IBD-style fundamentals + technical screen).",
+        "Mean Reversion":         "Came from the Mean Reversion tab (RSI2, Connors, pullback-to-21EMA).",
+        "Social":                 "Came from the Social tab (Reddit / Apewisdom spike).",
+        "Rotation":               "Came from the Rotation tab (leader within a top-ranked industry group).",
+        "Manual / Eyeball":       "You found it yourself — chart browsing, TradingView watchlist, idea from another trader.",
+        "Other":                  "Catch-all. Default for legacy trades logged before this field existed.",
+    }
+    for src, doc in src_docs.items():
+        st.markdown(f"- **{src}** — {doc}")
 
     st.markdown("---")
     st.markdown("### Expectancy math")
@@ -1793,7 +2240,7 @@ def render_journal_page():
         unsafe_allow_html=True,
     )
     st.markdown(
-        f"<h2 style='margin-top:0.6rem'>📓 Trade Journal</h2>"
+        f"<h2 style='margin-top:0.6rem'>📓 Performance Dashboard</h2>"
         f"<div style='color:{muted};font-size:0.9rem;line-height:1.5;margin-bottom:1rem;max-width:900px'>"
         f"One row = one position. Click any row to see its full transaction history "
         f"and add more shares, sell some, or close it out. After 30-50 closed positions "
@@ -1836,10 +2283,17 @@ def render_journal_page():
         )
 
     trades = load_trades()
+    # Summary tiles use the FULL trade list — Win Rate / Expectancy / P&L
+    # are journal-wide statistics that shouldn't shift based on the current
+    # table filter. Same reasoning for expectancy-by-setup below.
     _render_summary_tiles(trades)
     _render_add_form()
     st.markdown("")
-    _render_trades_table(trades)
+    # Status-filter buttons render just above the trades table. Selection
+    # only narrows which rows appear in the table — tiles and expectancy
+    # breakdown continue to reflect all trades.
+    status_filter = _render_status_filter_buttons(trades)
+    _render_trades_table(_apply_status_filter(trades, status_filter))
     st.markdown("")
     _render_expectancy_breakdown(trades)
 
@@ -1853,7 +2307,7 @@ def render_journal_sidebar():
         f"<div style='font-family:JetBrains Mono;font-size:1.3rem;font-weight:700;"
         f"color:{cyan};margin-bottom:0.5rem;line-height:1.2'>📓 LEGACY BRANDS</div>"
         f"<div style='font-family:JetBrains Mono;font-size:0.8rem;font-weight:700;"
-        f"color:{cyan};margin-bottom:0.5rem'>TRADE JOURNAL</div>"
+        f"color:{cyan};margin-bottom:0.5rem'>PERFORMANCE DASHBOARD</div>"
         f"<div style='color:{muted};font-size:0.75rem;margin-bottom:1.0rem'>"
         f"Log positions. Pyramid + scale out. Measure expectancy.</div>",
         unsafe_allow_html=True,
@@ -1951,8 +2405,17 @@ def render_journal_sidebar():
     st.markdown("---")
     st.markdown(
         f"<div style='color:{muted};font-size:0.75rem;line-height:1.5'>"
-        f"<b>Setup tags:</b><br>"
+        f"<b>Setup tags</b> <i>(chart pattern):</i><br>"
         + "<br>".join(f"• {t}" for t in SETUP_TAGS) +
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+    st.markdown(
+        f"<div style='color:{muted};font-size:0.75rem;line-height:1.5'>"
+        f"<b>Sources</b> <i>(scan origin):</i><br>"
+        + "<br>".join(f"• {s}" for s in SOURCE_OPTIONS) +
         f"</div>",
         unsafe_allow_html=True,
     )

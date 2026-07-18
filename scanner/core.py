@@ -36,6 +36,7 @@ from .setups import (
     detect_cheat_setup,
     detect_extension_from_50ma,
     detect_gap_up_today,
+    detect_ma_target,
     detect_power_play,
     detect_vcp_contractions,
     find_pivot_point,
@@ -1734,32 +1735,49 @@ def _build_signals_warnings(
     cheat: Optional[dict] = None,
     gap_up: Optional[dict] = None,
     pressure_20d: float = 1.0,
+    range_ratio_5v20: float = 1.0,
+    ma_target: Optional[dict] = None,
+    avg_dollar_volume_20d: float = 0.0,
 ) -> tuple[list[str], list[str]]:
     """Build the green-signal + red-warning tag lists for a candidate.
 
     Signal priority order (left-to-right in the table):
       BUY ZONE → BO TODAY → CHEAT → POWER PLAY → GAP UP → RS✓ → VCP-A → VCP-B
 
-    BUY ZONE (added 2026-06-30 — Minervini Triple Barrel equivalent):
-      Anticipatory pre-breakout entry window. Fires when ALL four are true:
+    BUY ZONE (added 2026-06-30, fully reverted to original criteria after
+    over-tightening broke the scan):
+      Anticipatory pre-breakout entry window. Fires when ALL FOUR are true:
         - Trend template intact (free — every Momentum candidate has this)
         - Pressure_20d >= 1.3 (20-day up-vol/down-vol confirms accumulation)
         - Pct_Above_50MA in [-3, +10] (near support, not chasing)
         - VCP_Quality is A, B, or C (some pattern structure exists)
-      The point: catch stocks while they're STILL in their base with
-      institutions accumulating — before the obvious BO TODAY signal fires
-      at the breakout (where stops are wide and you're already extended).
+
+      REVERTED 2026-06-30 (twice same day):
+        - The 5d-vs-20d range-ratio gate cut legitimate A-grade setups (AXGN,
+          NVT, ESI) because 50MA-test-and-bounce setups have elevated recent
+          range by definition. Removed.
+        - The M&A-target gate was reverted alongside the min-history gate
+          when the latter cut the universe from 3,228 → 705. M&A detection
+          stays available as a helper function but no longer gates BUY ZONE.
+      Per user's cardinal rule: maximum recall, manually sift false positives.
     """
     signals = []
     warnings_list = []
     # BUY ZONE — anticipatory composite, surfaced FIRST in the priority order
     # because it's the highest-leverage entry signal (low risk, before crowd).
+    # $20M avg-dollar-volume gate added 2026-07-02 after user feedback: SIF /
+    # GPRE / MXL-class micro-caps with 6-figure daily notional were consistently
+    # the worst-quality candidates in every batch. Cutting at $20M ADV kills
+    # those at the source without hurting the mid-cap-and-up universe where
+    # institutional flow actually lives.
+    _MIN_BUY_ZONE_DOLLAR_VOLUME = 20_000_000
     pct_50ma = extension.get("pct_above_50ma", 0.0) if extension else 0.0
     vcp_quality = vcp.get("quality") if vcp else None
     in_buy_zone = (
         pressure_20d >= 1.3
         and -3.0 <= pct_50ma <= 10.0
         and vcp_quality in ("A", "B", "C")
+        and avg_dollar_volume_20d >= _MIN_BUY_ZONE_DOLLAR_VOLUME
     )
     if in_buy_zone:
         signals.append("BUY ZONE")
@@ -1821,6 +1839,13 @@ def run_filters(
             if rs < rs_threshold:
                 d_rs += 1
                 continue
+            # NOTE: a min-history gate (len(data) < 220) was tried 2026-06-30
+            # and REVERTED same day — it cut the universe from 3,228 → 705
+            # and BUY ZONE candidates from 17 → 3 because much of the price
+            # cache has shorter history than expected. The XMAX/TDAY false
+            # positives are accepted as a cost of keeping recall high, per
+            # user's cardinal rule (better to manually sift trash than to
+            # accidentally miss good setups).
             close = float(data["Close"].iloc[-1])
             sma_50 = data["Close"].rolling(50).mean().iloc[-1]
             sma_150 = data["Close"].rolling(150).mean().iloc[-1]
@@ -1932,6 +1957,43 @@ def run_filters(
             except Exception:
                 pass
 
+            # 20-day average daily DOLLAR volume — used as a liquidity gate on
+            # BUY ZONE. Rationale (added 2026-07-02 after user feedback): thin
+            # names (SIF / GPRE / MXL-class 6-figure-volume micro-caps) with
+            # $500K daily notional consistently showed up in BUY ZONE and were
+            # the worst-quality candidates in every batch. $20M threshold cuts
+            # them at the source. Computed as mean(Close × Volume) over the
+            # last 20 sessions. Zero if history is too short (blocks BUY ZONE).
+            avg_dollar_volume_20d = 0.0
+            try:
+                if len(data) >= 20:
+                    last_20 = data.tail(20)
+                    dv = (last_20["Close"] * last_20["Volume"]).astype(float)
+                    avg_dollar_volume_20d = float(dv.mean())
+            except Exception:
+                pass
+
+            # 5-day vs prior-20-day daily-range ratio (volatility contraction
+            # check for BUY ZONE — added 2026-06-30 after AXSM false positive
+            # where a V-shape recovery passed criteria despite wild whipsaws).
+            # Ratio ≤ 1.0 = volatility contracting/flat (constructive base).
+            # Ratio > 1.3 = expanding (potential climax or post-shake-out chop).
+            range_ratio_5v20 = 1.0
+            try:
+                if len(data) >= 25:
+                    daily_range = (data["High"] - data["Low"]).abs()
+                    last5 = float(daily_range.tail(5).mean())
+                    prior20 = float(daily_range.iloc[-25:-5].mean())
+                    if prior20 > 0:
+                        range_ratio_5v20 = round(last5 / prior20, 2)
+            except Exception:
+                pass
+
+            # M&A target check — flag stocks with single >30% gap + post-gap
+            # range collapse. Filters out OGN-class buyout setups that look
+            # like tight high-tight flags but are dead-money arbitrage.
+            ma_target = detect_ma_target(data)
+
             squat_today = False
             try:
                 day_high = float(data["High"].iloc[-1])
@@ -1953,6 +2015,9 @@ def run_filters(
                 risk_pct=risk_pct, squat_today=squat_today,
                 cheat=cheat, gap_up=gap_up,
                 pressure_20d=pressure_20d,
+                range_ratio_5v20=range_ratio_5v20,
+                ma_target=ma_target,
+                avg_dollar_volume_20d=avg_dollar_volume_20d,
             )
 
             sector_val, industry_val = sector_map.get(ticker, ("N/A", "N/A"))
@@ -1990,6 +2055,10 @@ def run_filters(
                 "VDU": vdu_display,
                 "Pct_Above_50MA": extension.get("pct_above_50ma", 0.0),
                 "Pressure_20d": pressure_20d,
+                # Persisted so BUY ZONE cohort log can capture the liquidity
+                # environment at flag time — useful for post-hoc analysis of
+                # whether tighter/looser thresholds would have improved hit rate.
+                "Avg_Dollar_Volume_20d": round(avg_dollar_volume_20d, 0),
                 "Power_Play": power_play.get("is_power_play", False),
                 "Breakout_Today": breakout.get("is_breakout", False),
                 "Vol_vs_Avg": breakout.get("vol_ratio", 0.0),

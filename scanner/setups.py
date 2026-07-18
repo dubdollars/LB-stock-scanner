@@ -641,6 +641,97 @@ def detect_cheat_setup(df: pd.DataFrame, vcp_contractions: list,
 # GAP UP TODAY detection
 # ---------------------------------------------------------------------------
 
+def detect_ma_target(df: pd.DataFrame, lookback_days: int = 60) -> dict:
+    """Detect likely M&A buyout target via post-gap range-collapse pattern.
+
+    Added 2026-06-30 after OGN false positive: stock was bought out by Sun
+    Pharma at $14 cash in April 2026, then sat pinned at $13.55 for two
+    months. To our scanner it looked like a tight high-tight flag — every
+    BUY ZONE criterion passed. The reality: dead money pending merger close.
+
+    Pattern signature (both required):
+      1. Single multi-day large gap UP (>30% within `lookback_days` trading
+         bars). This is the buyout announcement spike.
+      2. Post-gap 10-day range collapsed to <25% of pre-gap 20-day range
+         (volatility dies as price pins to the deal price).
+
+    Caveats:
+      - Won't catch private-equity deals announced quietly without immediate
+        price jump
+      - Won't catch deals where stock was already extended pre-deal
+      - May false-positive on legitimate post-earnings high-tight flags
+        (which is why threshold is set tight at 25% ATR collapse, not 50%)
+
+    Returns {is_ma_target, gap_pct, bars_since_gap, atr_ratio, fail_reason}.
+    """
+    out = {
+        "is_ma_target": False,
+        "gap_pct": 0.0,
+        "bars_since_gap": None,
+        "atr_ratio": None,
+        "fail_reason": "",
+    }
+    if df is None or len(df) < (lookback_days + 30):
+        out["fail_reason"] = "insufficient_history"
+        return out
+
+    try:
+        recent = df.tail(lookback_days)
+        closes = recent["Close"]
+        prev_close = closes.shift(1)
+        pct_change = (closes - prev_close) / prev_close * 100
+
+        largest_move = float(pct_change.max())
+        if pd.isna(largest_move):
+            out["fail_reason"] = "nan_pct_change"
+            return out
+        out["gap_pct"] = round(largest_move, 2)
+
+        if largest_move < 30:
+            out["fail_reason"] = "no_large_gap"
+            return out
+
+        # Locate the gap bar
+        gap_idx = pct_change.idxmax()
+        gap_pos_in_recent = recent.index.get_loc(gap_idx)
+        # Map back to position in full df
+        gap_pos_full = len(df) - len(recent) + gap_pos_in_recent
+        bars_since_gap = (len(df) - 1) - gap_pos_full
+        out["bars_since_gap"] = int(bars_since_gap)
+
+        if bars_since_gap < 10:
+            # Need at least 10 bars after the gap to measure collapse
+            out["fail_reason"] = "gap_too_recent"
+            return out
+
+        # Pre-gap range (20 bars before the gap)
+        pre_window = df.iloc[max(0, gap_pos_full - 20):gap_pos_full]
+        if len(pre_window) < 10:
+            out["fail_reason"] = "no_pre_gap_window"
+            return out
+
+        pre_range = float((pre_window["High"] - pre_window["Low"]).mean())
+        if pre_range <= 0:
+            out["fail_reason"] = "invalid_pre_range"
+            return out
+
+        # Post-gap range (last 10 bars)
+        post_window = df.tail(10)
+        post_range = float((post_window["High"] - post_window["Low"]).mean())
+
+        atr_ratio = post_range / pre_range
+        out["atr_ratio"] = round(atr_ratio, 3)
+
+        # M&A signature: post-gap range collapsed to <25% of pre-gap
+        is_ma = atr_ratio < 0.25
+        out["is_ma_target"] = bool(is_ma)
+        if not is_ma:
+            out["fail_reason"] = f"atr_ratio_{atr_ratio:.2f}_above_0.25"
+    except Exception as e:
+        out["fail_reason"] = f"error:{type(e).__name__}"
+    return out
+
+
 def detect_gap_up_today(df: pd.DataFrame, avg_vol_50: Optional[float]) -> dict:
     """Gap-up entry: today's open >2% above yesterday's close, held through
     the day on above-average volume.

@@ -776,7 +776,12 @@ def render_mean_reversion_page():
         ticker = show.iloc[idx]["Ticker"]
         st.session_state.deep_dive_ticker = ticker
         st.session_state.view = "deepdive"
-        st.session_state.deep_dive_origin = "mean_reversion"
+        # Origin dict — deep-dive back button restores Mean Reversion with
+        # the same sub-view (RSI2 / Connors / Pullback) still selected.
+        st.session_state.deep_dive_origin = {
+            "mode": "mean_reversion", "view": "mean_reversion",
+            "label": "← Back to Mean Reversion",
+        }
         st.rerun()
 
     st.markdown(

@@ -768,12 +768,17 @@ def render_top_stocks_page():
         selection_mode="single-row",
     )
 
-    # Row click → deep dive, with origin=top_stocks so Return-to-Home brings us back
+    # Row click → deep dive. Origin dict preserves the mode/view so the
+    # deep-dive back button can restore Top Stocks with all current filter
+    # state (industry, tier, sort) intact.
     if selection and "selection" in selection and selection["selection"].get("rows"):
         idx = selection["selection"]["rows"][0]
         ticker = display.iloc[idx]["Ticker"]
         st.session_state.deep_dive_ticker = ticker
-        st.session_state.deep_dive_origin = "top_stocks"
+        st.session_state.deep_dive_origin = {
+            "mode": "top_stocks", "view": "top_stocks",
+            "label": "← Back to Top Stocks",
+        }
         st.session_state.view = "deepdive"
         st.rerun()
 

@@ -812,8 +812,12 @@ def render_quality_page():
         ticker = show.iloc[selected_row_idx]["Ticker"]
         st.session_state.deep_dive_ticker = ticker
         st.session_state.view = "deepdive"
-        # Remember that we came from quality so Back-to-scan returns here
-        st.session_state.deep_dive_origin = "quality"
+        # Origin dict — deep-dive back button restores Quality with all
+        # current slider/filter state preserved via session_state.
+        st.session_state.deep_dive_origin = {
+            "mode": "quality", "view": "quality",
+            "label": "← Back to Quality",
+        }
         st.rerun()
 
     st.markdown(

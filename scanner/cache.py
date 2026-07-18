@@ -24,6 +24,28 @@ LATEST_FILE = SCANS_DIR / "latest.json"
 LATEST_SHORT_FILE = SCANS_DIR / "latest_short.json"
 KEEP_LAST_N = 30
 
+# Rate-limit guardrail — any Momentum scan producing fewer than this many
+# tickers in the universe is almost certainly the result of yfinance
+# rate-limiting (Yahoo throttles our IP after too many requests in a short
+# window). Healthy scans in 2026 run ~3,200 tickers. Rate-limited scans
+# collapse to 700-800 (the mid-cap subset that survives before Yahoo starts
+# 429-ing us). Threshold set to 1500 — well above the rate-limited floor
+# and well below normal counts, so a legitimate mid-scan yfinance outage
+# vs a rate-limit is unambiguous.
+#
+# When a scan falls below this floor, save_scan() still archives the
+# result as scan_YYYYMMDD_HHMMSS.json for debugging, but REFUSES to
+# overwrite latest.json — so the Streamlit dashboard keeps showing
+# yesterday's healthy data instead of getting corrupted with the
+# rate-limited garbage.
+#
+# History: this happened three times in as many days (2026-06-30 02:08,
+# 2026-06-30 02:16, and 2026-07-01 12:40/12:43) before we added this
+# guardrail. Every time, the user's dashboard collapsed from ~3,246
+# universe to ~700, requiring manual latest.json restoration or an 8-24
+# hour rate-limit cooldown.
+MIN_HEALTHY_UNIVERSE = 1500
+
 # Momentum scan filenames match exactly scan_YYYYMMDD_HHMMSS.json — 8 digits,
 # underscore, 6 digits. Use this regex to filter out other scan types
 # (scan_quality_*, scan_mean_reversion_*, scan_short_*, scan_early_*) before
@@ -59,11 +81,21 @@ def _serialize(result: ScanResult) -> dict:
     return dict(result)  # type: ignore[arg-type]
 
 
-def save_scan(result: ScanResult) -> Path:
-    """Save scan to data/scans/scan_YYYYMMDD_HHMMSS.json + latest.json.
+def save_scan(result: ScanResult) -> tuple[Path, bool]:
+    """Save scan to data/scans/scan_YYYYMMDD_HHMMSS.json (always) and
+    to latest.json (only if the scan passes the rate-limit guardrail).
+
+    Returns (out_path, latest_updated) where latest_updated is False when
+    the guardrail rejected the scan. Caller (Streamlit UI) can use that
+    to show a warning to the user.
 
     Both writes go through _atomic_write_text() so a crash mid-write
     leaves the prior file intact rather than truncated.
+
+    Rate-limit guardrail: if the scan's universe_size is suspiciously
+    small (< MIN_HEALTHY_UNIVERSE), we DO NOT overwrite latest.json —
+    the dashboard keeps showing the previous healthy scan. This prevents
+    a rate-limited scan from corrupting the user's working data.
     """
     _ensure_dir()
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -71,10 +103,44 @@ def save_scan(result: ScanResult) -> Path:
     payload = _serialize(result)
     body = json.dumps(payload, indent=2, default=str)
 
+    # Always archive the raw scan — even rate-limited ones — for debugging
+    # and post-mortem analysis. Just don't promote them to "latest".
     _atomic_write_text(out_path, body)
-    _atomic_write_text(LATEST_FILE, body)
+
+    universe_size = payload.get("universe_size", 0) or 0
+    is_healthy = universe_size >= MIN_HEALTHY_UNIVERSE
+
+    if is_healthy:
+        _atomic_write_text(LATEST_FILE, body)
+        # Snapshot the BUY ZONE cohort — only for healthy scans, so a
+        # rate-limited scan can't pollute the cohort log with 3-ticker
+        # placeholder rows. Silent no-op if no candidates carry BUY ZONE.
+        try:
+            from .buy_zone_cohort import append_buy_zone_snapshot  # type: ignore
+            append_buy_zone_snapshot(
+                candidates=payload.get("candidates", []) or [],
+                market_signal=payload.get("market_signal", ""),
+                scan_timestamp=payload.get("timestamp"),
+            )
+        except Exception:
+            # Never let a cohort-log failure block the main scan-save path.
+            pass
+
     _prune_old()
-    return out_path
+    return out_path, is_healthy
+
+
+def scan_looks_rate_limited(result_or_dict) -> bool:
+    """Utility for UI code — returns True if the scan appears rate-limited.
+
+    Accepts either a ScanResult dataclass or a plain dict from a loaded
+    scan file. Threshold matches save_scan()'s guardrail.
+    """
+    if is_dataclass(result_or_dict):
+        universe = getattr(result_or_dict, "universe_size", 0) or 0
+    else:
+        universe = (result_or_dict or {}).get("universe_size", 0) or 0
+    return universe < MIN_HEALTHY_UNIVERSE
 
 
 def load_latest_scan() -> Optional[dict]:

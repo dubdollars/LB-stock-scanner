@@ -21,6 +21,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scanner import ScanSettings, run_scan, save_scan, load_latest_scan, list_scans
+from scanner.core import format_mktcap
 from scanner.social_scan import (
     SocialScanSettings, run_social_scan, load_latest_social_snapshot,
 )
@@ -125,6 +126,14 @@ def _init_state():
         st.session_state.view = "top_stocks"
     if "deep_dive_ticker" not in st.session_state:
         st.session_state.deep_dive_ticker = None
+    # deep_dive_origin tracks WHERE the user came from before landing on the
+    # deep-dive page (e.g. Rotation → industry drill-down). If set, the
+    # deep-dive page renders a contextual "← Back to X" button that restores
+    # that origin's state instead of forcing the user back to Home. Shape:
+    #   {"mode": "rotation", "view": "rotation", "industry": "Airlines",
+    #    "label": "← Back to Airlines"}
+    if "deep_dive_origin" not in st.session_state:
+        st.session_state.deep_dive_origin = None
     if "settings" not in st.session_state:
         st.session_state.settings = ScanSettings()
     if "latest_scan" not in st.session_state:
@@ -215,7 +224,7 @@ def _render_mode_switcher():
             st.session_state.rotation_selected_industry = None
             st.rerun()
     with col_journal:
-        if st.button("📓 JOURNAL", type=_btn_type("journal"),
+        if st.button("📓 PERFORMANCE", type=_btn_type("journal"),
                      use_container_width=True, key="mode_btn_journal"):
             st.session_state.mode = "journal"
             st.session_state.view = "journal"
@@ -234,7 +243,7 @@ def _render_mode_switcher():
     muted = PALETTE["text_muted"]
     mode_pretty = {
         "top_stocks": "TOP STOCKS",
-        "journal": "JOURNAL",
+        "journal": "PERFORMANCE",
         "longs": "MOMENTUM",
         "research": "RESEARCH", "twitter": "SOCIAL",
         "rotation": "ROTATION", "quality": "QUALITY",
@@ -381,10 +390,30 @@ def _trigger_rescan(settings: ScanSettings, demo: bool = False):
 
     try:
         result = run_scan(settings, progress=progress_cb)
-        save_scan(result)
-        st.session_state.latest_scan = result.to_dict()
-        bar.progress(1.0, text=f"✓ Scan complete — {len(result.candidates)} candidates")
-        status.success(f"Found {len(result.candidates)} candidates from {result.universe_size} stocks scanned.")
+        # save_scan returns (out_path, is_healthy). If is_healthy is False,
+        # latest.json is NOT overwritten — the rate-limit guardrail rejected
+        # this scan for corrupting the working dashboard state. The raw scan
+        # is still archived as scan_YYYYMMDD_HHMMSS.json for debugging.
+        _, is_healthy = save_scan(result)
+        if is_healthy:
+            # Only promote a healthy scan into session state — otherwise the
+            # rate-limited results would show in the UI even though latest.json
+            # kept the previous healthy scan.
+            st.session_state.latest_scan = result.to_dict()
+            bar.progress(1.0, text=f"✓ Scan complete — {len(result.candidates)} candidates")
+            status.success(f"Found {len(result.candidates)} candidates from {result.universe_size} stocks scanned.")
+        else:
+            # Rate-limit guardrail hit. Keep the previous healthy scan showing.
+            # Warn loudly so the user knows why the button didn't update the dashboard.
+            bar.progress(1.0, text=f"⚠ Scan rejected — universe {result.universe_size} looks rate-limited")
+            status.warning(
+                f"⚠ **Scan rejected — likely rate-limited by Yahoo Finance.**  \n"
+                f"Universe came back with only **{result.universe_size:,} tickers** "
+                f"(healthy scans return ~3,200). Yesterday's healthy scan has been preserved on your dashboard.  \n\n"
+                f"**What to do:** Do NOT re-run the scan for at least 8-12 hours — every retry extends "
+                f"the cooldown. Come back tomorrow morning and try one scan. The raw truncated scan "
+                f"was still archived to `data/scans/` for debugging."
+            )
     except Exception as e:
         status.error(f"Scan failed: {e}")
         raise
@@ -1204,9 +1233,11 @@ def _render_results_table(scan: dict):
     # daily watchlist filter.
     # BUY ZONE added 2026-06-30 — Minervini Triple Barrel composite (Pressure +
     # near-50MA + VCP). Anticipatory pre-breakout entry filter.
-    fcol1, fcol_ind, fcol2, fcol3, fcol4, fcol_b, fcol5, fcol_bz, fcol6 = st.columns(
-        [1.5, 1.5, 1.2, 1.2, 1.1, 1.1, 1.2, 1.2, 1.6]
-    )
+    # Row 1 — three input widgets (Index, Industry rank, Search) centered
+    # above the button row. Layout: [1 spacer][2 field][2 field][2 field][1 spacer]
+    # so the fields cluster in the middle of the panel rather than stretching
+    # edge-to-edge.
+    _sp_l, fcol1, fcol_ind, fcol_search, _sp_r = st.columns([1, 2, 2, 2, 1])
     with fcol1:
         idx_filter = st.multiselect("Index", options=sorted(df["Index"].unique()), default=None, placeholder="All")
     with fcol_ind:
@@ -1230,8 +1261,23 @@ def _render_results_table(scan: dict):
             "Top 5":  5,
         }
         max_industry_rank = _ind_rank_map.get(industry_choice)
+    with fcol_search:
+        search = st.text_input("Search", placeholder="e.g. NVDA or tech")
+
+    # Row 2 — 7 blue filter buttons, evenly spaced across the full panel width.
+    # Order: Trade Now · Watch List · VCP A · VCP B · Breakout · BUY ZONE ·
+    # Cohort Tracker. Cohort Tracker sits next to BUY ZONE per user request
+    # 2026-07-10 so the buy-zone workflow (find candidates → check historical
+    # performance of the buy-zone cohort) is co-located.
+    try:
+        from scanner.buy_zone_cohort import cohort_summary as _cohort_summary
+        _cs = _cohort_summary()
+        _cohort_label = f"📊 COHORT ({_cs.get('total', 0)})"
+    except Exception:
+        _cohort_label = "📊 COHORT"
+
+    fcol2, fcol3, fcol4, fcol_b, fcol5, fcol_bz, fcol_ct = st.columns(7)
     with fcol2:
-        st.markdown(_BTN_SPACER, unsafe_allow_html=True)
         label = _btn_label("TRADE NOW", st.session_state.flt_trade_now, n_trade_now)
         if st.button(label, type="primary", use_container_width=True, key="btn_trade_now",
                      help="A-Tier only — strict Minervini criteria: RS≥90, VCP A/B, within 5% of pivot, <20% above 50MA, strong fundamentals, top-15 industry rank, no earnings within 14 days. Typically 5-15 names."):
@@ -1239,7 +1285,6 @@ def _render_results_table(scan: dict):
             st.rerun()
         trade_now = st.session_state.flt_trade_now
     with fcol3:
-        st.markdown(_BTN_SPACER, unsafe_allow_html=True)
         label = _btn_label("WATCH LIST", st.session_state.flt_watch_list, n_watch_list)
         if st.button(label, type="primary", use_container_width=True, key="btn_watch_list",
                      help="B-Tier only — looser: RS≥85, VCP A/B/C, within 10% of pivot, <25% above 50MA, fundamentals or RS new high, no earnings within 14 days. Setups developing — monitor for trigger."):
@@ -1247,7 +1292,6 @@ def _render_results_table(scan: dict):
             st.rerun()
         watch_list = st.session_state.flt_watch_list
     with fcol4:
-        st.markdown(_BTN_SPACER, unsafe_allow_html=True)
         label = _btn_label("VCP A ONLY", st.session_state.flt_vcp_ab, n_vcp_ab)
         if st.button(label, type="primary", use_container_width=True, key="btn_vcp_ab",
                      help="Only show grade-A VCP setups — the cleanest, textbook Minervini contraction pattern (3+ contractions, monotonically tightening)."):
@@ -1255,7 +1299,6 @@ def _render_results_table(scan: dict):
             st.rerun()
         vcp_a_only = st.session_state.flt_vcp_ab
     with fcol_b:
-        st.markdown(_BTN_SPACER, unsafe_allow_html=True)
         label = _btn_label("VCP B ONLY", st.session_state.flt_vcp_b, n_vcp_b)
         if st.button(label, type="primary", use_container_width=True, key="btn_vcp_b",
                      help="Only show grade-B VCP setups — meaningful multi-contraction structure that didn't quite meet every A criterion. The practical daily watchlist filter when A-grade is empty."):
@@ -1263,7 +1306,6 @@ def _render_results_table(scan: dict):
             st.rerun()
         vcp_b_only = st.session_state.flt_vcp_b
     with fcol5:
-        st.markdown(_BTN_SPACER, unsafe_allow_html=True)
         label = _btn_label("BREAKOUT", st.session_state.flt_breakout, n_breakout)
         if st.button(label, type="primary", use_container_width=True, key="btn_breakout",
                      help="Stocks that broke out above pivot today on volume"):
@@ -1271,7 +1313,6 @@ def _render_results_table(scan: dict):
             st.rerun()
         breakout_only = st.session_state.flt_breakout
     with fcol_bz:
-        st.markdown(_BTN_SPACER, unsafe_allow_html=True)
         label = _btn_label("BUY ZONE", st.session_state.flt_buy_zone, n_buy_zone)
         if st.button(label, type="primary", use_container_width=True, key="btn_buy_zone",
                      help="Minervini Triple Barrel composite — accumulation building "
@@ -1282,8 +1323,19 @@ def _render_results_table(scan: dict):
             st.session_state.flt_buy_zone = not st.session_state.flt_buy_zone
             st.rerun()
         buy_zone_only = st.session_state.flt_buy_zone
-    with fcol6:
-        search = st.text_input("Search", placeholder="e.g. NVDA or tech")
+    with fcol_ct:
+        if st.button(
+            _cohort_label,
+            key="btn_cohort_tracker",
+            type="primary",
+            use_container_width=True,
+            help="BUY ZONE Cohort Tracker — every BUY ZONE flag ever surfaced by "
+                 "the scanner, with forward returns computed from cached price data. "
+                 "Answers the measurement question: is the scanner finding real "
+                 "leaders, or just noise? Populates automatically as scans accumulate.",
+        ):
+            from ui.cohort_view import cohort_tracker_dialog
+            cohort_tracker_dialog()
 
     filtered = df.copy()
     if idx_filter:
@@ -1412,6 +1464,12 @@ def _render_results_table(scan: dict):
         ticker = filtered.iloc[selected_row_idx]["Ticker"]
         st.session_state.deep_dive_ticker = ticker
         st.session_state.view = "deepdive"
+        # Origin — Momentum scan. Restoring mode+view brings back the exact
+        # filter/sort/search state because those are all in st.session_state.
+        st.session_state.deep_dive_origin = {
+            "mode": "longs", "view": "dashboard",
+            "label": "← Back to Momentum",
+        }
         st.rerun()
 
 
@@ -1534,6 +1592,53 @@ def render_dashboard():
 def render_deep_dive_page():
     _render_mode_switcher()
     ticker = st.session_state.deep_dive_ticker
+
+    # Contextual back button — restores the exact tab (and any sub-state
+    # like the industry drill-down) the user came from. Session_state
+    # persistence handles filter/slider restoration automatically; we just
+    # need to route them back to the right mode+view.
+    #
+    # Accepts two shapes for backward compat:
+    #   • DICT (preferred): {"mode": "quality", "view": "quality",
+    #                        "label": "← Back to Quality"}
+    #   • STRING (legacy): "quality" — mapped via _ORIGIN_STRING_MAP below.
+    _ORIGIN_STRING_MAP = {
+        "top_stocks":     ("top_stocks", "top_stocks", "← Back to Top Stocks"),
+        "quality":        ("quality", "quality", "← Back to Quality"),
+        "mean_reversion": ("mean_reversion", "mean_reversion", "← Back to Mean Reversion"),
+        "longs":          ("longs", "dashboard", "← Back to Momentum"),
+        "twitter":        ("twitter", "twitter", "← Back to Social"),
+        "rotation":       ("rotation", "rotation", "← Back to Rotation"),
+    }
+    origin = st.session_state.get("deep_dive_origin")
+    # Normalize string origins to the dict shape.
+    if isinstance(origin, str) and origin in _ORIGIN_STRING_MAP:
+        m, v, lbl = _ORIGIN_STRING_MAP[origin]
+        origin = {"mode": m, "view": v, "label": lbl}
+
+    if origin and isinstance(origin, dict):
+        # Placement: left column narrow enough to look like a button, wide
+        # enough to fit long labels ("← Back to Pollution & Treatment Controls").
+        col_back, _spacer = st.columns([2.5, 8.5])
+        with col_back:
+            if st.button(
+                origin.get("label", "← Back"),
+                key="deep_dive_contextual_back",
+                type="primary",
+                use_container_width=True,
+                help="Return to the tab/view where you selected this ticker. "
+                     "Filters, sorts, and search text will still be applied.",
+            ):
+                # Restore the origin's mode + view + any origin-specific
+                # state (e.g. rotation's selected industry). Then clear the
+                # deep-dive selection so we don't loop, and rerun.
+                st.session_state.mode = origin.get("mode", "top_stocks")
+                st.session_state.view = origin.get("view", "top_stocks")
+                if origin.get("mode") == "rotation" and origin.get("industry"):
+                    st.session_state.rotation_selected_industry = origin["industry"]
+                st.session_state.deep_dive_ticker = None
+                st.session_state.deep_dive_origin = None
+                st.rerun()
 
     st.markdown(
         f"<div style='font-family:JetBrains Mono;font-size:0.85rem;color:{PALETTE['text_muted']};padding-top:0.5rem'>"
@@ -2006,6 +2111,12 @@ def render_twitter_page():
         ticker = filtered.iloc[selected_row_idx]["Ticker"]
         st.session_state.deep_dive_ticker = ticker
         st.session_state.view = "deepdive"
+        # Origin — Social (Twitter) page. Restoring mode+view brings back the
+        # exact filter/sort/search state because those are all in session_state.
+        st.session_state.deep_dive_origin = {
+            "mode": "twitter", "view": "twitter",
+            "label": "← Back to Social",
+        }
         st.rerun()
 
     # Scan diagnostics expander (small info dump at the bottom for debugging)
@@ -2113,29 +2224,131 @@ def _render_rotation_sidebar():
 
 @st.dialog("Rotation — Table of Contents", width="large")
 def _show_rotation_toc_dialog():
-    """Brief column glossary for the rotation table."""
+    """Column glossary + filter-button explainer for the rotation table."""
     cyan = PALETTE["accent_cyan"]
     muted = PALETTE["text_muted"]
     st.markdown(
-        f"<div style='color:{muted};font-size:0.85rem;margin-bottom:1rem'>"
-        "Columns in the industry rotation table."
+        f"<div style='color:{muted};font-size:0.9rem;margin-bottom:1rem;line-height:1.5'>"
+        "The Rotation table is built <b>bottom-up</b> the way Minervini teaches: "
+        "scan the full universe, aggregate by industry, and look for groups where "
+        "many members are strong at once. Rank change over 4 weeks is more "
+        "actionable than absolute rank — a group climbing from #40 to #10 is "
+        "where new leadership emerges. Below is what each column and filter means."
         "</div>",
         unsafe_allow_html=True,
     )
-    cols = [
+
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.9rem;"
+        f"font-weight:700;margin:0.5rem 0 0.3rem 0'>CORE RANKING</div>",
+        unsafe_allow_html=True,
+    )
+    core_cols = [
         ("Industry", "GICS industry group. Must have at least 3 candidate stocks to be ranked."),
         ("Sector", "Parent GICS sector (Tech, Healthcare, etc.). Use the filter above the table to slice by sector."),
-        ("Members", "How many stocks from your scan belong to this industry. More members = more reliable RS average."),
+        ("Members", "How many stocks from your scan belong to this industry. More members = more reliable rollup."),
         ("Cur Rank", "Today's rank by mean RS within the industry (1 = strongest)."),
         ("Rank 1w / 4w", "Where the industry ranked ~1 week ago / ~4 weeks ago in your scan history. \"—\" means no scan from that period exists yet."),
-        ("Δ1w / Δ4w", "Rank change. Positive = climbing the leaderboard (the rotation signal). Negative = falling out of favor."),
+        ("Δ1w / Δ4w", "Rank change. **Positive = climbing the leaderboard** (the rotation signal). Negative = falling out of favor."),
         ("Avg RS", "Mean RS rating across the industry's member stocks."),
-        ("% > 50MA", "Pct of the industry's member stocks trading above their 50-day MA. Broader = more bullish."),
-        ("Rotation Score", "Weighted blend of mean RS (baseline), 4w rank change (×1.5), and 1w rank change (×0.75). Default sort column."),
+        ("% > 50MA", "Pct of members trading above their 50-day MA. Broader = more bullish participation."),
+        ("Rotation Score", "Weighted blend: mean RS + 1.5×Δ4w + 0.75×Δ1w. Default sort column."),
     ]
-    for name, doc in cols:
+    for name, doc in core_cols:
         with st.expander(f"-- {name}", expanded=False):
             st.markdown(doc)
+
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.9rem;"
+        f"font-weight:700;margin:1.1rem 0 0.3rem 0'>MINERVINI LEADERSHIP SIGNALS</div>"
+        f"<div style='color:{muted};font-size:0.82rem;margin-bottom:0.5rem'>"
+        "These four columns answer <i>is this group's strength real, or fake?</i> "
+        "A high AVG RS with a low LDR % is one mega-cap carrying the mean. High "
+        "LDR + high NH + high SETUP + a buyable GENERAL = the group is being "
+        "accumulated across the board — Minervini's textbook new leader profile."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    minervini_cols = [
+        ("LDR % (Leadership Breadth)",
+         "**% of members with RS ≥ 80.** Filters out the 'one mega-cap carrying "
+         "the mean' problem. A group with 30%+ LDR is being accumulated broadly, "
+         "not just at the top. Below 10% and the group's rank is likely a mirage. "
+         "This is the single best sanity check on AVG RS."),
+        ("NH % (New-Highs Breadth)",
+         "**% of members within 5% of their 52-week high.** Minervini's "
+         "coordination signal — institutional flow shows up as many stocks in the "
+         "group attacking their highs at the same time. 25%+ = the group is being "
+         "bid up systematically, not just drifting sideways with a couple of standouts."),
+        ("SETUP % (Setup Density)",
+         "**% of members currently in the Momentum scan with a valid setup** "
+         "(VCP grade A/B, BUY_ZONE, or breakout today). High density means many "
+         "stocks in the group are coiling for coordinated moves — often precedes "
+         "group-wide breakouts. Requires a recent Momentum scan; shows 0% if no "
+         "scan has been run. Directly actionable — drill into the group to find "
+         "the setups."),
+        ("THE GENERAL (Canary stock)",
+         "**Highest-RS member of the group.** Minervini refers to the #1 stock "
+         "as 'the general' — when the general breaks out and holds, the group "
+         "usually follows; when the general cracks, the group is done. Use this "
+         "as your one-glance read on whether the group is buyable right now."),
+        ("GEN RS",
+         "The general's RS rating (0-99). A general with RS 95+ in a group with "
+         "high LDR % is textbook active leadership."),
+        ("GEN SIG",
+         "The general's current setup signal, pulled from the Momentum scan:  \n"
+         "• **BUY ZONE** — near the 50MA with contracted volatility, buyable now  \n"
+         "• **VCP A** — clean base with tightening contractions  \n"
+         "• **BREAKOUT** — broke out today with volume  \n"
+         "• **VCP B** — base is forming but grade B  \n"
+         "• **on list** — in Momentum scan but no specific setup  \n"
+         "• _blank_ — general is NOT in Momentum scan (extended, in Stage 3/4, "
+         "or below the RS threshold — the group may be late-cycle)"),
+    ]
+    for name, doc in minervini_cols:
+        with st.expander(f"-- {name}", expanded=False):
+            st.markdown(doc)
+
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.9rem;"
+        f"font-weight:700;margin:1.1rem 0 0.3rem 0'>FILTER BUTTONS</div>",
+        unsafe_allow_html=True,
+    )
+    filter_buttons = [
+        ("🌱 BUDDING LEADERS",
+         "**Δ4w ≥ +15 AND rank 15-50.** The 'early-but-confirmed' zone — capital "
+         "is rotating IN and the group is climbing fast, but it hasn't reached "
+         "consensus leadership yet. This is where you find groups before Wall "
+         "Street writes them up. Higher potential, more speculative."),
+        ("🚀 EMERGING",
+         "**Δ4w ≥ +15 AND rank ≤ 30.** Groups already in the top tier that are "
+         "STILL climbing. Wider net than BUDDING (includes obvious leaders too). "
+         "Use when you want confirmed leadership whose upmove is accelerating — "
+         "safer than BUDDING, tighter selection than sorting by Rotation Score."),
+        ("Sector filter",
+         "Narrow to one GICS sector (Tech, Healthcare, Financials, etc.). "
+         "Useful when you already have a thesis and want to see which industries "
+         "within that sector are leading."),
+        ("Search industry",
+         "Partial name match (case-insensitive). Try 'semi', 'oil', 'bio', "
+         "'defense' to jump to a theme."),
+    ]
+    for name, doc in filter_buttons:
+        with st.expander(f"-- {name}", expanded=False):
+            st.markdown(doc)
+
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.9rem;"
+        f"font-weight:700;margin:1.1rem 0 0.3rem 0'>DRILL-DOWN</div>"
+        f"<div style='color:{muted};font-size:0.82rem'>"
+        "Click any industry row to see <b>every member</b> of that group with "
+        "Composite Rating, EPS, RS, U/D Vol, and fundamentals — sorted by "
+        "Composite desc. Click a member to open its full deep-dive. Use "
+        "'← Back to Rotation' in the sidebar to return."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
     if st.button("Close", use_container_width=True, key="rotation_toc_close"):
         st.rerun()
 
@@ -2225,8 +2438,27 @@ def render_rotation_page():
 
     # Compute the rotation table — internally prefers Quality scans, falls
     # back to Momentum if no Quality scans exist.
+    #
+    # Cached at the session level: rotation depends only on the on-disk
+    # Quality scan files, not on any per-render UI state. Without caching,
+    # every filter click / drill-down / back-button triggered a full 6s
+    # rebuild — the user saw "loading" spinner on every interaction
+    # (reported 2026-07-10). We invalidate the cache when the most recent
+    # Quality scan's timestamp changes, so a freshly-completed scan shows
+    # up without needing a manual refresh.
     from scanner.rotation import compute_rotation_table, list_quality_scans
-    result = compute_rotation_table(scan)
+
+    @st.cache_data(show_spinner=False)
+    def _cached_rotation(latest_quality_ts: str, latest_momentum_ts: str):
+        # Args are session invariants that identify the data underneath;
+        # they're not used by compute_rotation_table itself. When either
+        # changes, Streamlit invalidates the cache and recomputes.
+        return compute_rotation_table(scan)
+
+    _qs = list_quality_scans()
+    _latest_q_ts = _qs[0][0].isoformat() if _qs else ""
+    _latest_m_ts = (scan or {}).get("timestamp") or ""
+    result = _cached_rotation(_latest_q_ts, _latest_m_ts)
     rot_df = result["df"]
     history = result["history"]
     rotation_source = result.get("source", "none")
@@ -2293,20 +2525,77 @@ def render_rotation_page():
                 unsafe_allow_html=True,
             )
 
-        # Filter the scan's candidates to this industry, render as a small inline table.
-        cands = [c for c in scan.get("candidates", []) if (c.get("Industry") or "") == selected]
+        # Load the FULL Quality scan for the industry drill-down. Layer 1's
+        # "Members" count comes from Quality scan aggregation (broad universe,
+        # ~3,000 stocks). Using the Momentum scan's candidates here caused a
+        # mismatch — Layer 1 would say "Airlines: 14 members" but Layer 2 would
+        # show 0 because Momentum only surfaces SEPA-passing candidates and
+        # rarely includes airlines. Now we pull from the Quality scan directly
+        # so ALL industry members show up, letting the user do their own
+        # per-ticker assessment (which is what the Rotation tab is for anyway).
+        from scanner.rotation import load_scan_json
+        quality_scans_list = list_quality_scans()
+        quality_scan = None
+        if quality_scans_list:
+            _, latest_q_path = quality_scans_list[0]
+            quality_scan = load_scan_json(latest_q_path)
+
+        if quality_scan and quality_scan.get("candidates"):
+            source_scan = quality_scan
+            source_label = "Quality"
+        else:
+            # Fallback: no Quality scan available, use whatever the current scan has
+            source_scan = scan
+            source_label = "Momentum"
+
+        cands = [c for c in source_scan.get("candidates", [])
+                 if (c.get("Industry") or "") == selected]
         if not cands:
-            st.warning(f"No candidate stocks found for industry '{selected}'.")
+            st.warning(
+                f"No stocks found for industry '{selected}' in the latest {source_label} scan. "
+                f"If Layer 1 shows members but this is empty, the Quality scan may be missing — "
+                f"run a Quality scan first."
+            )
             return
 
-        df = _candidates_dataframe(cands)
+        # Build a compact per-industry browse dataframe. Uses Quality-scan-native
+        # fields (Composite_Rating, EPS_Rating, RS_Rating, Acc_Dis, U/D Vol, etc.)
+        # rather than Momentum fields (Signals, Warnings, VCP, Tier) since we're
+        # now sourcing from Quality scans.
+        rows = []
+        for c in cands:
+            rows.append({
+                "Ticker":      c.get("Ticker"),
+                "Composite":   c.get("Composite_Rating"),
+                "EPS":         c.get("EPS_Rating"),
+                "RS":          c.get("RS_Rating"),
+                "RS 3m":       c.get("RS_3m"),
+                "RS 6m":       c.get("RS_6m"),
+                "Acc/Dis":     c.get("Acc_Dis_Rating"),
+                "U/D Vol":     c.get("UD_Vol_Ratio"),
+                "Fwd EPS Gr%": c.get("Fwd_EPS_Growth"),
+                "Fwd PE":      c.get("Forward_PE"),
+                "ROE %":       c.get("ROE_Pct"),
+                "Profit %":    c.get("Profit_Margin_Pct"),
+                "Inst %":      c.get("Inst_Pct"),
+                # Market cap is pre-formatted with M/B/T suffix here so it
+                # displays as "$2.8B" instead of raw "$2796693760". Using
+                # scanner.core.format_mktcap for consistency with the other
+                # tables (Momentum, Social, Mean Reversion) that all render
+                # market cap as a formatted string.
+                "MktCap":      format_mktcap(c.get("Mktcap_Raw")),
+                "Sector":      c.get("Sector"),
+            })
+        df = pd.DataFrame(rows)
         if df.empty:
             st.info("No data to display for this industry.")
             return
 
-        # Sort by RS descending — that's "leaders" in this industry
-        if "RS" in df.columns:
-            df = df.sort_values("RS", ascending=False, na_position="last")
+        # Sort by Composite Rating desc (highest to lowest, missing at bottom) —
+        # per user request 2026-07-02. Composite is the IBD-style aggregate score
+        # that blends EPS + RS + Acc/Dis, so it's the natural ranking metric
+        # within an industry.
+        df = df.sort_values("Composite", ascending=False, na_position="last")
 
         # Fill the download-button placeholders we created up top
         try:
@@ -2346,30 +2635,74 @@ def render_rotation_page():
         st.markdown(
             f"<div style='font-family:JetBrains Mono;font-size:0.8rem;color:{muted};"
             f"margin-top:0.7rem;margin-bottom:0.35rem'>"
-            f"LEADERS IN {selected.upper()} ({len(df)} stocks) — sorted by RS desc · click any row to deep-dive"
+            f"MEMBERS OF {selected.upper()} ({len(df)} stocks) — sorted by Composite desc · "
+            f"source: {source_label} scan · click any row to deep-dive"
             f"</div>",
             unsafe_allow_html=True,
         )
 
-        # Column config — reuse the same shape as the longs table
+        # Column config — Quality-native fields for browsing an industry's full
+        # membership. Composite Rating is a ProgressColumn (0-99) so the bar
+        # visually communicates the score at a glance without user having to
+        # compare numbers row-by-row.
         column_config = {
-            "Ticker": st.column_config.TextColumn("TICKER", width="small", pinned=True),
-            "Tier": st.column_config.TextColumn("TIER", width="small"),
-            "RS": st.column_config.ProgressColumn("RS", min_value=0, max_value=99, format="%d", width="small"),
-            "RSI": st.column_config.NumberColumn("RSI", format="%.1f", width="small"),
-            "PEG": st.column_config.NumberColumn("PEG", format="%.2f", width="small"),
-            "Signals_Display": st.column_config.TextColumn("🟢 SIGNALS", width="medium"),
-            "Warnings_Display": st.column_config.TextColumn("🔴 WARNINGS", width="medium"),
-            "VCP_Quality": st.column_config.TextColumn("VCP", width="small"),
-            "Pct_Above_50MA": st.column_config.NumberColumn("% > 50MA", format="%.1f%%", width="small"),
-            "Price": st.column_config.NumberColumn("PRICE", format="$%.2f", width="small"),
-            "Buy_Trigger": st.column_config.NumberColumn("BUY >", format="$%.2f", width="small"),
-            "Stop": st.column_config.NumberColumn("STOP <", format="$%.2f", width="small"),
-            "Risk_Pct": st.column_config.NumberColumn("RISK %", format="%.2f%%", width="small"),
-            "Fundamentals": st.column_config.TextColumn("FUND", width="small"),
-            "Market_Cap": st.column_config.TextColumn("MKT CAP", width="small"),
-            "Sector": st.column_config.TextColumn("SECTOR", width="small"),
-            "Industry": st.column_config.TextColumn("INDUSTRY"),
+            "Ticker":    st.column_config.TextColumn("Ticker", width="small", pinned=True),
+            "Composite": st.column_config.ProgressColumn(
+                "Composite", min_value=0, max_value=99, format="%d", width="small",
+                help="Composite Rating (1-99): IBD-style blend of EPS Rating + 6mo RS + Acc/Dis. "
+                     "Higher = stronger overall.",
+            ),
+            "EPS":       st.column_config.NumberColumn(
+                "EPS", format="%d", width="small",
+                help="EPS Rating (1-99): percentile of forward EPS growth vs. the universe.",
+            ),
+            "RS":        st.column_config.NumberColumn(
+                "RS", format="%d", width="small",
+                help="RS Rating (1-99): percentile of 6-month price return vs. the universe.",
+            ),
+            "RS 3m":     st.column_config.NumberColumn(
+                "RS 3m", format="%d", width="small",
+                help="3-month RS percentile — shorter-term momentum.",
+            ),
+            "RS 6m":     st.column_config.NumberColumn(
+                "RS 6m", format="%d", width="small",
+                help="6-month RS percentile — medium-term momentum.",
+            ),
+            "Acc/Dis":   st.column_config.TextColumn(
+                "Acc/Dis", width="small",
+                help="Accumulation/Distribution Rating: A+/A = strong accumulation, D/E = distribution.",
+            ),
+            "U/D Vol":   st.column_config.NumberColumn(
+                "U/D Vol", format="%.2f", width="small",
+                help="Up/Down Volume Ratio (last 50 days). > 1.0 = more up-day volume than down. "
+                     "Higher = accumulation signal.",
+            ),
+            "Fwd EPS Gr%": st.column_config.NumberColumn(
+                "Fwd EPS Gr%", format="%.0f%%", width="small",
+                help="Forward EPS growth estimate (next fiscal year vs. current).",
+            ),
+            "Fwd PE":    st.column_config.NumberColumn(
+                "Fwd PE", format="%.1f", width="small",
+                help="Forward P/E — price vs. next fiscal year EPS estimate.",
+            ),
+            "ROE %":     st.column_config.NumberColumn(
+                "ROE %", format="%.1f%%", width="small",
+                help="Return on Equity — profitability relative to shareholder equity.",
+            ),
+            "Profit %":  st.column_config.NumberColumn(
+                "Profit %", format="%.1f%%", width="small",
+                help="Net profit margin.",
+            ),
+            "Inst %":    st.column_config.NumberColumn(
+                "Inst %", format="%.1f%%", width="small",
+                help="% of shares owned by institutions.",
+            ),
+            "MktCap":    st.column_config.TextColumn(
+                "MktCap", width="small",
+                help="Market capitalization, formatted with M/B/T suffix "
+                     "for readability (e.g., $2.8B for a $2.8 billion company).",
+            ),
+            "Sector":    st.column_config.TextColumn("Sector", width="small"),
         }
 
         selection = st.dataframe(
@@ -2382,6 +2715,19 @@ def render_rotation_page():
             ticker = df.iloc[idx]["Ticker"]
             st.session_state.deep_dive_ticker = ticker
             st.session_state.view = "deepdive"
+            # Record where the user came from so the deep-dive page can render
+            # a contextual "← Back to [Industry]" button. Without this the
+            # only way out is Return to Home (top) or clicking the Rotation
+            # mode button, which resets to Layer 1 and loses their industry
+            # context. Stored as a small dict so we can extend to other
+            # origins (Momentum, Quality, Social) with the same mechanism
+            # later without changing the state shape.
+            st.session_state.deep_dive_origin = {
+                "mode": "rotation",
+                "view": "rotation",
+                "industry": selected,
+                "label": f"← Back to {selected}",
+            }
             st.rerun()
         return
 
@@ -2431,26 +2777,36 @@ def render_rotation_page():
         st.info("Not enough industries in the latest scan (need ≥3 candidates per industry).")
         return
 
-    # Filter row — sector dropdown + search + BUDDING LEADERS toggle.
-    # BUDDING LEADERS (added 2026-06-30) is the actionable rotation filter:
-    # industries with Δ4w ≥ +15 (confirmed positive rotation) AND current
-    # rank between 15-50 (still in mid-pack, NOT yet the obvious leaders).
-    # This is the "early-but-confirmed" zone — the rotation has begun and
-    # capital is flowing, but the names haven't become consensus yet.
+    # Filter row — sector dropdown + search + BUDDING LEADERS + EMERGING toggles.
+    #
+    # BUDDING LEADERS (2026-06-30): Δ4w ≥ +15 AND rank 15-50. The "early-but-
+    # confirmed" zone — rotation has begun but names haven't reached consensus.
+    #
+    # EMERGING (2026-07-10 — Minervini methodology overhaul): Δ4w ≥ +15 AND
+    # rank ≤ 30 (top 30). The "climbing into leadership" filter — groups that
+    # have already broken into the top tier via strong recent momentum. Wider
+    # net than BUDDING (includes obvious leaders too), tighter on absolute
+    # rank. Use this when you want the industries currently leading capital
+    # flows AND still rising.
     if "rot_flt_budding" not in st.session_state:
         st.session_state["rot_flt_budding"] = False
+    if "rot_flt_emerging" not in st.session_state:
+        st.session_state["rot_flt_emerging"] = False
 
-    # Pre-compute the BUDDING count so the button label can show it
+    # Pre-compute counts so the button labels can show them
     budding_count = 0
+    emerging_count = 0
     if "Delta_4w" in rot_df.columns and "Rank" in rot_df.columns:
         try:
             d4 = pd.to_numeric(rot_df["Delta_4w"], errors="coerce")
             rk = pd.to_numeric(rot_df["Rank"], errors="coerce")
             budding_count = int(((d4 >= 15) & rk.between(15, 50)).sum())
+            emerging_count = int(((d4 >= 15) & (rk <= 30)).sum())
         except Exception:
             budding_count = 0
+            emerging_count = 0
 
-    fcol1, fcol2, fcol3 = st.columns([2, 4, 1.5])
+    fcol1, fcol2, fcol3, fcol4 = st.columns([2, 3, 1.5, 1.5])
     with fcol1:
         sectors = sorted(rot_df["Sector"].dropna().unique().tolist())
         sector_filter = st.selectbox(
@@ -2479,6 +2835,23 @@ def render_rotation_page():
         ):
             st.session_state["rot_flt_budding"] = not st.session_state["rot_flt_budding"]
             st.rerun()
+    with fcol4:
+        st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
+        emerg_label = (
+            f"🚀 EMERGING ({emerging_count})"
+            if st.session_state["rot_flt_emerging"] else "🚀 EMERGING"
+        )
+        if st.button(
+            emerg_label, type="primary", use_container_width=True, key="btn_rot_emerging",
+            help="Groups climbing INTO leadership: Δ4w ≥ +15 AND currently ranked in "
+                 "the top 30. Minervini's classic 'new leader emerging' screen — the "
+                 "group has real 4-week rotation momentum AND is already in the top "
+                 "tier by absolute rank. Wider net than BUDDING (includes obvious "
+                 "leaders); complementary lens for finding groups whose upmove is "
+                 "still accelerating.",
+        ):
+            st.session_state["rot_flt_emerging"] = not st.session_state["rot_flt_emerging"]
+            st.rerun()
 
     filtered = rot_df.copy()
     if sector_filter and sector_filter != "All sectors":
@@ -2491,6 +2864,11 @@ def render_rotation_page():
             d4 = pd.to_numeric(filtered["Delta_4w"], errors="coerce")
             rk = pd.to_numeric(filtered["Rank"], errors="coerce")
             filtered = filtered[(d4 >= 15) & rk.between(15, 50)]
+    if st.session_state["rot_flt_emerging"]:
+        if "Delta_4w" in filtered.columns and "Rank" in filtered.columns:
+            d4 = pd.to_numeric(filtered["Delta_4w"], errors="coerce")
+            rk = pd.to_numeric(filtered["Rank"], errors="coerce")
+            filtered = filtered[(d4 >= 15) & (rk <= 30)]
 
     # Default sort: Rotation Score desc
     if "RotationScore" in filtered.columns:
@@ -2515,6 +2893,49 @@ def render_rotation_page():
         "MeanRS": st.column_config.NumberColumn("AVG RS", format="%.1f", width="small"),
         "PctAbove50MA": st.column_config.NumberColumn("% > 50MA", format="%.1f%%", width="small",
             help="Pct of industry members above their 50-day MA. Higher = broader strength."),
+        # Minervini-style leadership signals (added 2026-07-10). Each answers a
+        # different question about whether the group's strength is real vs. faked
+        # by a couple of mega-caps carrying the mean.
+        "RS_Strong_Pct": st.column_config.NumberColumn(
+            "LDR %", format="%.0f%%", width="small",
+            help="LEADERSHIP BREADTH — pct of members with RS ≥ 80. A group ranked "
+                 "high by mean RS but with low LDR % means 1-2 mega-caps are carrying "
+                 "the average. Minervini looks for groups where MANY names are strong, "
+                 "not just the composite. 30%+ = institutional accumulation zone.",
+        ),
+        "Near_High_Pct": st.column_config.NumberColumn(
+            "NH %", format="%.0f%%", width="small",
+            help="NEW-HIGHS BREADTH — pct of members within 5% of their 52-week high. "
+                 "Minervini's coordination signal: institutional flow shows up as many "
+                 "stocks attacking their highs together. 25%+ = the group is being bid "
+                 "up systematically, not just drifting.",
+        ),
+        "Setup_Density": st.column_config.NumberColumn(
+            "SETUP %", format="%.0f%%", width="small",
+            help="SETUP DENSITY — pct of members currently in the Momentum scan with a "
+                 "valid setup (VCP / breakout / BUY ZONE). High density means many "
+                 "stocks in the group are coiling for coordinated moves. Requires a "
+                 "recent Momentum scan; 0% if no scan has been run recently.",
+        ),
+        "General_Ticker": st.column_config.TextColumn(
+            "THE GENERAL", width="small",
+            help="Highest-RS member of the group — the 'canary' stock. When the "
+                 "general is buyable (BUY ZONE, VCP A, BREAKOUT), the group is in "
+                 "active leadership. When the general breaks down, the group usually "
+                 "follows. Click into the group to see its base structure.",
+        ),
+        "General_RS": st.column_config.NumberColumn(
+            "GEN RS", format="%d", width="small",
+            help="RS of THE GENERAL stock.",
+        ),
+        "General_Signal": st.column_config.TextColumn(
+            "GEN SIG", width="small",
+            help="Current setup signal for THE GENERAL from the Momentum scan. "
+                 "BUY ZONE / VCP A = buyable now. BREAKOUT = broke out today. "
+                 "'on list' = in Momentum scan but no specific setup right now. "
+                 "Blank = not currently in the Momentum scan (may be extended, "
+                 "in Stage 3/4, or below the RS threshold).",
+        ),
         "RotationScore": st.column_config.ProgressColumn("ROTATION", min_value=0, max_value=200,
             format="%.0f", width="small",
             help="Composite score: mean RS + 1.5×Δ4w + 0.75×Δ1w. Higher = stronger rotation IN."),

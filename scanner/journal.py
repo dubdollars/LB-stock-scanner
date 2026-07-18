@@ -51,6 +51,23 @@ SETUP_TAGS = [
     "Other",
 ]
 
+# Single source of truth for trade SOURCES — where the candidate originated.
+# Distinct from SETUP_TAGS (which describes the chart pattern). Source tracks
+# which scan/filter surfaced the ticker so we can later answer questions like
+# "what's my hit rate on BUY ZONE trades vs Top Stocks intersections?".
+SOURCE_OPTIONS = [
+    "Top Stocks",
+    "Momentum - BUY ZONE",
+    "Momentum - Power Play",
+    "Momentum - Other Filter",
+    "Quality",
+    "Mean Reversion",
+    "Social",
+    "Rotation",
+    "Manual / Eyeball",
+    "Other",
+]
+
 JOURNAL_FILE = (
     Path(__file__).resolve().parent.parent / "data" / "journal.json"
 )
@@ -116,6 +133,7 @@ class Trade:
     id: str = ""
     ticker: str = ""
     setup_tag: str = "Other"
+    source: str = "Other"             # which scan/filter surfaced this trade
     stop_price: float = 0.0           # CURRENT stop (mutable; updated as you trail)
     initial_stop_price: float = 0.0   # IMMUTABLE anchor for R-multiple math
     notes: str = ""
@@ -128,17 +146,22 @@ class Trade:
     @classmethod
     def new(cls, ticker: str, setup_tag: str, entry_date: str,
             entry_price: float, stop_price: float, shares: int,
-            notes: str = "") -> "Trade":
+            notes: str = "", source: str = "Other") -> "Trade":
         """Construct a fresh trade with one BUY transaction (the starter).
 
         Sets BOTH stop_price (current/mutable) AND initial_stop_price (immutable
         R-multiple anchor) to the same value at entry.
+
+        `source` is validated against SOURCE_OPTIONS (falls back to "Other"
+        if an unknown value is passed) and tracks which scan/filter the trade
+        came from — separate from setup_tag, which describes the chart pattern.
         """
         sp = round(float(stop_price), 4) if stop_price else 0.0
         t = cls(
             id=str(uuid.uuid4())[:8],
             ticker=ticker.strip().upper(),
             setup_tag=setup_tag if setup_tag in SETUP_TAGS else "Other",
+            source=source if source in SOURCE_OPTIONS else "Other",
             stop_price=sp,
             initial_stop_price=sp,
             notes=notes.strip(),
@@ -376,6 +399,37 @@ class Trade:
         """Date of the most recent SELL (used as 'closed' date for closed trades)."""
         return self.sells[-1].date if self.sells else ""
 
+    @property
+    def days_held(self) -> int:
+        """Calendar days since the starter (first BUY) transaction.
+
+        - OPEN / PARTIAL positions: today − entry_date (still accruing)
+        - CLOSED positions: last_exit_date − entry_date (total trade duration, frozen)
+
+        Returns 0 for trades with no entry date or unparseable dates.
+        Uses calendar days (not trading days) for simplicity — easy to reason about
+        and matches how most journals/brokerages report holding period.
+        """
+        if not self.buys:
+            return 0
+        entry_str = self.entry_date
+        if not entry_str:
+            return 0
+        try:
+            from datetime import date
+            entry_d = datetime.strptime(entry_str[:10], "%Y-%m-%d").date()
+            if self.status == "closed":
+                last_exit = self.last_exit_date
+                if last_exit:
+                    end_d = datetime.strptime(last_exit[:10], "%Y-%m-%d").date()
+                else:
+                    end_d = date.today()
+            else:
+                end_d = date.today()
+            return max(0, (end_d - entry_d).days)
+        except Exception:
+            return 0
+
 
 # ---------------------------------------------------------------------------
 # Persistence
@@ -438,6 +492,10 @@ def _trade_from_row(row: dict) -> Trade:
     # pre-date the field's existence.
     if "initial_stop_price" not in row or not row.get("initial_stop_price"):
         row["initial_stop_price"] = row.get("stop_price", 0.0)
+    # Backfill source for legacy trades that pre-date the field. "Other"
+    # is the neutral default so old trades don't pollute source-based stats.
+    if "source" not in row or not row.get("source"):
+        row["source"] = "Other"
     return Trade(transactions=txs, stop_history=stop_hist, **row)
 
 
@@ -539,6 +597,51 @@ def expectancy_by_setup(trades: list[Trade]) -> dict:
         avg_loss = sum(b["losses_r"]) / losses if losses else 0.0
         expectancy = hit_rate * avg_win + (1 - hit_rate) * avg_loss
         out[tag] = {
+            "n": n,
+            "wins": wins,
+            "losses": losses,
+            "hit_rate": round(hit_rate, 3),
+            "avg_win_r": round(avg_win, 3),
+            "avg_loss_r": round(avg_loss, 3),
+            "expectancy_r": round(expectancy, 3),
+        }
+    return out
+
+
+def expectancy_by_source(trades: list[Trade]) -> dict:
+    """Same shape as expectancy_by_setup, but bucketed by trade SOURCE.
+
+    Lets you answer: "Which scan/filter actually surfaces my best winners?"
+    e.g. compare hit rate + expectancy of BUY ZONE-sourced trades vs Top
+    Stocks intersection trades vs Manual / Eyeball picks.
+
+    Only CLOSED trades that have a computable realized_r count.
+    """
+    by_source: dict = {}
+    for t in trades:
+        if t.status != "closed":
+            continue
+        r = t.realized_r
+        if r is None:
+            continue
+        bucket = by_source.setdefault(t.source or "Other", {"wins_r": [], "losses_r": []})
+        if r > 0:
+            bucket["wins_r"].append(r)
+        else:
+            bucket["losses_r"].append(r)
+
+    out = {}
+    for src, b in by_source.items():
+        wins = len(b["wins_r"])
+        losses = len(b["losses_r"])
+        n = wins + losses
+        if n == 0:
+            continue
+        hit_rate = wins / n
+        avg_win = sum(b["wins_r"]) / wins if wins else 0.0
+        avg_loss = sum(b["losses_r"]) / losses if losses else 0.0
+        expectancy = hit_rate * avg_win + (1 - hit_rate) * avg_loss
+        out[src] = {
             "n": n,
             "wins": wins,
             "losses": losses,

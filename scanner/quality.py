@@ -566,6 +566,15 @@ def run_quality_scan(
     ret_3m_map: dict[str, Optional[float]] = {}
     ret_6m_map: dict[str, Optional[float]] = {}
     ad_map: dict[str, Optional[str]] = {}
+    # Pct_Above_50MA — needed by the Rotation table's "% > 50MA" column.
+    # Cheap to compute here since we're already looping over price history
+    # for every ticker (added 2026-07-02 after user reported all-None column).
+    pct50_map: dict[str, Optional[float]] = {}
+    # Pct_From_52wHigh — needed by the Rotation table's "NEW HIGHS %" column
+    # (% of members within 5% of 52w high — Minervini's coordination signal).
+    # Computed as (52wh - last_close) / 52wh * 100, so 0.0 = at high, 5.0 = 5%
+    # below high. Added 2026-07-10 alongside Leadership Breadth improvements.
+    from52wh_map: dict[str, Optional[float]] = {}
 
     processed = 0
     for t in tickers:
@@ -580,6 +589,25 @@ def run_quality_scan(
         ret_3m_map[t] = compute_n_day_return(df, 63)
         ret_6m_map[t] = compute_n_day_return(df, 126)
         ad_map[t] = compute_acc_dis_rating(df, weeks=13)
+        # Pct above 50-day SMA: (close - sma50) / sma50 * 100.
+        # Guards against too-short history and zero SMA.
+        try:
+            if len(df) >= 50 and "Close" in df.columns:
+                close = float(df["Close"].iloc[-1])
+                sma50 = float(df["Close"].tail(50).mean())
+                if sma50 > 0:
+                    pct50_map[t] = round((close - sma50) / sma50 * 100, 2)
+                # Pct BELOW 52w high: (52wh - close) / 52wh * 100.
+                # Value of 0 = at 52w high; 5 = 5% below high; used by Rotation's
+                # New-Highs Breadth to count members within striking distance.
+                # 252 trading days ≈ 52 weeks; tail is fine even if len < 252
+                # (uses whatever history exists — better a partial year than
+                # dropping the ticker entirely).
+                high_52w = float(df["Close"].tail(252).max())
+                if high_52w > 0:
+                    from52wh_map[t] = round((high_52w - close) / high_52w * 100, 2)
+        except Exception:
+            pass
 
     # ---- 5. Universe-relative percentile rankings ----
     fwd_eps_growth = {
@@ -624,6 +652,8 @@ def run_quality_scan(
             "RS_6m":             rs_6m_map.get(t),
             "Acc_Dis_Rating":    ad_r,
             "UD_Vol_Ratio":      ud_vol_map.get(t),
+            "Pct_Above_50MA":    pct50_map.get(t),
+            "Pct_From_52wHigh":  from52wh_map.get(t),
             "Trailing_PE":       entry.get("trailing_pe"),
             "Forward_PE":        entry.get("forward_pe"),
             "Forward_EPS":       entry.get("forward_eps"),
