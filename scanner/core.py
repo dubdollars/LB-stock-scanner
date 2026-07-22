@@ -118,6 +118,21 @@ class ScanResult:
     # Rotation page's industry table (gives it ~70 industries instead of
     # only the ~20 that have 3+ SEPA-passing candidates).
     industry_universe: list = field(default_factory=list)
+    # Distribution-day DATES per index (ISO YYYY-MM-DD strings, oldest first,
+    # after O'Neil erasure). Added 2026-07-10 so the market-signal banner
+    # can show hover/click reveal of exactly which days were counted.
+    # Placed at the END of the dataclass because Python requires all fields
+    # with defaults to come AFTER all non-defaulted fields (universe_size,
+    # sp_dist, nq_dist, rut_dist are all non-defaulted). Legacy scans
+    # loaded from disk get [] via default_factory — the UI shows a "re-run
+    # to capture" hint in the expander for those.
+    sp_dist_dates: list = field(default_factory=list)
+    nq_dist_dates: list = field(default_factory=list)
+    rut_dist_dates: list = field(default_factory=list)
+    # Market state machine snapshot — O'Neil correction/rally/FTD tracking.
+    # See detect_market_state_and_ftds() for the full contract. Legacy
+    # scan files that predate this field load with empty dict.
+    market_state: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -200,17 +215,85 @@ def days_until(date_str: Optional[str]) -> Optional[int]:
 # Phase 0: Market context
 # ---------------------------------------------------------------------------
 
-def diagnose_market_context() -> tuple[str, str, int, str, int, str, int]:
+def diagnose_market_context() -> tuple:
+    """Return (market_signal, sp_trend, sp_dist, nq_trend, nq_dist,
+    rut_trend, rut_dist, sp_dates, nq_dates, rut_dates, state_info).
+
+    Distribution dates are ISO YYYY-MM-DD strings, oldest first. Uses strict
+    IBD rules (down 0.2%+ on volume higher than prior day). Data source is
+    ETF proxies (SPY / QQQ / IWM) not underlying indices (^GSPC / ^IXIC /
+    ^RUT) because yfinance's index-level volume series is notoriously
+    inconsistent — ETF share volume is clean and matches institutional flow.
+    Prices tracked by the ETFs move ~1:1 with the underlying indices so the
+    price test is unaffected.
+
+    state_info is a dict describing the O'Neil correction/rally-attempt/
+    confirmed-uptrend state machine — see detect_market_state_and_ftds()
+    for the full contract.
+    """
     market_signal = "GREEN (Aggressive)"
     sp_trend = nq_trend = rut_trend = "N/A"
     sp_dist = nq_dist = rut_dist = 0
+    sp_dates: list[str] = []
+    nq_dates: list[str] = []
+    rut_dates: list[str] = []
+    state_info: dict = {}
 
     try:
+        # ETF proxies for market-state analysis. SPY = S&P 500, QQQ =
+        # Nasdaq-100 (institutional side of the tape; better proxy for
+        # what moves markets than the noisy Nasdaq Composite), IWM =
+        # Russell 2000. All three have clean, consistent share volume
+        # that we can trust for prior-day comparisons.
         indices = yf.download(
-            ["^GSPC", "^IXIC", "^RUT"], period="80d", progress=False
+            ["SPY", "QQQ", "IWM"], period="80d", progress=False
         )
 
         def check_index(ticker):
+            """Return (trend, dist_count, dist_date_list) — strict IBD
+            Market Pulse rules.
+
+            Distribution day = index closes down 0.2%+ from prior close,
+            AND today's volume is HIGHER than yesterday's volume.
+
+            The count is the number of such days in the trailing 25
+            trading sessions. Days age out of the count naturally as the
+            25-session window slides forward — no separate "erasure" loop.
+
+            IMPORTANT — what changed 2026-07-22 (user-reported bug fix):
+            The previous implementation used "volume > 50-day average"
+            instead of "volume > prior day". That single deviation from
+            O'Neil / IBD's published rule caused three visible problems:
+
+              1. False positives around earnings/expiration weeks. Days
+                 with heavy background volume (quad witching, quarter-end)
+                 inflated the 50-day average, but a subsequent slightly-
+                 lower-volume down-day still beat the average and got
+                 flagged. Under the correct prior-day test it fails
+                 because expiration Friday's volume is huge.
+
+              2. False negatives on real distribution days like July 13
+                 and July 17. Their absolute volume was elevated, but
+                 the 50-day average had been dragged UP by even bigger
+                 panic days earlier in the window, so they failed the
+                 average test. Under the correct prior-day test they
+                 easily pass.
+
+              3. Retroactive count changes ("yesterday said 4, today
+                 says 5, no new day was added"). The 50-day average
+                 changes every day as the window slides, so a borderline
+                 historical day could flip from "not counted" to "counted"
+                 without anything new happening. Under the prior-day test,
+                 each historical day's flag status is FROZEN — determined
+                 only by its own volume vs. the immediately prior day, both
+                 of which are historical constants. This eliminates the
+                 whole class of "the past changed" bugs.
+
+            The rally-cancellation ("1.7%+ up-day erases a dist day")
+            logic is also removed. It has no basis in IBD's actual
+            published methodology — IBD ages days out via the 25-session
+            window and doesn't credit accumulation days as cancellations.
+            """
             try:
                 try:
                     closes = indices["Close"][ticker]
@@ -219,32 +302,44 @@ def diagnose_market_context() -> tuple[str, str, int, str, int, str, int]:
                     closes = indices["Close"]
                     vols = indices["Volume"]
 
-                avg_vol_50 = vols.rolling(50).mean()
-                dist_days = 0
-
-                for i in range(len(closes) - 25, len(closes)):
-                    if i < 1:
+                dist_dates: list[str] = []
+                # Walk the last 25 trading sessions. For each day i:
+                #   - Compare close[i] vs close[i-1] for the price test
+                #   - Compare volume[i] vs volume[i-1] for the volume test
+                # Both are pure historical comparisons — no rolling window,
+                # no average, no state that changes as new bars arrive.
+                # This is what makes the count deterministic and stable
+                # across scans.
+                lookback_start = max(1, len(closes) - 25)
+                for i in range(lookback_start, len(closes)):
+                    try:
+                        prev_close = float(closes.iloc[i - 1])
+                        cur_close = float(closes.iloc[i])
+                        prev_vol = float(vols.iloc[i - 1])
+                        cur_vol = float(vols.iloc[i])
+                    except Exception:
+                        # NaN or missing bar — skip it. yfinance occasionally
+                        # returns partial data for the current session; better
+                        # to skip than to falsely flag.
                         continue
-                    pct = (closes.iloc[i] - closes.iloc[i - 1]) / closes.iloc[i - 1]
-                    if pct < -0.002 and vols.iloc[i] > avg_vol_50.iloc[i]:
-                        dist_days += 1
-
-                # O'Neil rule: strong 1.7%+ rally on high vol erases one dist day
-                for i in range(len(closes) - 25, len(closes)):
-                    if i < 1:
-                        continue
-                    pct = (closes.iloc[i] - closes.iloc[i - 1]) / closes.iloc[i - 1]
-                    if pct >= 0.017 and vols.iloc[i] > avg_vol_50.iloc[i]:
-                        dist_days = max(0, dist_days - 1)
+                    if prev_close <= 0 or prev_vol <= 0:
+                        continue  # bad data; skip
+                    pct = (cur_close - prev_close) / prev_close
+                    if pct <= -0.002 and cur_vol > prev_vol:
+                        try:
+                            iso = closes.index[i].strftime("%Y-%m-%d")
+                        except Exception:
+                            iso = str(closes.index[i])[:10]
+                        dist_dates.append(iso)
 
                 trend = "UP" if closes.iloc[-1] > closes.tail(50).mean() else "DOWN"
-                return trend, dist_days
+                return trend, len(dist_dates), dist_dates
             except Exception:
-                return "N/A", 0
+                return "N/A", 0, []
 
-        sp_trend, sp_dist = check_index("^GSPC")
-        nq_trend, nq_dist = check_index("^IXIC")
-        rut_trend, rut_dist = check_index("^RUT")
+        sp_trend, sp_dist, sp_dates = check_index("SPY")
+        nq_trend, nq_dist, nq_dates = check_index("QQQ")
+        rut_trend, rut_dist, rut_dates = check_index("IWM")
 
         max_dist = max(sp_dist, nq_dist)
         if max_dist >= 6:
@@ -259,10 +354,247 @@ def diagnose_market_context() -> tuple[str, str, int, str, int, str, int]:
         if sp_trend == "UP" and rut_trend == "DOWN":
             if "GREEN" in market_signal:
                 market_signal = "YELLOW (Divergence - Small Caps Lagging)"
+
+        # ---- State machine + FTD detection ----
+        # SPY drives the state (correction/rally-attempt) because it's the
+        # cleanest "market" proxy. FTDs are detected on any of the three
+        # ETFs — any one qualifying triggers a state transition to UPTREND.
+        state_info = detect_market_state_and_ftds(indices, sp_dates)
     except Exception:
         pass
 
-    return market_signal, sp_trend, sp_dist, nq_trend, nq_dist, rut_trend, rut_dist
+    return (market_signal, sp_trend, sp_dist, nq_trend, nq_dist, rut_trend, rut_dist,
+            sp_dates, nq_dates, rut_dates, state_info)
+
+
+# ---------------------------------------------------------------------------
+# Market state machine (O'Neil correction / rally-attempt / FTD)
+# ---------------------------------------------------------------------------
+
+# FTD price threshold. IBD's current published threshold is 1.4%; O'Neil's
+# original threshold from *How to Make Money in Stocks* was 1.7%. Some modern
+# practitioners use 1.25% to catch borderline confirmations that IBD misses.
+# User set to 1.25% (2026-07-22) after asking about how often 1.4% actually
+# prints on major indices — the answer is "not often enough in sleepy tapes."
+# Days above 1.7% are noted separately as "strong FTDs" for the UI.
+_FTD_PCT_THRESHOLD = 0.0125
+_FTD_STRONG_THRESHOLD = 0.017
+
+# Minimum day-of-rally-attempt for a valid FTD. O'Neil's rule: Day 4+.
+# FTDs on Day 1-3 are considered premature (rally hasn't established
+# enough follow-through to distinguish from a dead-cat bounce).
+_FTD_MIN_DAY = 4
+
+# Distribution-days threshold that flips UPTREND -> CORRECTION. This
+# mirrors the existing "YELLOW (Caution)" signal cutoff so the state
+# machine and the market-signal banner stay directionally aligned.
+_CORRECTION_DIST_THRESHOLD = 5
+
+
+def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
+    """Walk forward through the price history for SPY/QQQ/IWM and produce
+    a snapshot of the O'Neil market-state machine.
+
+    Returns a dict with:
+      state             — "UPTREND" | "CORRECTION" | "RALLY_ATTEMPT"
+      state_since       — ISO date the current state began
+      correction_low    — {"date", "close"} of the lowest SPY close inside
+                          the current correction/rally-attempt; None if
+                          currently UPTREND
+      rally_day         — Day-N of the current rally attempt (1-based), or
+                          0 if not currently in a rally attempt
+      last_ftd          — {"date", "index", "pct_gain", "vol_ratio"} of the
+                          most recent FTD in the window; None if none
+      ftd_history       — list of every FTD detected in the window, oldest
+                          first. Same shape as last_ftd.
+
+    State transitions (walked chronologically, deterministic):
+
+      UPTREND
+        └─ CORRECTION triggered when SPY dist-days in trailing 25 sessions
+           reach _CORRECTION_DIST_THRESHOLD (5). Marks correction_low =
+           SPY close on trigger day.
+
+      CORRECTION
+        ├─ correction_low updated on any new lower close.
+        └─ RALLY_ATTEMPT triggered on the first up-day (SPY close > prior
+           close) after a fresh lower low. Day 1 = that up-day.
+
+      RALLY_ATTEMPT
+        ├─ Day counter advances each session.
+        ├─ Reset to CORRECTION if SPY closes below correction_low
+           (attempt failed; next up-day starts a new attempt).
+        └─ UPTREND triggered when ANY of the three ETFs prints an FTD
+           on Day 4+ of the current attempt. FTD = close +1.25%+ on
+           volume higher than prior session.
+
+    The walk starts from the earliest usable bar (index 25+ so we have
+    enough history to count dist-days for the correction trigger). If the
+    market is already deep in correction at the start of the window, the
+    machine catches up on its own within a few sessions.
+    """
+    result = {
+        "state": "UPTREND",
+        "state_since": "",
+        "correction_low": None,
+        "rally_day": 0,
+        "last_ftd": None,
+        "ftd_history": [],
+    }
+
+    try:
+        # Extract SPY (state driver) + all three ETFs (FTD checker).
+        # yfinance's multi-ticker download returns a MultiIndex; the
+        # try/except handles the single-ticker fallback shape.
+        try:
+            spy_closes = indices_df["Close"]["SPY"]
+            spy_vols   = indices_df["Volume"]["SPY"]
+            qqq_closes = indices_df["Close"]["QQQ"]
+            qqq_vols   = indices_df["Volume"]["QQQ"]
+            iwm_closes = indices_df["Close"]["IWM"]
+            iwm_vols   = indices_df["Volume"]["IWM"]
+        except Exception:
+            return result
+
+        n = len(spy_closes)
+        if n < 30:
+            return result  # not enough history to run state machine safely
+
+        # Pre-compute distribution-day dates on SPY across the full window
+        # so we can quickly ask "how many dist-days in the trailing 25
+        # sessions ending at index i?" during the walk.
+        sp_dist_iso_set = set(sp_dist_dates or [])
+
+        def _iso(idx):
+            try:
+                return idx.strftime("%Y-%m-%d")
+            except Exception:
+                return str(idx)[:10]
+
+        def _pct(series, i):
+            try:
+                prev = float(series.iloc[i - 1])
+                cur = float(series.iloc[i])
+                if prev <= 0:
+                    return None
+                return (cur - prev) / prev
+            except Exception:
+                return None
+
+        def _vol_ratio(vols, i):
+            try:
+                prev = float(vols.iloc[i - 1])
+                cur = float(vols.iloc[i])
+                if prev <= 0:
+                    return None
+                return cur / prev
+            except Exception:
+                return None
+
+        # Count SPY dist-days in trailing 25 sessions ending at index i.
+        # Fast: iterate window, check membership in the pre-built ISO set.
+        def _dist_days_in_trailing_25(end_i: int) -> int:
+            start = max(0, end_i - 25 + 1)
+            count = 0
+            for k in range(start, end_i + 1):
+                if _iso(spy_closes.index[k]) in sp_dist_iso_set:
+                    count += 1
+            return count
+
+        # State machine walk. Start at index 1 (need i-1 for comparisons)
+        # but the CORRECTION trigger needs at least 25 sessions of history
+        # to be meaningful, so we start UPTREND until index 25.
+        state = "UPTREND"
+        state_since_i = 0
+        correction_low: dict | None = None  # {"date": iso, "close": float}
+        rally_day = 0
+
+        for i in range(1, n):
+            date_iso = _iso(spy_closes.index[i])
+            spy_pct = _pct(spy_closes, i)
+            spy_close = float(spy_closes.iloc[i]) if spy_closes.iloc[i] == spy_closes.iloc[i] else None
+            if spy_pct is None or spy_close is None:
+                continue
+
+            if state == "UPTREND":
+                # Trigger CORRECTION if trailing dist-days accumulated.
+                if i >= 25 and _dist_days_in_trailing_25(i) >= _CORRECTION_DIST_THRESHOLD:
+                    state = "CORRECTION"
+                    state_since_i = i
+                    correction_low = {"date": date_iso, "close": spy_close}
+                    rally_day = 0
+
+            elif state == "CORRECTION":
+                # Track new lows.
+                if correction_low is None or spy_close < correction_low["close"]:
+                    correction_low = {"date": date_iso, "close": spy_close}
+                # First up-day starts a rally attempt.
+                if spy_pct > 0:
+                    state = "RALLY_ATTEMPT"
+                    state_since_i = i
+                    rally_day = 1
+
+            elif state == "RALLY_ATTEMPT":
+                # Advance day counter (Day 1 was set on the transition day;
+                # subsequent sessions advance).
+                rally_day += 1
+
+                # Failure: SPY closed below the correction low → attempt
+                # resets. New correction_low is today's close. Machine
+                # returns to CORRECTION; next up-day starts new attempt.
+                if correction_low is not None and spy_close < correction_low["close"]:
+                    state = "CORRECTION"
+                    state_since_i = i
+                    correction_low = {"date": date_iso, "close": spy_close}
+                    rally_day = 0
+                    continue
+
+                # FTD detection — only valid from Day 4+.
+                if rally_day >= _FTD_MIN_DAY:
+                    # Check each ETF; any qualifying day triggers FTD.
+                    # If multiple qualify same day, the strongest wins in
+                    # the record for last_ftd (higher pct gain).
+                    ftd_candidates = []
+                    for label, closes, vols in [
+                        ("S&P 500", spy_closes, spy_vols),
+                        ("Nasdaq",  qqq_closes, qqq_vols),
+                        ("Russell 2000", iwm_closes, iwm_vols),
+                    ]:
+                        pct = _pct(closes, i)
+                        vr  = _vol_ratio(vols, i)
+                        if pct is None or vr is None:
+                            continue
+                        if pct >= _FTD_PCT_THRESHOLD and vr > 1.0:
+                            ftd_candidates.append({
+                                "date": date_iso,
+                                "index": label,
+                                "pct_gain": round(pct * 100, 2),
+                                "vol_ratio": round(vr, 2),
+                                "strong": pct >= _FTD_STRONG_THRESHOLD,
+                                "rally_day": rally_day,
+                            })
+                    if ftd_candidates:
+                        # Sort by pct_gain desc; the winner represents "the"
+                        # FTD for this session, but we log all of them so
+                        # the user can see confirmations across indices.
+                        ftd_candidates.sort(key=lambda x: -x["pct_gain"])
+                        result["ftd_history"].extend(ftd_candidates)
+                        # Transition to UPTREND. state_since = today.
+                        state = "UPTREND"
+                        state_since_i = i
+                        correction_low = None
+                        rally_day = 0
+
+        # Materialize the final state.
+        result["state"] = state
+        result["state_since"] = _iso(spy_closes.index[state_since_i]) if state_since_i else _iso(spy_closes.index[0])
+        result["correction_low"] = correction_low
+        result["rally_day"] = rally_day if state == "RALLY_ATTEMPT" else 0
+        if result["ftd_history"]:
+            result["last_ftd"] = result["ftd_history"][-1]
+        return result
+    except Exception:
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -2099,6 +2431,8 @@ def run_scan(settings: ScanSettings, progress: ProgressCallback = None) -> ScanR
     (
         market_signal, sp_trend, sp_dist,
         nq_trend, nq_dist, rut_trend, rut_dist,
+        sp_dist_dates, nq_dist_dates, rut_dist_dates,
+        market_state,
     ) = diagnose_market_context()
     if progress:
         progress("market", 1, 1, f"Market: {market_signal}")
@@ -2205,6 +2539,10 @@ def run_scan(settings: ScanSettings, progress: ProgressCallback = None) -> ScanR
         sp_dist=sp_dist,
         nq_dist=nq_dist,
         rut_dist=rut_dist,
+        sp_dist_dates=sp_dist_dates,
+        nq_dist_dates=nq_dist_dates,
+        rut_dist_dates=rut_dist_dates,
+        market_state=market_state,
         universe_size=pre_filter_count,
         pct_above_50=round(pct_above_50, 1),
         pct_above_200=round(pct_above_200, 1),

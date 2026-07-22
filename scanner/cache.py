@@ -125,6 +125,14 @@ def save_scan(result: ScanResult) -> tuple[Path, bool]:
         except Exception:
             # Never let a cohort-log failure block the main scan-save path.
             pass
+        # Append market-state snapshot to the append-only jsonl log.
+        # Used for diffing distribution-day counts across scans and
+        # explaining any change ("what day appeared/disappeared and why").
+        try:
+            from .dist_log import append_scan_snapshot as _append_state_snapshot  # type: ignore
+            _append_state_snapshot(payload)
+        except Exception:
+            pass
 
     _prune_old()
     return out_path, is_healthy

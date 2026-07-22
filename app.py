@@ -229,6 +229,11 @@ def _render_mode_switcher():
             st.session_state.mode = "journal"
             st.session_state.view = "journal"
             st.session_state.research_ticker = None
+            # Auto-refresh prices on tab entry — flag consumed by
+            # render_journal_page(). Sidebar's Refresh Prices button still
+            # exists for manual re-refreshes if the user's been on the page
+            # a while. Cheap enough (~10-30s) that we can do it every entry.
+            st.session_state.journal_auto_refresh_pending = True
             st.rerun()
     with col_research:
         if st.button("🔎 RESEARCH", type=_btn_type("research"),
@@ -719,12 +724,201 @@ def _signal_to_class(signal: str) -> str:
 
 def _render_market_strip(scan: dict):
     sig = scan.get("market_signal", "N/A")
+
+    # Distribution-date lists per index. Added 2026-07-10 so the user can
+    # hover the "Dist days" number to see the actual dates counted, or
+    # click the expander below the banner for a full formatted list.
+    # Legacy scans (pre-field) return empty lists — hover/click still work,
+    # they just show "no dates recorded" and prompt to re-run the scan.
+    sp_dates = scan.get("sp_dist_dates") or []
+    nq_dates = scan.get("nq_dist_dates") or []
+    rut_dates = scan.get("rut_dist_dates") or []
+
+    def _fmt_dates_for_tooltip(dates: list) -> str:
+        """Compact list for the browser-native title tooltip (single line,
+        max 60 chars visible before OS truncates)."""
+        if not dates:
+            return "No distribution days"
+        # Reverse to show newest first — matches how a trader mentally scans
+        return " · ".join(reversed(dates))
+
+    sp_tip = _fmt_dates_for_tooltip(sp_dates)
+    nq_tip = _fmt_dates_for_tooltip(nq_dates)
+    rut_tip = _fmt_dates_for_tooltip(rut_dates)
+
+    # Wrap the Dist days numbers in <span title=""> so hovering shows the
+    # dates. The dotted underline is a subtle "hoverable" affordance without
+    # cluttering the banner.
+    hover_css = "border-bottom:1px dotted currentColor;cursor:help"
     subtitle = (
-        f"S&P 500: <b>{scan.get('sp_trend', 'N/A')}</b> · Dist days: {scan.get('sp_dist', 0)} &nbsp;|&nbsp; "
-        f"Nasdaq: <b>{scan.get('nq_trend', 'N/A')}</b> · Dist days: {scan.get('nq_dist', 0)} &nbsp;|&nbsp; "
-        f"Russell 2000: <b>{scan.get('rut_trend', 'N/A')}</b> · Dist days: {scan.get('rut_dist', 0)}"
+        f"S&P 500: <b>{scan.get('sp_trend', 'N/A')}</b> · Dist days: "
+        f"<span title='{sp_tip}' style='{hover_css}'>{scan.get('sp_dist', 0)}</span> &nbsp;|&nbsp; "
+        f"Nasdaq: <b>{scan.get('nq_trend', 'N/A')}</b> · Dist days: "
+        f"<span title='{nq_tip}' style='{hover_css}'>{scan.get('nq_dist', 0)}</span> &nbsp;|&nbsp; "
+        f"Russell 2000: <b>{scan.get('rut_trend', 'N/A')}</b> · Dist days: "
+        f"<span title='{rut_tip}' style='{hover_css}'>{scan.get('rut_dist', 0)}</span>"
     )
     st.markdown(signal_banner(sig, subtitle), unsafe_allow_html=True)
+
+    # Click reveal — expander below the banner shows the full formatted
+    # date list per index. Uses newest-first ordering so today's date (if
+    # a dist day) is right at the top. Hidden by default so it doesn't
+    # clutter the dashboard unless the user actively wants to see it.
+    total_dist = len(sp_dates) + len(nq_dates) + len(rut_dates)
+    if total_dist > 0 or scan.get("sp_dist", 0) or scan.get("nq_dist", 0) or scan.get("rut_dist", 0):
+        with st.expander(f"📅 Distribution day dates ({total_dist} total across all indices)", expanded=False):
+            def _fmt_list_html(name: str, dates: list) -> str:
+                if not dates:
+                    if scan.get(f"{name.lower()[:3]}_dist", 0):
+                        # Legacy scan — has a count but no dates field
+                        return f"<b>{name}:</b> <span style='color:#9CA3AF'>Dates not recorded in this scan (re-run to capture)</span>"
+                    return f"<b>{name}:</b> <span style='color:#9CA3AF'>None</span>"
+                # Newest first — feels more natural for "what happened recently"
+                bullets = "".join(f"<li>{d}</li>" for d in reversed(dates))
+                return (
+                    f"<b>{name}</b> — {len(dates)} day(s):"
+                    f"<ul style='margin:0.2rem 0 0.6rem 1.2rem;padding:0'>{bullets}</ul>"
+                )
+            st.markdown(
+                f"<div style='font-family:JetBrains Mono;font-size:0.85rem;line-height:1.5'>"
+                f"{_fmt_list_html('S&P 500', sp_dates)}"
+                f"{_fmt_list_html('Nasdaq', nq_dates)}"
+                f"{_fmt_list_html('Russell 2000', rut_dates)}"
+                f"<div style='color:#9CA3AF;font-size:0.75rem;margin-top:0.4rem'>"
+                f"A distribution day is a session where the index closed <b>down ≥0.2%</b> from "
+                f"the prior close, on <b>volume higher than the prior day's volume</b> "
+                f"(strict IBD Market Pulse rule). Days age out of the count after 25 trading "
+                f"sessions — no separate cancellation logic. Because each day's flag depends "
+                f"only on that day and the one before it (both frozen history), the list is "
+                f"deterministic and won't change retroactively between scans."
+                f"</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+    # ============================================================
+    # MARKET STATE MACHINE — O'Neil correction / rally / FTD tracker
+    # ============================================================
+    # Complementary to the distribution-day count above. Distribution days
+    # govern DOWNGRADES from GREEN → YELLOW → RED during uptrends; the state
+    # machine governs UPGRADES from correction back to uptrend via a
+    # confirmed follow-through day (FTD). The two never fight.
+    state = scan.get("market_state") or {}
+    if state and state.get("state"):
+        state_name = state.get("state", "UPTREND")
+        state_since = state.get("state_since", "")
+        rally_day = int(state.get("rally_day") or 0)
+        correction_low = state.get("correction_low") or {}
+        last_ftd = state.get("last_ftd") or {}
+        ftd_history = state.get("ftd_history") or []
+
+        # Color + icon for the state pill
+        state_style = {
+            "UPTREND":       {"icon": "🟢", "color": "#22C55E", "label": "UPTREND (confirmed)"},
+            "CORRECTION":    {"icon": "🔴", "color": "#EF4444", "label": "CORRECTION"},
+            "RALLY_ATTEMPT": {"icon": "🟡", "color": "#EAB308", "label": f"RALLY ATTEMPT — Day {rally_day}"},
+        }.get(state_name, {"icon": "•", "color": "#9CA3AF", "label": state_name})
+
+        # One-line status summary above the expander so the state is visible
+        # at a glance without expanding. Format changes based on state:
+        #   UPTREND       — just the label + last FTD reference (if any)
+        #   CORRECTION    — label + correction low + how to escape
+        #   RALLY_ATTEMPT — label + Day N + what constitutes an FTD
+        if state_name == "RALLY_ATTEMPT":
+            need_ftd = "" if rally_day >= 4 else f" (FTDs count from Day 4)"
+            summary = (
+                f"Awaiting FTD{need_ftd} — need any of SPY/QQQ/IWM to close "
+                f"+1.25% or more on higher volume than the prior session"
+            )
+        elif state_name == "CORRECTION":
+            cl_str = ""
+            if correction_low and correction_low.get("date"):
+                cl_str = f" · Correction low: {correction_low.get('date')} · SPY ${correction_low.get('close', 0):.2f}"
+            summary = f"In correction{cl_str} — waiting for first up-day to start rally attempt"
+        else:  # UPTREND
+            if last_ftd and last_ftd.get("date"):
+                summary = (
+                    f"Confirmed since last FTD: {last_ftd.get('date')} · "
+                    f"{last_ftd.get('index')} +{last_ftd.get('pct_gain', 0):.2f}% "
+                    f"on {last_ftd.get('vol_ratio', 0):.2f}× volume"
+                )
+            else:
+                summary = "No recent correction — uptrend continues"
+
+        st.markdown(
+            f"<div style='background:#0F1620;border:1px solid {state_style['color']};"
+            f"border-radius:6px;padding:0.5rem 0.8rem;margin-top:0.4rem;"
+            f"font-family:JetBrains Mono;font-size:0.85rem'>"
+            f"<span style='font-weight:700;color:{state_style['color']}'>"
+            f"{state_style['icon']} MARKET STATE: {state_style['label']}"
+            f"</span>"
+            f"<span style='color:#9CA3AF'> · {summary}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Detail expander — full state machine snapshot for the curious
+        with st.expander(f"🔬 Market state detail (SPY-driven state machine · {len(ftd_history)} FTD(s) in window)",
+                         expanded=False):
+            since_str = state_since or "unknown"
+            html_parts = [
+                f"<div style='font-family:JetBrains Mono;font-size:0.85rem;line-height:1.55'>"
+                f"<b>State:</b> <span style='color:{state_style['color']}'>{state_style['label']}</span> "
+                f"<span style='color:#9CA3AF'>(since {since_str})</span>"
+            ]
+            if correction_low and correction_low.get("date"):
+                html_parts.append(
+                    f"<br><b>Correction low:</b> {correction_low.get('date')} — "
+                    f"SPY close ${correction_low.get('close', 0):.2f}"
+                )
+            if state_name == "RALLY_ATTEMPT":
+                html_parts.append(
+                    f"<br><b>Day of rally attempt:</b> {rally_day} "
+                    f"<span style='color:#9CA3AF'>(FTD detection active from Day 4)</span>"
+                )
+            if last_ftd and last_ftd.get("date"):
+                strong = "🔥 STRONG " if last_ftd.get("strong") else ""
+                html_parts.append(
+                    f"<br><b>Last FTD:</b> {strong}{last_ftd.get('date')} · "
+                    f"{last_ftd.get('index')} · <b style='color:#22C55E'>+"
+                    f"{last_ftd.get('pct_gain', 0):.2f}%</b> on "
+                    f"{last_ftd.get('vol_ratio', 0):.2f}× prior-day volume "
+                    f"(Day {last_ftd.get('rally_day', '?')} of rally attempt)"
+                )
+            html_parts.append("</div>")
+
+            # FTD history table
+            if ftd_history:
+                html_parts.append(
+                    "<div style='font-family:JetBrains Mono;font-size:0.82rem;"
+                    "margin-top:0.7rem'>"
+                    "<b style='color:#22D3EE'>FTD history (window)</b>"
+                    "<ul style='margin:0.3rem 0 0.5rem 1.2rem;padding:0'>"
+                )
+                # Show newest first
+                for ftd in reversed(ftd_history[-10:]):  # cap at 10 for display
+                    strong_tag = " 🔥" if ftd.get("strong") else ""
+                    html_parts.append(
+                        f"<li>{ftd.get('date')} · {ftd.get('index')} · "
+                        f"+{ftd.get('pct_gain', 0):.2f}% on "
+                        f"{ftd.get('vol_ratio', 0):.2f}× vol · "
+                        f"Day {ftd.get('rally_day', '?')}{strong_tag}</li>"
+                    )
+                html_parts.append("</ul></div>")
+
+            html_parts.append(
+                "<div style='color:#9CA3AF;font-size:0.75rem;margin-top:0.4rem'>"
+                "The state machine walks SPY forward through the window. "
+                "<b>UPTREND</b> flips to <b>CORRECTION</b> when trailing 25-session "
+                "distribution days reach 5. First up-day out of correction starts a "
+                "<b>RALLY ATTEMPT</b> (Day 1). From Day 4 onward, if any of SPY / QQQ / "
+                "IWM closes up 1.25%+ on higher volume than the prior day, that's a "
+                "<b>Follow-Through Day</b> — the rally is confirmed and state returns "
+                "to UPTREND. If SPY closes below the correction low during the attempt, "
+                "it resets and starts over. FTDs at 1.7%+ are marked 🔥 <b>STRONG</b>."
+                "</div>"
+            )
+            st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 
 _METRIC_DOCS = {

@@ -30,6 +30,10 @@ data/cache/
 .DS_Store
 Thumbs.db
 
+# Word / Office lock files (created while a doc is open)
+~$*
+
+
 # Logs
 *.log
 

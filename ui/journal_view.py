@@ -1973,22 +1973,72 @@ def _render_trades_table(trades: list[Trade]):
             body,
         ), unsafe_allow_html=True)
 
-        if trade.notes:
-            # white-space: pre-wrap preserves the \n line breaks that
-            # append_note inserts between timestamped action entries, while
-            # still wrapping long lines naturally. The dark panel + monospace
-            # font keep the running log visually distinct from chart prose.
-            import html as _html
-            notes_html = _html.escape(trade.notes)
-            st.markdown(
-                f"<div style='font-family:JetBrains Mono;font-size:0.82rem;"
-                f"white-space:pre-wrap;background:#0F1620;padding:0.6rem 0.8rem;"
-                f"border-radius:4px;border:1px solid #1F2937;margin-top:0.3rem;"
-                f"line-height:1.55'>"
-                f"<b style='color:{cyan}'>Notes</b>\n{notes_html}"
-                f"</div>",
-                unsafe_allow_html=True,
+        # Notes section — read-only view by default, edit mode when the user
+        # toggles the ✏️ Edit button. Edit mode replaces the styled panel with
+        # a text_area pre-filled with the current notes plus Save/Cancel
+        # buttons. Save persists via update_trade() and reruns; Cancel just
+        # flips the toggle off without saving.
+        # Editing is intentionally destructive — replaces the entire notes
+        # blob rather than diffing individual lines. This is the simplest
+        # UX for cleaning up a running log (deleting outdated action entries,
+        # fixing a typo, adding context) and matches how the notes field
+        # works internally (a single string, appended to by actions).
+        edit_key = f"edit_notes_{trade.id}"
+        is_editing = st.session_state.get(edit_key, False)
+
+        if is_editing:
+            # Edit mode — full-width text area + Save / Cancel
+            new_notes = st.text_area(
+                "Edit notes",
+                value=trade.notes or "",
+                height=200,
+                key=f"edit_notes_ta_{trade.id}",
+                help="Free-form. Preserves line breaks. Timestamped action "
+                     "entries (from Add/Sell/Move Stop) will still get "
+                     "appended below whatever you save here.",
             )
+            btn_save, btn_cancel, _ = st.columns([1, 1, 5])
+            with btn_save:
+                if st.button("💾 Save", key=f"save_notes_{trade.id}",
+                             type="primary", use_container_width=True):
+                    update_trade(trade.id, lambda t, n=new_notes: setattr(t, "notes", n))
+                    st.session_state[edit_key] = False
+                    st.rerun()
+            with btn_cancel:
+                if st.button("Cancel", key=f"cancel_notes_{trade.id}",
+                             use_container_width=True):
+                    st.session_state[edit_key] = False
+                    st.rerun()
+        else:
+            # Read-only view
+            if trade.notes:
+                # white-space: pre-wrap preserves the \n line breaks that
+                # append_note inserts between timestamped action entries, while
+                # still wrapping long lines naturally. The dark panel + monospace
+                # font keep the running log visually distinct from chart prose.
+                import html as _html
+                notes_html = _html.escape(trade.notes)
+                st.markdown(
+                    f"<div style='font-family:JetBrains Mono;font-size:0.82rem;"
+                    f"white-space:pre-wrap;background:#0F1620;padding:0.6rem 0.8rem;"
+                    f"border-radius:4px;border:1px solid #1F2937;margin-top:0.3rem;"
+                    f"line-height:1.55'>"
+                    f"<b style='color:{cyan}'>Notes</b>\n{notes_html}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                edit_label = "✏️ Edit Notes"
+            else:
+                # No notes yet — offer to add some so the user isn't stuck
+                # with a hidden field.
+                edit_label = "✏️ Add Notes"
+
+            btn_edit, _ = st.columns([1.2, 6])
+            with btn_edit:
+                if st.button(edit_label, key=f"edit_notes_btn_{trade.id}",
+                             type="primary", use_container_width=True):
+                    st.session_state[edit_key] = True
+                    st.rerun()
 
         # Transaction history table
         st.markdown("##### Transactions")
@@ -2233,6 +2283,21 @@ def render_journal_page():
     """Main journal page — summary tiles + add-trade form + table + expectancy."""
     cyan = PALETTE["accent_cyan"]
     muted = PALETTE["text_muted"]
+
+    # Auto-refresh prices when the user just clicked the PERFORMANCE mode
+    # button. Flag is set in app.py's mode-switcher click handler and
+    # consumed here (cleared regardless of success so we don't loop). The
+    # sidebar's manual Refresh Prices button is still available for anyone
+    # who's been on the page a while and wants a fresher pull.
+    #
+    # We call load_trades() upfront just for the refresh — the page's own
+    # trades load happens later, and that second call re-reads whatever we
+    # just persisted so P&L tiles reflect the fresh closes on this render.
+    if st.session_state.pop("journal_auto_refresh_pending", False):
+        _pending_trades = load_trades()
+        _held = [t for t in _pending_trades if t.net_shares > 0]
+        if _held:
+            _refresh_journal_prices(_pending_trades)
 
     st.markdown(
         f"<div style='font-family:JetBrains Mono;font-size:0.85rem;color:{muted};"
