@@ -332,7 +332,14 @@ def diagnose_market_context() -> tuple:
                             iso = str(closes.index[i])[:10]
                         dist_dates.append(iso)
 
-                trend = "UP" if closes.iloc[-1] > closes.tail(50).mean() else "DOWN"
+                # Trend labels use ">50MA" / "<50MA" so it's unambiguous what
+                # they measure. Older labels "UP" / "DOWN" implied "up on the
+                # day" which is a different thing (Russell could be down -0.7%
+                # on the day but still trading above its 50-day MA, which
+                # confused users into thinking the scanner was miscounting).
+                # This label matches Minervini's actual trend template: price
+                # above/below the medium-term MA is the trend definition.
+                trend = ">50MA" if closes.iloc[-1] > closes.tail(50).mean() else "<50MA"
                 return trend, len(dist_dates), dist_dates
             except Exception:
                 return "N/A", 0, []
@@ -347,11 +354,16 @@ def diagnose_market_context() -> tuple:
         elif max_dist >= 4:
             market_signal = "YELLOW (Caution)"
 
-        if sp_trend == "DOWN" or nq_trend == "DOWN":
+        # Trend labels renamed 2026-07-22 from "UP"/"DOWN" to ">50MA"/"<50MA"
+        # so users don't misread them as "up on the day". The semantic
+        # meaning is unchanged — trend = price vs 50-day MA — so all the
+        # market-signal downgrade rules below still apply, just with new
+        # string literals.
+        if sp_trend == "<50MA" or nq_trend == "<50MA":
             if market_signal == "GREEN (Aggressive)":
                 market_signal = "YELLOW (Trend Broken)"
 
-        if sp_trend == "UP" and rut_trend == "DOWN":
+        if sp_trend == ">50MA" and rut_trend == "<50MA":
             if "GREEN" in market_signal:
                 market_signal = "YELLOW (Divergence - Small Caps Lagging)"
 
@@ -1499,9 +1511,11 @@ def calc_breadth(stock_cache: dict, sp_trend: str, nq_trend: str, rut_trend: str
 
     # ------ Status decision tree ------
     # Worst-first; first match wins.
-    trend_broken = sp_trend == "DOWN" or nq_trend == "DOWN"
+    # Trend labels are ">50MA" / "<50MA" (renamed from "UP"/"DOWN" 2026-07-22).
+    # Meaning unchanged: "<50MA" = index closed below its 50-day MA = trend broken.
+    trend_broken = sp_trend == "<50MA" or nq_trend == "<50MA"
     small_cap_divergence = (
-        sp_trend == "UP" and nq_trend == "UP" and rut_trend == "DOWN"
+        sp_trend == ">50MA" and nq_trend == ">50MA" and rut_trend == "<50MA"
     )
     # Tightened GREEN gates
     strong_ud = up_down_ratio >= 1.3

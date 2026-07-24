@@ -40,7 +40,7 @@ from ui.mean_reversion_view import render_mean_reversion_page, render_mean_rever
 
 st.set_page_config(
     page_title="Legacy Brands Money Making Machine",
-    page_icon="◆",
+    page_icon="💰",  # money bag — matches the h1 icon in the page title
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -155,6 +155,16 @@ def _render_mode_switcher():
     mode obvious at a glance. A small "VIEWING: …" caption underneath also
     spells it out in writing for absolute clarity.
     """
+    # App title bar — sits above the mode switcher on every page. Moved here
+    # 2026-07-22 so it's the FIRST thing the user sees regardless of which
+    # tab they're on. Was previously duplicated inside each individual page's
+    # render function.
+    st.markdown(
+        f"<h1 style='border:none;margin:0.2rem 0 0.4rem 0;font-size:1.9rem'>"
+        f"💰 Legacy Brands Money Making Machine</h1>",
+        unsafe_allow_html=True,
+    )
+
     current = st.session_state.get("mode", "top_stocks")
 
     def _btn_type(mode_name: str) -> str:
@@ -339,31 +349,23 @@ def _scan_age_string(iso_str: str) -> str:
 # power management. No-op on non-Windows platforms.
 
 def _keep_awake():
-    """Tell the OS not to sleep while a scan is running."""
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            ES_CONTINUOUS = 0x80000000
-            ES_SYSTEM_REQUIRED = 0x00000001
-            # System stays awake; display CAN turn off (the scan doesn't
-            # need the display, and keeping the display on for 25 minutes
-            # would waste a lot of battery).
-            ctypes.windll.kernel32.SetThreadExecutionState(
-                ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-            )
-        except Exception:
-            pass  # best-effort — fall back to OS defaults
+    """Tell the OS not to sleep while a scan is running.
+
+    Delegates to scanner.system_helpers.keep_awake — see that module for
+    the actual implementation. We include ES_DISPLAY_REQUIRED (which
+    prevents Modern Standby entry) plus ES_AWAYMODE_REQUIRED, and start
+    a background daemon that reasserts the flag every 30 seconds to
+    survive Windows configurations that "forget" the hint. Fixed
+    2026-07-22 after user reported scans still stalling overnight.
+    """
+    from scanner.system_helpers import keep_awake as _shared_keep_awake
+    _shared_keep_awake()
 
 
 def _allow_sleep():
     """Restore normal power management after the scan finishes."""
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            ES_CONTINUOUS = 0x80000000
-            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-        except Exception:
-            pass
+    from scanner.system_helpers import allow_sleep as _shared_allow_sleep
+    _shared_allow_sleep()
 
 
 def _trigger_rescan(settings: ScanSettings, demo: bool = False):
@@ -536,9 +538,16 @@ def _render_long_sidebar():
             type="primary",
         )
 
-        # Note: the old "⭐ Top Stocks" button used to live here. It now
-        # lives as the leftmost top-level mode button and is the app's
-        # default home page — see ui/top_stocks_view.py.
+        # Control Tower playbook — explains how to use the Market Signal +
+        # Market State + Breadth tiles + Internal Breadth together to make
+        # regime decisions. Positioned between the exports (data out) and
+        # the TOC (data definitions) because it's the "how do I use this
+        # data" layer that sits between them conceptually.
+        if st.button("Control Tower", type="primary", use_container_width=True,
+                     help="The O'Neil regime-management playbook — how to read the "
+                          "Control Tower and translate it into probes vs. full-size "
+                          "vs. stand-down"):
+            _show_control_tower_dialog()
 
         if st.button("📖 Table of Contents", type="primary", use_container_width=True,
                      help="Definitions for every momentum-scan column and signal/warning tag"):
@@ -812,12 +821,17 @@ def _render_market_strip(scan: dict):
         last_ftd = state.get("last_ftd") or {}
         ftd_history = state.get("ftd_history") or []
 
-        # Color + icon for the state pill
+        # Color + icon for the state pill. Colors sourced from PALETTE so
+        # they match the Market Signal banner exactly — user reported red
+        # shade mismatch 2026-07-22 between banner (#ff4d6d from down_red)
+        # and state pill (was hardcoded #EF4444). Now both use the same
+        # PALETTE constants, so RED CORRECTION and RED (Heavy Distribution)
+        # render as the same red.
         state_style = {
-            "UPTREND":       {"icon": "🟢", "color": "#22C55E", "label": "UPTREND (confirmed)"},
-            "CORRECTION":    {"icon": "🔴", "color": "#EF4444", "label": "CORRECTION"},
-            "RALLY_ATTEMPT": {"icon": "🟡", "color": "#EAB308", "label": f"RALLY ATTEMPT — Day {rally_day}"},
-        }.get(state_name, {"icon": "•", "color": "#9CA3AF", "label": state_name})
+            "UPTREND":       {"icon": "🟢", "color": PALETTE["up_green"],  "label": "UPTREND (confirmed)"},
+            "CORRECTION":    {"icon": "🔴", "color": PALETTE["down_red"],  "label": "CORRECTION"},
+            "RALLY_ATTEMPT": {"icon": "🟡", "color": "#EAB308",            "label": f"RALLY ATTEMPT — Day {rally_day}"},
+        }.get(state_name, {"icon": "•", "color": PALETTE["text_muted"], "label": state_name})
 
         # One-line status summary above the expander so the state is visible
         # at a glance without expanding. Format changes based on state:
@@ -852,7 +866,9 @@ def _render_market_strip(scan: dict):
             f"<span style='font-weight:700;color:{state_style['color']}'>"
             f"{state_style['icon']} MARKET STATE: {state_style['label']}"
             f"</span>"
-            f"<span style='color:#9CA3AF'> · {summary}</span>"
+            # Summary text in pure white (not muted #9CA3AF) — user asked
+            # 2026-07-22 for max readability. Only heading carries color.
+            f"<span style='color:#FFFFFF'> · {summary}</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -1147,8 +1163,13 @@ def _render_breadth_metrics(scan: dict):
     breadth = scan.get("breadth_status", "")
     color = _signal_to_class(breadth)
     explanation = _breadth_explanation(scan)
+    # Explanation text in pure white (was inheriting the signal color via
+    # the signal-banner-* class and using opacity:0.95 which muted it).
+    # User asked 2026-07-22 for the description in real white so it's
+    # easy to read. Only the "INTERNAL BREADTH: STATUS" heading keeps
+    # the red/yellow/green color.
     explanation_html = (
-        f"<div style='font-family:Inter;font-size:0.8rem;font-weight:400;margin-top:0.3rem;opacity:0.95'>{explanation}</div>"
+        f"<div style='font-family:Inter;font-size:0.8rem;font-weight:400;margin-top:0.3rem;color:#FFFFFF;opacity:1'>{explanation}</div>"
         if explanation else ""
     )
     st.markdown(
@@ -1186,9 +1207,10 @@ def _breadth_explanation(scan: dict) -> str:
         )
     if "Small Caps Lagging" in status:
         return (
-            f"S&P and Nasdaq are UP but Russell 2000 is {rut_trend} — large caps "
-            "are masking weakness underneath. Classic late-cycle narrowing. "
-            "Be selective; favour the strongest leaders only."
+            f"S&P and Nasdaq are above their 50-day MAs but Russell 2000 is "
+            f"{rut_trend} — large caps are masking weakness underneath. "
+            f"Classic late-cycle narrowing. Be selective; favour the strongest "
+            f"leaders only."
         )
     if "Participation Falling" in status:
         delta = pct_50_10d - pct_50
@@ -1742,11 +1764,6 @@ def render_dashboard():
     _render_mode_switcher()
     scan = st.session_state.latest_scan
 
-    st.markdown(
-        f"<h1>💰 Legacy Brands Money Making Machine</h1>",
-        unsafe_allow_html=True,
-    )
-
     if scan is None:
         st.markdown(
             panel(
@@ -1763,8 +1780,69 @@ def render_dashboard():
         )
         return
 
-    _render_market_strip(scan)
-    _render_breadth_metrics(scan)
+    # ============================================================
+    # CONTROL TOWER — regime dashboard
+    # ============================================================
+    # Wraps distribution count + market state machine + breadth tiles +
+    # internal-breadth grader in a single cyan-bordered container so it
+    # reads as ONE regime instrument.
+    #
+    # Streamlit note: an earlier version used st.container(border=True) with
+    # a CSS override on [data-testid="stVerticalBlockBorderWrapper"], but
+    # the recolor didn't apply reliably (some versions ignore the override
+    # or use different testids). This version uses a hidden marker inside
+    # a plain st.container(), then targets the containing block via a
+    # CSS :has() selector — a technique that works across all Streamlit
+    # versions because :has() operates on the actual rendered DOM
+    # regardless of how Streamlit labels its wrappers.
+    cyan = PALETTE["accent_cyan"]
+    # Cyan border for the Control Tower group. Previous attempts targeted
+    # [data-testid="stVerticalBlockBorderWrapper"] alone, which didn't
+    # actually render a visible border in this Streamlit version. We
+    # now use MULTIPLE selectors (border-wrapper testid + attribute-
+    # contains fallbacks) plus `outline` in addition to `border` — outline
+    # is drawn on top of the element regardless of internal styling, so
+    # even if the emotion-cache class beats our border override, the
+    # outline still shows. Also use box-shadow inset as a third fallback.
+    # Title matches LBMMM's h1 styling — user-requested peer feel.
+    st.markdown(
+        f"""
+<style>
+/* Style every possible variant of the bordered-container testid.
+   Streamlit 1.29-1.36 used stVerticalBlockBorderWrapper; some builds
+   render slightly different attributes. The attribute-CONTAINS selector
+   catches all of them. */
+[data-testid="stVerticalBlockBorderWrapper"],
+[data-testid*="BorderWrapper"],
+[class*="stVerticalBlockBorderWrapper"] {{
+    /* Three redundant ways to draw the cyan frame — whichever one wins
+       against Streamlit's internal styles, we're covered. */
+    border: 2px solid {cyan} !important;
+    outline: 2px solid {cyan} !important;
+    outline-offset: -2px !important;
+    box-shadow: inset 0 0 0 2px {cyan}, 0 0 12px rgba(0, 212, 255, 0.15) !important;
+    border-radius: 10px !important;
+    background: transparent !important;
+    padding: 1rem !important;
+    margin: 0.3rem 0 1rem 0 !important;
+}}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+    # Title matches the LBMMM app-title styling — same font (default h1)
+    # same color (inherits h1 color from global CSS), same casing (title
+    # case, not ALL CAPS). Was ALL CAPS + cyan mono before; user asked
+    # for peer treatment with LBMMM 2026-07-22.
+    st.markdown(
+        "<h1 style='border:none;text-align:center;font-size:1.9rem;"
+        "margin:0.5rem 0 0.5rem 0'>Control Tower</h1>",
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        _render_market_strip(scan)
+        _render_breadth_metrics(scan)
+
     _render_results_table(scan)
     _render_diagnostics(scan)
 
@@ -1906,6 +1984,345 @@ def render_diagnose_page():
         "</table>"
     )
     st.markdown(panel("TEST RESULTS", body), unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Control Tower — How to Use the Regime Panel dialog
+# ---------------------------------------------------------------------------
+
+@st.dialog("Control Tower — How to Use the Regime Panel", width="large")
+def _show_control_tower_dialog():
+    """Modal dialog explaining the O'Neil regime-management framework as a
+    chronological stage-by-stage guide. Focuses on WHAT to look for at each
+    stage and WHY — no specific dates, prices, or ticker examples that would
+    date the content.
+    """
+    cyan  = PALETTE["accent_cyan"]
+    muted = PALETTE["text_muted"]
+    up    = PALETTE["up_green"]
+    down  = PALETTE["down_red"]
+
+    st.markdown(
+        f"<div style='color:{muted};font-size:0.9rem;line-height:1.55;margin-bottom:0.7rem'>"
+        f"The Control Tower ties together four instruments — Market Signal, Market "
+        f"State, Breadth Tiles, and Internal Breadth — plus one confirmation layer "
+        f"(the Cohort Tracker on the Momentum tab). Each has ONE specific job. Read "
+        f"this as a chronological playbook: what to watch, what to do, and when to "
+        f"escalate or retreat as the market cycles through each stage."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ---- The four instruments (one line each) ----
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.95rem;"
+        f"font-weight:700;letter-spacing:0.06em;margin:0.6rem 0 0.3rem 0'>"
+        f"THE INSTRUMENTS — ONE LINE EACH</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div style='font-size:0.85rem;line-height:1.7'>"
+        f"<b>Market Signal (top red/yellow/green banner)</b> — a rearview mirror. "
+        f"Counts distribution days over the trailing 25 sessions. Tells you "
+        f"how hostile institutions have been recently.<br>"
+        f"<b>Market State (color pill)</b> — the forward-looking regime tracker. "
+        f"Says whether the market is in an uptrend, a correction, or a rally "
+        f"attempt trying to end a correction.<br>"
+        f"<b>Breadth Tiles (six metric cards)</b> — the confidence multiplier. "
+        f"Grades whether the broader market is healthy under whatever the "
+        f"other signals are saying. Never triggers anything on its own.<br>"
+        f"<b>Internal Breadth (bottom banner)</b> — the tape-quality sanity check. "
+        f"Reconciles the breadth tiles with the index trend flags into a single "
+        f"plain-English read.<br>"
+        f"<b>Cohort Hit Rate (Momentum tab → Cohort Tracker button)</b> — real-time "
+        f"evidence. Are the setups you'd trade actually paying? The only "
+        f"empirical layer O'Neil never had."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # ---- The chronological stages ----
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.95rem;"
+        f"font-weight:700;letter-spacing:0.06em;margin:0.4rem 0 0.3rem 0'>"
+        f"THE STAGES — CHRONOLOGICAL PLAYBOOK</div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("STAGE 1 — Confirmed UPTREND", expanded=False):
+        st.markdown(
+            "**What you see:** Market State pill shows 🟢 UPTREND. Distribution day "
+            "count is low (typically 0-3). Breadth tiles are green: majority of "
+            "stocks above their 50-day MA, up/down volume favors up, new highs "
+            "outnumber new lows.\n\n"
+            "**What to do:** Trade the full playbook. A+ setups get full-size "
+            "entries. Pyramid on strength. Use the Momentum tab's BUY ZONE and "
+            "VCP A filters aggressively.\n\n"
+            "**What to watch for that ends the stage:** distribution day count "
+            "climbing toward 5. Each fresh distribution day is institutions "
+            "unloading — the count reaching 5 flips the state to CORRECTION.\n\n"
+            "**Why it matters:** confirmed uptrends are when your setups have the "
+            "highest win rates. Losing trades happen fast; winning trades run for "
+            "months. Being in the market during this stage is the whole game."
+        )
+
+    with st.expander("STAGE 2 — CORRECTION begins", expanded=False):
+        st.markdown(
+            "**What you see:** Market State pill flips to 🔴 CORRECTION. Distribution "
+            "day count is 5 or higher. The 'Market state detail' expander shows "
+            "the current correction low (the lowest SPY close so far).\n\n"
+            "**What to do:** Stand down on new entries. Existing runners with defined "
+            "stops only — do not add to positions. Take partials into strength if any "
+            "of your runners get extended. The distribution count itself will start "
+            "to mechanically decline as old days age out — do NOT read that decline "
+            "as improvement. It's just arithmetic.\n\n"
+            "**What to watch for that ends the stage:** the first up-day (any positive "
+            "close) after the correction has bottomed. That triggers Stage 3.\n\n"
+            "**Why it matters:** most losses come from entering during correction "
+            "conditions. This is where discipline pays the most — the framework is "
+            "telling you not to fight the tape, and honoring it protects your capital "
+            "for when the regime turns back."
+        )
+
+    with st.expander("STAGE 3 — RALLY ATTEMPT (Day 1-3)", expanded=False):
+        st.markdown(
+            "**What you see:** Market State pill shows 🟡 RALLY ATTEMPT — Day 1, 2, or 3. "
+            "The detail expander shows the correction low as the 'line in the sand.'\n\n"
+            "**What to do:** Continue standing down. Days 1-3 are too fragile to trust — "
+            "many rally attempts fade in this window with no follow-through. Watch the "
+            "correction low: if SPY closes below it, the attempt fails and the state "
+            "resets. You'll likely see this happen once or twice before a real rally "
+            "attempt takes hold.\n\n"
+            "**What to watch for that ends the stage:** Day 4 arrives. Then the FTD "
+            "trigger becomes live — see Stage 4.\n\n"
+            "**Why it matters:** early rally days are dominated by short-covering "
+            "and dip buyers, not institutional accumulation. Waiting for Day 4+ "
+            "filters out the dead-cat bounces that cost you money."
+        )
+
+    with st.expander("STAGE 4 — RALLY ATTEMPT (Day 4+) — the FTD window opens", expanded=False):
+        st.markdown(
+            "**What you see:** Market State pill still shows 🟡 RALLY ATTEMPT, but "
+            "now on Day 4 or later. The pill's message spells out exactly what "
+            "would constitute a Follow-Through Day: any of SPY / QQQ / IWM closing "
+            "up ≥1.25% on volume higher than the prior day.\n\n"
+            "**What to do:** Watch closely, especially the last hour of the trading "
+            "day. Set a mental alert on any of the three ETFs approaching a +1.25% "
+            "up-day. If one prints on high volume, go to Stage 5.\n\n"
+            "**What to watch for that ends the stage:**\n"
+            "- FTD prints → Stage 5\n"
+            "- SPY closes below the correction low → reset back to Stage 2 (attempt "
+            "failed)\n"
+            "- Day 10+ passes with no FTD → the attempt is stalling; historically "
+            "these late FTDs have much weaker success rates.\n\n"
+            "**Why it matters:** Day 4-7 FTDs have the highest historical success "
+            "rate (roughly ~70%). Day 10+ FTDs still work occasionally but with "
+            "more failure. Volume above the prior day is essential — a big up-day "
+            "on light volume is NOT a valid FTD."
+        )
+
+    with st.expander("STAGE 5 — FTD confirmed → deploy PROBE #1", expanded=False):
+        st.markdown(
+            "**What you see:** Market State pill flips to 🟢 UPTREND. The state detail "
+            "expander now shows the FTD date, index, percentage gain, and volume ratio.\n\n"
+            "**What to do:** deploy Probe #1 at HALF your normal position size on the "
+            "single best A+ setup breaking out with real volume within the next few "
+            "days. Use the Momentum tab's BUY ZONE / VCP A filters to find the setup. "
+            "Keep a tight stop — this is a probe, not a commitment.\n\n"
+            "**Also open the Cohort Tracker** on the Momentum tab. Note the current "
+            "REACHED +5% and REACHED +10% percentages so you can watch them evolve.\n\n"
+            "**Why half size:** roughly 1/3 to 1/2 of FTDs fail. Full-size entries "
+            "on unconfirmed rallies is where the second wave of losses comes from. "
+            "Half size lets you participate in a real rally without over-committing "
+            "to a fake one.\n\n"
+            "**Why act fast:** the strongest leaders declare themselves in the first "
+            "1-3 weeks after an FTD. That's when the best setups appear. If you wait "
+            "until 'certainty,' the moves are half over."
+        )
+
+    with st.expander("STAGE 6 — Confirmation window (first ~2 weeks after FTD)", expanded=False):
+        st.markdown(
+            "**What you see:** Market State pill is 🟢 UPTREND. You're monitoring "
+            "Probe #1 and watching three specific signals:\n\n"
+            "**1. Probe #1 performance.** Is it up +1R (one full unit of your initial "
+            "risk)? Then it's proving the FTD was real.\n\n"
+            "**2. Fresh distribution day count.** Count how many NEW distribution "
+            "days print AFTER the FTD. Two or three inside two weeks is the kill "
+            "switch — institutions are selling into the bounce.\n\n"
+            "**3. Cohort hit rate on mature flags.** Reopen the Cohort Tracker "
+            "periodically. If freshly-mature flags start reaching +5% at higher "
+            "rates than during the prior correction, that's empirical confirmation.\n\n"
+            "**What to do based on what you see:**\n"
+            "- **Probe #1 up +1R AND no fresh distribution days AND cohort improving** "
+            "→ deploy Probe #2 at half size on a different A+ setup\n"
+            "- **2-3 fresh distribution days accumulate** → CLOSE probes and back to "
+            "Stage 2 (the FTD failed)\n"
+            "- **Probe stalls (flat or slightly negative)** → hold with tight stop; "
+            "don't add. Wait another few sessions for clarity.\n\n"
+            "**Why this stage exists:** this is where good FTDs get separated from "
+            "failed ones. The framework's power comes from having a mechanical "
+            "kill switch — you retreat on evidence, not emotion."
+        )
+
+    with st.expander("STAGE 7 — Full GREEN posture", expanded=False):
+        st.markdown(
+            "**What you see:** Market State pill 🟢 UPTREND is still active. Both "
+            "probes are working (up +1R or more). Nasdaq trend flag has flipped to "
+            "UP. Breadth tiles have improved (60%+ above 50MA, U/D Vol above 1.5, "
+            "new highs materially outnumbering new lows). Internal Breadth banner "
+            "flips from YELLOW to GREEN.\n\n"
+            "**What to do:** trade the full playbook. A+ setups now get full size, "
+            "not half. Pyramid on strength. Keep the Cohort Tracker open as your "
+            "early-warning system — if fresh flags stop working, that's the first "
+            "sign the regime is turning again.\n\n"
+            "**Why this is the payoff:** the two-probe filter has done its job — "
+            "you've earned the right to size up because the market has proven, with "
+            "your own trades, that the regime pays again. This is the mode where "
+            "the biggest winners come from — trades initiated in the first weeks "
+            "of a confirmed uptrend can run for months.\n\n"
+            "**What to keep watching:** the distribution day count still matters "
+            "here. It will start rising again when the eventual next correction "
+            "approaches. That's your bridge back to Stage 8."
+        )
+
+    with st.expander("STAGE 8 — Regime turning back down", expanded=False):
+        st.markdown(
+            "**What you see:** Distribution day count creeping up (3, 4, approaching "
+            "5). New highs shrinking or being outnumbered by new lows. Cohort hit "
+            "rate on the newest mature flags starting to drop. Internal Breadth "
+            "banner degrading to YELLOW.\n\n"
+            "**What to do:** tighten stops on all runners. Take partials into strength. "
+            "Stop initiating new positions. Do NOT add to existing ones. This is the "
+            "'graceful exit' phase — you want to be lightening up before the state "
+            "pill formally flips to CORRECTION.\n\n"
+            "**What ends this stage:** distribution count hits 5, state flips to 🔴 "
+            "CORRECTION, and the cycle returns to Stage 2.\n\n"
+            "**Why this matters:** most traders don't have a system for KNOWING when "
+            "to reduce size. They wait until the losses hit them. The Control Tower's "
+            "leading indicators (rising dist days, weakening breadth, falling cohort "
+            "hit rate) give you a several-day head start on the state machine's "
+            "formal downgrade — use it."
+        )
+
+    st.markdown("---")
+
+    # ---- Decision flow — numbered step ladder ----
+    # Was previously called "THE PINNED FORMULA" and rendered as a single
+    # wrapping line with cyan+muted text. User feedback 2026-07-22:
+    # "I don't even know what it is it's so hard to see/read."
+    # Redesigned as numbered stepwise ladder: each step on its own line
+    # with a big cyan number, then WHITE step text, then optional muted
+    # explanation of what that step actually does. Final "GREEN" step
+    # highlighted with green background so the destination is obvious.
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.95rem;"
+        f"font-weight:700;letter-spacing:0.06em;margin:0.4rem 0 0.4rem 0'>"
+        f"DECISION FLOW — STEP BY STEP</div>",
+        unsafe_allow_html=True,
+    )
+    steps = [
+        ("1", "State pill picks the rulebook",
+         "Uptrend, correction, or rally attempt — the current state tells you which stage of the playbook applies."),
+        ("2", "FTD unlocks Probe #1",
+         "Day 4+ of a rally attempt with any of SPY / QQQ / IWM up +1.25% on higher volume. Deploy ONE half-size position."),
+        ("3", "Probe performance decides escalation",
+         "Probe up +1R → deploy Probe #2. 2-3 fresh distribution days within two weeks → close probes, back to correction."),
+        ("4", "Breadth grades confidence",
+         "50MA% / 200MA% / U/D Vol / NH-NL don't trigger anything — they multiply the confidence of whatever triggered."),
+        ("5", "Cohort hit rate confirms",
+         "Mature BUY ZONE flags starting to hit +5%/+10% at higher rates = the regime is empirically paying."),
+        ("6", "Trend flags >50MA + working probes = GREEN", None, True),
+    ]
+
+    # Render each step. Text colors set to BLACK for the light-background
+    # Streamlit dialog (was white which was invisible on white — user caught
+    # this 2026-07-22). Font sizes bumped for readability. Number stays
+    # cyan as an accent, name+explanation both black at bigger sizes.
+    for step in steps:
+        num, name, explanation = step[0], step[1], step[2]
+        is_final = len(step) > 3 and step[3]
+        bg_color = f"rgba(38,217,127,0.15)" if is_final else "transparent"
+        border_left = f"4px solid {up}" if is_final else f"4px solid {cyan}"
+        st.markdown(
+            f"<div style='display:flex;align-items:flex-start;gap:0.9rem;"
+            f"padding:0.7rem 0.9rem;margin-bottom:0.45rem;"
+            f"border-left:{border_left};background:{bg_color};"
+            f"border-radius:0 4px 4px 0'>"
+            # Big cyan number
+            f"<div style='color:{cyan};font-family:JetBrains Mono;"
+            f"font-size:1.3rem;font-weight:700;min-width:1.6rem;line-height:1.2'>{num}</div>"
+            # Step name + explanation — BLACK, larger
+            f"<div style='flex:1'>"
+            f"<div style='color:#000000;font-weight:700;font-size:1.05rem;"
+            f"line-height:1.35'>{name}</div>"
+            + (f"<div style='color:#000000;font-size:0.95rem;margin-top:0.25rem;"
+               f"line-height:1.5;font-weight:400'>{explanation}</div>" if explanation else "")
+            + f"</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Footer aphorism — now BLACK italic (was invisible white on light bg).
+    st.markdown(
+        f"<div style='color:#000000;font-size:0.95rem;margin-top:0.7rem;"
+        f"text-align:center;font-style:italic'>"
+        f"The panel decides <b>when</b> and <b>how much</b>. "
+        f"The charts decide <b>what</b>."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # ---- Why this is the win-rate lever ----
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.95rem;"
+        f"font-weight:700;letter-spacing:0.06em;margin:0.4rem 0 0.4rem 0'>"
+        f"WHY THIS IS THE WIN-RATE LEVER</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        # Bumped from 0.88rem to 1.05rem per user request 2026-07-22 —
+        # was too small alongside the redesigned Decision Flow above.
+        f"<div style='color:#000000;font-size:1.05rem;line-height:1.6'>"
+        f"Most losing trades come from entering during regime conditions the framework "
+        f"would have flagged in real time. Same trader, same setups, same charts — but "
+        f"entries <b>concentrated in the post-FTD window</b> instead of scattered "
+        f"throughout the tape is what turns a modest win rate into a strong one, "
+        f"without changing anything else you do. The Control Tower's job is to make "
+        f"that discipline mechanical rather than emotional."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # ---- Quick state decoder ----
+    st.markdown(
+        f"<div style='color:{cyan};font-family:JetBrains Mono;font-size:0.95rem;"
+        f"font-weight:700;letter-spacing:0.06em;margin:0.4rem 0 0.4rem 0'>"
+        f"QUICK STATE DECODER</div>",
+        unsafe_allow_html=True,
+    )
+    # All state names + descriptions are BLACK per user request 2026-07-22.
+    # The colored emoji dots (🔴 🟡 🟢) are unicode and render their own
+    # color regardless of CSS — so they stay red/yellow/green as visual
+    # indicators while the labels themselves are black for readability.
+    st.markdown(
+        f"<div style='color:#000000;font-family:JetBrains Mono;font-size:0.95rem;line-height:1.8'>"
+        f"<b>🔴 CORRECTION</b> — no new entries. Existing runners with defined stops only.<br>"
+        f"<b>🟡 RALLY ATTEMPT — Day 1-3</b> — no entries. Watching for FTD in Day 4-7 window.<br>"
+        f"<b>🟡 RALLY ATTEMPT — Day 4+</b> — FTD eligible. Half-size probe if it prints.<br>"
+        f"<b>🟢 UPTREND (fresh)</b> — probes only until confirmation. Watch cohort hit rate improve.<br>"
+        f"<b>🟢 UPTREND (mature)</b> — full size on A+ setups, but honor the kill switch."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Close", use_container_width=True, key="control_tower_close", type="primary"):
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------

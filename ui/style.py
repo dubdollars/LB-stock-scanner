@@ -373,27 +373,35 @@ button[data-testid="stPopoverButton"] * {{
     border-radius: 6px;
 }}
 
-/* ---- Custom signal banner ---- */
+/* ---- Custom signal banner ----
+   Padding/border-radius tightened 2026-07-22 to match the Market State
+   pill and Internal Breadth banner — all three now use ~0.5-0.6rem padding
+   and 6px border-radius so they read as visually consistent peers inside
+   the Control Tower group. */
 .signal-banner {{
-    padding: 1rem 1.5rem;
-    border-radius: 8px;
-    margin-bottom: 1rem;
+    padding: 0.5rem 0.8rem;
+    border-radius: 6px;
+    margin-bottom: 0.4rem;
     font-family: 'JetBrains Mono', monospace;
     font-weight: 700;
     border: 1px solid;
 }}
+/* Background gradients removed 2026-07-22 per user request — the colored
+   tint made the small text inside these banners hard to read against the
+   dark page background. Border color alone is enough to communicate the
+   red/yellow/green regime state. */
 .signal-banner-green {{
-    background: linear-gradient(90deg, rgba(38,217,127,0.12), rgba(38,217,127,0.04));
+    background: transparent;
     border-color: {PALETTE['signal_green']};
     color: {PALETTE['signal_green']};
 }}
 .signal-banner-yellow {{
-    background: linear-gradient(90deg, rgba(255,181,71,0.12), rgba(255,181,71,0.04));
+    background: transparent;
     border-color: {PALETTE['signal_yellow']};
     color: {PALETTE['signal_yellow']};
 }}
 .signal-banner-red {{
-    background: linear-gradient(90deg, rgba(255,77,109,0.16), rgba(255,77,109,0.04));
+    background: transparent;
     border-color: {PALETTE['signal_red']};
     color: {PALETTE['signal_red']};
 }}
@@ -519,7 +527,14 @@ def apply_theme():
 
 
 def signal_banner(signal: str, subtitle: str = "") -> str:
-    """Build HTML for a color-coded market signal banner."""
+    """Build HTML for a color-coded market signal banner.
+
+    Sized to match the Market State pill (Correction/Rally/Uptrend)
+    and Internal Breadth banner — all use 0.85rem for the header line
+    so the Control Tower's three banners read as visually consistent
+    peers. Was 1.05rem before, which made the market signal look
+    disproportionately large next to the others.
+    """
     if signal.startswith("GREEN"):
         cls = "signal-banner-green"
         icon = "▲"
@@ -532,10 +547,14 @@ def signal_banner(signal: str, subtitle: str = "") -> str:
     else:
         cls = "signal-banner-yellow"
         icon = "•"
-    sub_html = f"<div style='font-size:0.85rem;font-weight:400;margin-top:0.3rem;opacity:0.85'>{subtitle}</div>" if subtitle else ""
+    # Subtitle color forced to pure white (not inherited from parent signal
+    # color, and not opacity-dimmed) — user requested 2026-07-22 that only
+    # the heading carry the red/yellow/green indicator color, so the detail
+    # text stays maximally readable at all times.
+    sub_html = f"<div style='font-size:0.8rem;font-weight:400;margin-top:0.25rem;color:#FFFFFF;opacity:1'>{subtitle}</div>" if subtitle else ""
     return f"""
     <div class="signal-banner {cls}">
-      <div style="font-size:1.05rem;letter-spacing:0.05em;">
+      <div style="font-size:0.85rem;letter-spacing:0.03em;">
         {icon} &nbsp; MARKET SIGNAL: {signal}
       </div>
       {sub_html}

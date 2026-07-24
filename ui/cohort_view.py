@@ -32,8 +32,20 @@ import pandas as pd
 import streamlit as st
 
 from scanner.buy_zone_cohort import load_cohort, cohort_summary
+from scanner.cohort_history import append_snapshot, load_history, get_previous_snapshot
 from scanner.data_cache import load_price_history
 from ui.style import PALETTE
+
+
+# Minimum trading sessions of forward history a flag must have before it
+# counts toward the REACHED +5% / REACHED +10% hit-rate denominators.
+# Rationale (user request 2026-07-22): younger flags haven't had a fair
+# chance to move — including them dragged the hit rate down artificially.
+# 5 trading sessions ≈ one week, which matches Minervini's "winners work
+# fast" heuristic and is the smallest window where a genuine breakout has
+# had time to distinguish itself from a dead-cat bounce. Flags younger
+# than this are shown as a separate "developing" count.
+MATURITY_TRADING_DAYS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +69,7 @@ def _compute_forward_metrics(row: dict) -> dict:
         "current_close":         None,
         "current_return_pct":    None,
         "days_since":            None,
+        "trading_days_since":    None,
         "max_return_pct":        None,
         "max_drawdown_pct":      None,
         "hit_2r_before_neg_1r":  None,
@@ -109,6 +122,11 @@ def _compute_forward_metrics(row: dict) -> dict:
 
     # Session count between flag and now (rough days-since via index length)
     days_since = int((date.today() - flag_dt).days)
+    # Trading sessions of forward history (bars after the flag bar, inclusive
+    # of any bar dated on the flag_date itself). Used for maturity check —
+    # flags with fewer than MATURITY_TRADING_DAYS bars haven't had a fair
+    # chance to hit +5% / +10% and are excluded from the hit-rate denominator.
+    trading_days_since = max(0, len(post) - 1)
 
     current_return_pct = round((current_close - flag_close) / flag_close * 100, 2)
     max_return_pct     = round((max_close - flag_close) / flag_close * 100, 2)
@@ -181,6 +199,7 @@ def _compute_forward_metrics(row: dict) -> dict:
         "current_close":         round(current_close, 2),
         "current_return_pct":    current_return_pct,
         "days_since":            days_since,
+        "trading_days_since":    trading_days_since,
         "max_return_pct":        max_return_pct,
         "max_drawdown_pct":      max_drawdown_pct,
         "hit_2r_before_neg_1r":  hit_2r,
@@ -194,21 +213,49 @@ def _compute_forward_metrics(row: dict) -> dict:
 
 
 def _build_cohort_df() -> pd.DataFrame:
-    """Load cohort log + enrich with forward-return metrics. Newest first."""
+    """Load cohort log + enrich with forward-return metrics. Newest first.
+
+    Dedupes by ticker — a ticker that flagged multiple times (Mon/Tue/Wed)
+    counts as ONE cohort member anchored to the EARLIEST flag. This treats
+    each ticker as a single "setup we spotted" tracked from first sighting,
+    rather than counting the same setup 3x. The Times Flagged column shows
+    the raw re-flag count for transparency.
+
+    User request 2026-07-22 — was previously one row per flag event, which
+    let a single active setup dominate the cohort stats.
+    """
     entries = load_cohort()
     if not entries:
         return pd.DataFrame()
-    rows = []
+
+    # Dedupe: for each ticker, keep the earliest flag_date entry AND count
+    # how many total flag events there were. Iterating over the full log
+    # once (rather than groupby-in-pandas) so we can also count re-flags.
+    earliest_by_ticker: dict[str, dict] = {}
+    counts_by_ticker: dict[str, int] = {}
     for e in entries:
+        t = str(e.get("ticker") or "").upper()
+        if not t:
+            continue
+        counts_by_ticker[t] = counts_by_ticker.get(t, 0) + 1
+        fd = str(e.get("flag_date") or "")
+        cur = earliest_by_ticker.get(t)
+        if cur is None or fd < str(cur.get("flag_date") or ""):
+            earliest_by_ticker[t] = e
+
+    rows = []
+    for t, e in earliest_by_ticker.items():
         fwd = _compute_forward_metrics(e)
         rows.append({
             "Flag Date":      e.get("flag_date"),
-            "Ticker":         e.get("ticker"),
+            "Ticker":         t,
+            "Times Flagged":  counts_by_ticker.get(t, 1),
             "Sector":         e.get("flag_sector"),
             "Signal":         e.get("flag_market_signal"),
             "Flag $":         e.get("flag_close"),
             "Now $":          fwd.get("current_close"),
             "Days":           fwd.get("days_since"),
+            "TDays":          fwd.get("trading_days_since"),
             "Return %":       fwd.get("current_return_pct"),
             "Max %":          fwd.get("max_return_pct"),
             "MaxDD %":        fwd.get("max_drawdown_pct"),
@@ -224,15 +271,37 @@ def _build_cohort_df() -> pd.DataFrame:
             "Pressure":       e.get("flag_pressure_20d"),
             "% > 50MA":       e.get("flag_pct_above_50ma"),
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # Newest first by flag date (matches the old behavior for the table).
+    if not df.empty:
+        df = df.sort_values("Flag Date", ascending=False).reset_index(drop=True)
+    return df
 
 
 def _rollup_stats(df: pd.DataFrame) -> dict:
-    """Cohort-level rollup: hit rates + avg returns."""
+    """Cohort-level rollup: hit rates + avg returns.
+
+    Split into MATURE and DEVELOPING buckets based on trading days since first
+    flag. Hit rates (REACHED +5% / +10%) compute ONLY on the mature bucket so
+    fresh flags don't drag down the ratios.
+    """
     if df.empty:
         return {}
 
+    # Split into mature / developing. TDays column comes from
+    # _compute_forward_metrics via _build_cohort_df — it's the number of
+    # trading bars we have post-flag. Flags without a TDays value (missing
+    # price history) are treated as immature and excluded from hit-rate calc.
+    tdays = pd.to_numeric(df.get("TDays"), errors="coerce")
+    mature_mask     = tdays >= MATURITY_TRADING_DAYS
+    developing_mask = ~mature_mask
+    mature_df       = df[mature_mask]
+    developing_df   = df[developing_mask]
+
     # Only count decided outcomes for hit rate (ignore "…" still-in-flight).
+    # 2R hit rate keeps using the full df — the pivot-clear semantics are
+    # already "wait until the trade actually starts", so young flags are
+    # correctly counted as "…" (still-in-flight) and excluded automatically.
     decided = df[df["Worked?"].isin(["✓", "✗"])]
     n_dec  = len(decided)
     n_wins = int((decided["Worked?"] == "✓").sum())
@@ -246,18 +315,21 @@ def _rollup_stats(df: pd.DataFrame) -> dict:
             return None
         return round(float(s.mean()), 2)
 
-    # Hit rate at +1R (using return %, no pivot/stop needed)
-    # +1R proxy: return_5d_pct >= 5% (rough proxy for +1R since we don't have
-    # per-row R denominator readily). Better: check current return >= 5%.
-    # We'll keep it directional and just report the +5% and +10% hit rates.
+    # Hit rate at +5% / +10% — computed only on the MATURE bucket. Flags
+    # with fewer than MATURITY_TRADING_DAYS bars of forward history are
+    # excluded from both numerator and denominator, so freshly-flagged
+    # tickers don't drag the ratio down while they haven't had a chance
+    # to move yet.
     def _hit_rate_at(pct: float, col: str = "Max %") -> Optional[float]:
-        s = df[col].dropna()
+        s = mature_df[col].dropna()
         if s.empty:
             return None
         return round((s >= pct).sum() / len(s) * 100, 1)
 
     return {
         "n_total":       len(df),
+        "n_mature":      int(mature_mask.sum()),
+        "n_developing":  int(developing_mask.sum()),
         "n_decided":     n_dec,
         "hit_rate_2r":   round(hit_rate_2r, 1) if hit_rate_2r is not None else None,
         "hit_max_5pct":  _hit_rate_at(5,  "Max %"),
@@ -270,11 +342,30 @@ def _rollup_stats(df: pd.DataFrame) -> dict:
 
 
 def _sector_composition(df: pd.DataFrame) -> pd.DataFrame:
-    """Count of flags per sector — used as a regime-tell."""
+    """Count of flags per sector — used as a regime-tell.
+
+    Expands yfinance's abbreviated sector labels (Comm.Svc, Cons.Def, etc.)
+    to their full GICS-standard names so the display is unambiguous. If a
+    sector isn't in the map, its raw label passes through unchanged.
+    """
     if df.empty or "Sector" not in df.columns:
         return pd.DataFrame()
     counts = df["Sector"].fillna("N/A").value_counts().reset_index()
     counts.columns = ["Sector", "Flags"]
+    # Map yfinance shortnames → full GICS-style labels
+    _SECTOR_FULL_NAME = {
+        "Tech":       "Technology",
+        "Health":     "Healthcare",
+        "Financial":  "Financial Services",
+        "Comm.Svc":   "Communication Services",
+        "Cons.Def":   "Consumer Defensive",
+        "Cons.Cyc":   "Consumer Cyclical",
+        "Indust.":    "Industrials",
+        "Utils":      "Utilities",
+        "RE":         "Real Estate",
+        # Some scans emit the full name already; leave as-is
+    }
+    counts["Sector"] = counts["Sector"].map(lambda s: _SECTOR_FULL_NAME.get(s, s))
     return counts
 
 
@@ -389,15 +480,35 @@ def cohort_tracker_dialog():
     color: #FFFFFF;
     line-height: 1.1;
 }
+/* Delta indicator (vs previous scan). Added 2026-07-22 so the user can
+   see at a glance whether the current tile is better/worse than the last
+   time they looked, without needing to open the trend chart. */
+.ct-delta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    margin-top: 0.35rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+.ct-delta-up   { color: #26D97F; }
+.ct-delta-down { color: #FF4D6D; }
+.ct-delta-flat { color: #9CA3AF; }
 </style>
 """
 
-    def _tile(label: str, value: str, tooltip: Optional[str] = None) -> str:
+    def _tile(label: str, value: str, tooltip: Optional[str] = None,
+              delta: Optional[str] = None, delta_class: str = "ct-delta-flat") -> str:
+        """Render one tile. delta is a pre-formatted string like '↑ +2.1 vs 07-24'
+        or None to skip. delta_class picks the color (up/down/flat)."""
         attr = f' data-tooltip="{tooltip}"' if tooltip else ""
+        delta_html = (
+            f"<div class='ct-delta {delta_class}'>{delta}</div>" if delta else ""
+        )
         return (
             f"<div class='ct-card'{attr}>"
             f"<div class='ct-label'>{label}</div>"
             f"<div class='ct-value'>{value}</div>"
+            f"{delta_html}"
             f"</div>"
         )
 
@@ -421,14 +532,19 @@ def cohort_tracker_dialog():
         "Only statistically meaningful once decided count is 30+."
     )
     tip_reached_5 = (
-        "% of flags whose maximum post-flag price reached at least +5% above the "
-        "flagged close, at any point since the flag date. Includes flags that "
-        "later gave back the gain — this is 'ever reached', not 'still up'."
+        "% of MATURE flags whose maximum post-flag price reached at least +5% "
+        "above the flagged close, at any point since the flag date. Includes "
+        "flags that later gave back the gain — this is 'ever reached', not "
+        "'still up'. Flags with fewer than "
+        f"{MATURITY_TRADING_DAYS} trading sessions since first flag are "
+        "EXCLUDED from both numerator and denominator, so freshly-flagged "
+        "tickers don't drag the ratio down before they've had a chance to move."
     )
     tip_reached_10 = (
-        "% of flags whose maximum post-flag price reached at least +10% above the "
-        "flagged close, at any point since the flag date. Same rules as +5% — "
-        "'ever reached', not 'still up'."
+        "% of MATURE flags whose maximum post-flag price reached at least +10% "
+        "above the flagged close, at any point since the flag date. Same rules "
+        f"as +5% — 'ever reached', not 'still up', mature flags only "
+        f"(≥{MATURITY_TRADING_DAYS} trading sessions since first flag)."
     )
     tip_avg_20d = (
         "Average return 20 trading sessions after the flag, across all flags "
@@ -449,27 +565,130 @@ def cohort_tracker_dialog():
 
     st.markdown("### Cohort performance")
 
-    # Performance row — 4 tiles
+    # Performance row — 4 tiles. REACHED +5% and REACHED +10% are computed
+    # only over the MATURE cohort (flags with ≥MATURITY_TRADING_DAYS sessions
+    # of forward history). Tile labels reflect the mature-only denominator
+    # so the number can't be misread as "% of all flags".
     hr = stats.get("hit_rate_2r")
     max5 = stats.get("hit_max_5pct")
     max10 = stats.get("hit_max_10pct")
     avg20 = stats.get("avg_20d")
+    n_mature = stats.get("n_mature", 0) or 0
+    n_developing = stats.get("n_developing", 0) or 0
+
+    # ---- Snapshot + delta computation (added 2026-07-22) ----
+    # Every dialog open appends a snapshot to cohort_history.jsonl. We then
+    # look up the most recent snapshot BEFORE today to compute the delta
+    # shown on each hit-rate tile ("↑ +2.1 vs 07-24"). Silent no-op on
+    # first-ever open — delta just doesn't render.
+    from datetime import datetime as _dt_now
+    _today_str = _dt_now.utcnow().strftime("%Y-%m-%d")
+    append_snapshot(stats)  # write current
+    _prev = get_previous_snapshot(_today_str)  # previous distinct-day snapshot
+
+    def _delta_for(prev_val, cur_val):
+        """Return (delta_string, css_class) or (None, None) if no comparison possible."""
+        if prev_val is None or cur_val is None:
+            return None, None
+        try:
+            diff = round(float(cur_val) - float(prev_val), 1)
+        except (TypeError, ValueError):
+            return None, None
+        prev_date = (_prev or {}).get("date", "")
+        # Show as "MM-DD" for compactness
+        prev_short = prev_date[5:] if len(prev_date) >= 10 else prev_date
+        if diff > 0:
+            return f"↑ +{diff:.1f} vs {prev_short}", "ct-delta-up"
+        if diff < 0:
+            return f"↓ {diff:.1f} vs {prev_short}", "ct-delta-down"
+        return f"→ flat vs {prev_short}", "ct-delta-flat"
+
+    hr_delta,   hr_cls   = _delta_for((_prev or {}).get("hit_rate_2r"),   hr)
+    max5_delta, max5_cls = _delta_for((_prev or {}).get("hit_max_5pct"),  max5)
+    max10_delta, max10_cls = _delta_for((_prev or {}).get("hit_max_10pct"), max10)
+
     perf_html = "".join([
         _tile("HIT RATE (+2R B/F -1R)",
               f"{hr}%" if hr is not None else "—",
-              tooltip=tip_hit_rate),
-        _tile("REACHED +5%",
+              tooltip=tip_hit_rate,
+              delta=hr_delta, delta_class=hr_cls or "ct-delta-flat"),
+        _tile(f"REACHED +5% (of {n_mature} mature)",
               f"{max5}%" if max5 is not None else "—",
-              tooltip=tip_reached_5),
-        _tile("REACHED +10%",
+              tooltip=tip_reached_5,
+              delta=max5_delta, delta_class=max5_cls or "ct-delta-flat"),
+        _tile(f"REACHED +10% (of {n_mature} mature)",
               f"{max10}%" if max10 is not None else "—",
-              tooltip=tip_reached_10),
+              tooltip=tip_reached_10,
+              delta=max10_delta, delta_class=max10_cls or "ct-delta-flat"),
         _tile("AVG 20D RETURN",
               f"{avg20:+.2f}%" if avg20 is not None else "—",
               tooltip=tip_avg_20d),
     ])
     st.markdown(f"<div class='ct-grid' style='--ct-cols:4'>{perf_html}</div>",
                 unsafe_allow_html=True)
+
+    # Explainer line about the maturity split — shown below the tiles so the
+    # user always knows the pipeline is being tracked but the young flags
+    # aren't counting against the hit rates.
+    muted_color = PALETTE["text_muted"]
+    if n_developing > 0:
+        st.markdown(
+            f"<div style='color:{muted_color};font-size:0.78rem;"
+            f"margin-top:0.4rem;font-family:JetBrains Mono'>"
+            f"📥 {n_developing} developing — flagged within the last "
+            f"{MATURITY_TRADING_DAYS} trading sessions, too young to judge. "
+            f"Included in the table below but excluded from the hit-rate math."
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"<div style='color:{muted_color};font-size:0.78rem;"
+            f"margin-top:0.4rem;font-family:JetBrains Mono'>"
+            f"All {n_mature} cohort flags have ≥{MATURITY_TRADING_DAYS} "
+            f"trading sessions of forward history."
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ---- Trend chart of hit rates over time (added 2026-07-22) ----
+    # Line chart of the last ~60 days of REACHED +5%, +10%, and 2R hit rate.
+    # This is the direct visual answer to "are my numbers improving?" —
+    # rising lines = regime paying, flat/falling = probes should stay small.
+    # Silent no-op on first-ever open (needs ≥2 snapshots to draw a trend).
+    _hist = load_history(days=60)
+    if len(_hist) >= 2:
+        import pandas as pd
+        chart_df = pd.DataFrame([
+            {
+                "Date":        h.get("date"),
+                "Reached +5%": h.get("hit_max_5pct"),
+                "Reached +10%": h.get("hit_max_10pct"),
+                "Hit Rate 2R": h.get("hit_rate_2r"),
+            }
+            for h in _hist
+        ])
+        try:
+            chart_df["Date"] = pd.to_datetime(chart_df["Date"])
+            chart_df = chart_df.set_index("Date")
+            st.markdown("### Hit-rate trend (last 60 days)")
+            st.caption(
+                "Each point is one scan's cohort snapshot. **Rising** = the "
+                "regime is starting to pay; **flat** = still developing; "
+                "**falling** = setups deteriorating (tighten stops, stop adding). "
+                "Missing days = no scan was run. First value shows once a "
+                "second scan has been logged."
+            )
+            st.line_chart(chart_df, height=280, use_container_width=True)
+        except Exception:
+            pass  # never let chart failure block the rest of the dialog
+    else:
+        st.markdown("### Hit-rate trend")
+        st.caption(
+            f"📈 Trend chart appears once you have 2+ daily snapshots "
+            f"logged ({len(_hist)} so far). Open this dialog after your "
+            f"next scan to start building history."
+        )
 
     st.markdown("### Every BUY ZONE flag + forward returns")
     st.dataframe(
@@ -485,8 +704,20 @@ def cohort_tracker_dialog():
                 help="Market signal on the flag date (RED / GREEN / YELLOW)."),
             "Flag $":    st.column_config.NumberColumn("Flag $", format="$%.2f", width="small"),
             "Now $":     st.column_config.NumberColumn("Now $", format="$%.2f", width="small"),
+            "Times Flagged": st.column_config.NumberColumn(
+                "Flags", format="%d", width="small",
+                help="How many times this ticker has appeared on the BUY ZONE list. "
+                     "The cohort dedupes by ticker (only earliest flag counted), but "
+                     "this column shows the raw re-flag count for transparency. "
+                     "Values >1 mean the setup persisted across multiple scans."),
             "Days":      st.column_config.NumberColumn("Days", format="%d", width="small",
-                help="Calendar days since the flag."),
+                help="Calendar days since the FIRST flag of this ticker."),
+            "TDays":     st.column_config.NumberColumn("TDays", format="%d", width="small",
+                help=f"Trading sessions of forward price history since first flag. "
+                     f"Flags with TDays ≥ {MATURITY_TRADING_DAYS} are 'mature' and "
+                     f"count in the REACHED +5% / +10% math above. Younger flags "
+                     f"are excluded so freshly-flagged tickers don't drag the ratio "
+                     f"down before they've had a chance to move."),
             "Return %":  st.column_config.NumberColumn("Return %", format="%+.2f%%", width="small",
                 help="Current return vs. flagged close."),
             "Max %":     st.column_config.NumberColumn("Max %", format="%+.2f%%", width="small",
@@ -518,7 +749,78 @@ def cohort_tracker_dialog():
         "signal. Growth/tech/small-cap concentration = risk-on confirmation."
     )
     sec_df = _sector_composition(df)
-    st.dataframe(sec_df, use_container_width=True, hide_index=True, height=250)
+    if not sec_df.empty:
+        # Equal-width tile grid — CSS Grid with a fixed column count so every
+        # tile is the SAME width (wide enough to comfortably fit the longest
+        # sector name, "Communication Services"). Column count picked to
+        # prefer a 2-row layout; falls back to 3 rows only when >8 sectors,
+        # per user request 2026-07-22.
+        n_sectors = len(sec_df)
+        if n_sectors <= 3:
+            # 1 row, one column per sector
+            n_cols = n_sectors
+        elif n_sectors <= 6:
+            # 3 cols × 2 rows — comfortable width for full sector names
+            n_cols = 3
+        elif n_sectors <= 8:
+            # 4 cols × 2 rows — tighter but still fits
+            n_cols = 4
+        else:
+            # 4 cols × 3 rows — better to widen tiles and add a row than
+            # cram 5-6 per row where "Communication Services" would clip
+            n_cols = 4
+
+        tiles_css = f"""
+<style>
+.sec-grid {{
+    display: grid;
+    grid-template-columns: repeat({n_cols}, 1fr);
+    gap: 0.6rem;
+    margin: 0.4rem 0 0.6rem 0;
+}}
+.sec-tile {{
+    background: #0F1620;
+    border: 1px solid #1F2937;
+    border-radius: 6px;
+    padding: 0.6rem 0.5rem;
+    text-align: center;
+}}
+.sec-tile-name {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: #FFFFFF;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    margin-bottom: 0.35rem;
+    line-height: 1.25;
+    /* Prevent wrapping on shorter names so tile heights stay consistent */
+    min-height: 1.8rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}}
+.sec-tile-count {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.35rem;
+    font-weight: 700;
+    color: #FFFFFF;
+    line-height: 1;
+}}
+</style>
+"""
+        tile_html = "".join(
+            f"<div class='sec-tile'>"
+            f"<div class='sec-tile-name'>{row['Sector']}</div>"
+            f"<div class='sec-tile-count'>{int(row['Flags'])}</div>"
+            f"</div>"
+            for _, row in sec_df.iterrows()
+        )
+        st.markdown(
+            tiles_css + f"<div class='sec-grid'>{tile_html}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("No sector data available yet.")
 
     if st.button("Close", use_container_width=True, key="cohort_close"):
         st.rerun()

@@ -53,9 +53,12 @@ def _base_layout(title: str = "", height: int = 500) -> dict:
         plot_bgcolor=PALETTE["bg_main"],
         paper_bgcolor=PALETTE["bg_main"],
         font=dict(family="JetBrains Mono, monospace", color=PALETTE["text_primary"], size=13),
-        title=dict(text=title, font=dict(size=15, color=PALETTE["text_muted"]), x=0.01),
-        # Extra top margin makes room for the legend now positioned ABOVE the plot area
-        margin=dict(l=50, r=140, t=70, b=40),
+        title=dict(text=title, font=dict(size=15, color=PALETTE["text_muted"]),
+                   x=0.01, y=0.98, yanchor="top"),
+        # Extra top margin — bumped 70→95 to accommodate the wider gap
+        # between title and legend (user request 2026-07-22: they were
+        # almost overlapping at t=70 + legend y=1.02).
+        margin=dict(l=50, r=140, t=95, b=40),
         height=height,
         xaxis=dict(
             gridcolor=PALETTE["border"],
@@ -119,11 +122,15 @@ def _build_price_chart(d: DeepDiveData) -> go.Figure:
         row=1, col=1,
     )
 
-    # SMAs
+    # SMAs — colors set per user request 2026-07-22:
+    # SMA 50 = blue, SMA 150 = gold/yellow, SMA 200 = red.
+    # (Previously SMA 50 was gold, 150 cyan, 200 purple — reordered so the
+    # shortest MA is the calm/blue color and the longest is the alerting red,
+    # matching how the user reads trend health from the chart.)
     for col, color, name in [
-        ("SMA50", "#ffb547", "SMA 50"),
-        ("SMA150", "#00d4ff", "SMA 150"),
-        ("SMA200", "#b388ff", "SMA 200"),
+        ("SMA50",  "#3B82F6", "SMA 50"),   # blue
+        ("SMA150", "#F5B841", "SMA 150"),  # gold/yellow
+        ("SMA200", "#EF4444", "SMA 200"),  # red
     ]:
         fig.add_trace(
             go.Scatter(
