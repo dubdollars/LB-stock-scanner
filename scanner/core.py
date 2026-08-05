@@ -622,7 +622,34 @@ def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
                 # This catches multi-week decay where no single day is dramatic
                 # but the aggregate absorption is high. Still valuable as a
                 # backstop — see the module-level docstring.
-                if i >= 25 and _dist_days_in_trailing_25(i) >= _CORRECTION_DIST_THRESHOLD:
+                #
+                # POST-FTD GRACE PERIOD (added 2026-08-05 after user-reported
+                # bug where the state flipped UPTREND → CORRECTION on the very
+                # first session after an FTD because the trailing-25 counter
+                # was already at 5-6 from pre-FTD dist days).
+                #
+                # The IBD rule is: an FTD is a "clean slate" event — start
+                # watching for FRESH damage, not accumulated old damage. The
+                # fresh-dist counter above enforces the fresh-damage rule.
+                # Without a grace period on the slow-grind counter, the FTD
+                # would get immediately undone by dist days that ACCUMULATED
+                # BEFORE the FTD — nonsense.
+                #
+                # Rule: for the first _FRESH_DIST_FAILURE_WINDOW (10) sessions
+                # after an FTD, suppress the slow-grind trigger. Only the
+                # fresh-dist counter can downgrade. After 10 sessions, if the
+                # FTD is holding but the slow-grind count is still ≥ 5, the
+                # slow-grind path re-activates as a backstop against multi-week
+                # decay that hasn't produced two compressed fresh dist days.
+                in_ftd_grace = (
+                    last_ftd_i is not None
+                    and (i - last_ftd_i) <= _FRESH_DIST_FAILURE_WINDOW
+                )
+                if (
+                    not in_ftd_grace
+                    and i >= 25
+                    and _dist_days_in_trailing_25(i) >= _CORRECTION_DIST_THRESHOLD
+                ):
                     state = "CORRECTION"
                     state_since_i = i
                     correction_low = {"date": date_iso, "close": spy_close}

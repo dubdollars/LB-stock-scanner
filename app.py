@@ -342,6 +342,35 @@ def _format_timestamp(iso_str: str) -> str:
         return iso_str
 
 
+def _is_intraday_scan_window() -> bool:
+    """True if now is within the US market's regular trading session (weekday,
+    9:30am-4:00pm ET). Used to warn the user before running a scan on
+    partial-day yfinance data.
+
+    Uses stdlib zoneinfo for the ET conversion (same pattern as
+    _format_timestamp). If zoneinfo can't be loaded (missing tzdata on some
+    stripped-down Windows setups), returns False — we prefer no warning over
+    a false warning based on system-local time.
+
+    Weekend detection is by ET weekday (Mon=0..Sun=6). Doesn't try to detect
+    market holidays — false positives on Christmas / Thanksgiving are
+    acceptable because the warning is non-blocking (user can just scan
+    anyway).
+    """
+    try:
+        from datetime import datetime as _dt, time as _time
+        from zoneinfo import ZoneInfo
+        now_et = _dt.now(ZoneInfo("America/New_York"))
+        # Weekend — market is closed, no partial-data risk.
+        if now_et.weekday() >= 5:  # 5=Sat, 6=Sun
+            return False
+        market_open  = _time(9, 30)
+        market_close = _time(16, 0)
+        return market_open <= now_et.time() < market_close
+    except Exception:
+        return False
+
+
 def _scan_age_string(iso_str: str) -> str:
     """Age of a scan, using tz-aware UTC comparison so DST changes don\'t lie."""
     from datetime import datetime as _dt, timezone as _tz
@@ -518,8 +547,30 @@ def _render_long_sidebar():
 
     # ---- Start Scan button ----
     st.markdown("<div style='margin-top:0.5rem'></div>", unsafe_allow_html=True)
+
+    # Intraday-scan warning (added 2026-08-05 after user-reported bug where
+    # a midday scan showed state = CORRECTION because SPY looked like a fresh
+    # dist day on partial-day volume). yfinance's current-session bar reflects
+    # only the ticks so far — Close is the latest print (not the true close),
+    # and Volume is cumulative-to-now (which after 3 hours can easily match
+    # yesterday's full-day volume). Both distortions can fabricate signals
+    # that vanish once the day actually closes. Warning is non-blocking — the
+    # user can still scan (useful for testing), just gets an explicit heads-up.
+    warn_intraday = _is_intraday_scan_window()
+    if warn_intraday:
+        st.warning(
+            "⚠ **Market is still open (before 4:00pm ET).** yfinance is "
+            "serving partial-day data — current-session Close is the latest "
+            "tick, and Volume is only cumulative-to-now. This can produce "
+            "false distribution-day flags, false BREAKOUT signals, and "
+            "state-machine flips that reverse after the close.\n\n"
+            "**Best practice:** re-run the scan after 4:15pm ET for reliable "
+            "state readings. It's fine to scan now for a preview — just "
+            "don't act on state changes until you've re-scanned post-close."
+        )
+
     if st.button("▶ Run Scan", type="primary", use_container_width=True,
-                 help="Run a full ~25-minute MOMENTUM scan against the S&P 500 + Nasdaq 100 + Russell 2000 + Russell 3000 universe"):
+                 help="Run a full ~25-minute MOMENTUM scan against the S&P 500 + Nasdaq 100 + Russell 2000 + Russell 3000 universe. For most reliable state readings, run after 4:15pm ET when the day's bar has closed."):
         _trigger_rescan(settings, demo=False)
         st.rerun()
 
