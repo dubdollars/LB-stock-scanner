@@ -789,6 +789,279 @@ def detect_gap_up_today(df: pd.DataFrame, avg_vol_50: Optional[float]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# PEAD — Post-Earnings Announcement Drift (added 2026-08-04)
+# ---------------------------------------------------------------------------
+
+def detect_pead(
+    df: pd.DataFrame,
+    days_since_earnings: Optional[int],  # kept for API compat; not used
+    avg_vol_50: Optional[float],
+) -> dict:
+    """Detect the classic Post-Earnings Drift setup — PRICE-BASED.
+
+    Institutions accumulate winners in the weeks after an earnings beat. The
+    setup we're catching, all detected from PRICE data alone (not metadata):
+
+      1. Within the last 3-15 trading sessions there was a "catalyst-day"
+         bar — gapped up 5%+ from prior close on 2x+ average volume, and
+         closed in the upper half of that day's range. This is the fingerprint
+         of an earnings beat / guidance raise / upgrade / other catalyst.
+      2. Since that catalyst-day, price has held ABOVE the catalyst-day open
+         on every close (no fill).
+      3. Volume since the catalyst has quieted — recent 5 sessions ≤ 1.05x
+         the 50-day average. Quiet accumulation, not distribution.
+      4. Today's close is within 5% of the post-catalyst high (consolidating
+         near the top, not rolling over).
+
+    IMPORTANT — 2026-08-04 rewrite: previous version keyed off yfinance's
+    earnings_date field, which is FORWARD-LOOKING (next scheduled earnings,
+    not last). That made days_since_earnings always None for nearly every
+    ticker, and PEAD returned zero across the board. Detecting the gap
+    from price alone is more robust and works for ANY catalyst — earnings,
+    guidance, contracts, upgrades — not just scheduled earnings.
+
+    Returns dict with:
+      is_pead              — bool
+      days_since_earnings  — trading days since detected catalyst-day (int)
+      gap_pct              — catalyst-day gap size (%)
+      gap_vol_ratio        — catalyst-day volume vs 50d avg
+      pct_from_post_er_hi  — how close today is to the post-catalyst high (%)
+      recent_vol_ratio     — recent 5-day avg volume vs 50d avg
+      fail_reason          — human-readable failure category
+    """
+    out = {
+        "is_pead": False,
+        "days_since_earnings": None,
+        "gap_pct": None,
+        "gap_vol_ratio": None,
+        "pct_from_post_er_hi": None,
+        "recent_vol_ratio": None,
+        "fail_reason": "",
+    }
+
+    if df is None or len(df) < 60:
+        out["fail_reason"] = "insufficient_history"
+        return out
+    if avg_vol_50 is None or avg_vol_50 <= 0:
+        out["fail_reason"] = "no_avg_volume"
+        return out
+
+    try:
+        # ---- Gate 1: scan the last 15 sessions for a catalyst-day bar ----
+        # We check offsets 3..15 (skip 1-2 which are too fresh — the drift
+        # setup requires post-catalyst consolidation, so we need at least a
+        # few sessions after the gap before it counts). If multiple bars in
+        # the window qualify, pick the strongest by gap_pct * vol_ratio.
+        candidates = []
+        for offset in range(3, 16):
+            if offset >= len(df):
+                break
+            try:
+                bar_open  = float(df["Open"].iloc[-offset])
+                bar_close = float(df["Close"].iloc[-offset])
+                bar_high  = float(df["High"].iloc[-offset])
+                bar_low   = float(df["Low"].iloc[-offset])
+                bar_vol   = float(df["Volume"].iloc[-offset])
+                prev_close = float(df["Close"].iloc[-offset - 1])
+                if prev_close <= 0 or bar_low <= 0 or avg_vol_50 <= 0:
+                    continue
+                gap_pct   = (bar_open - prev_close) / prev_close * 100
+                vol_ratio = bar_vol / avg_vol_50
+                rng       = bar_high - bar_low
+                close_pos = ((bar_close - bar_low) / rng) if rng > 0 else 0.5
+                # All three gates for catalyst-day: 5% gap, 2x vol, strong close.
+                if gap_pct >= 5.0 and vol_ratio >= 2.0 and close_pos >= 0.5:
+                    candidates.append({
+                        "offset":     offset,
+                        "gap_pct":    gap_pct,
+                        "vol_ratio":  vol_ratio,
+                        "close_pos":  close_pos,
+                        "open":       bar_open,
+                        "high":       bar_high,
+                    })
+            except Exception:
+                continue
+
+        if not candidates:
+            out["fail_reason"] = "no_catalyst_day_in_window"
+            return out
+
+        # Pick the strongest catalyst-day — highest gap × vol product.
+        er_bar = max(candidates, key=lambda c: c["gap_pct"] * c["vol_ratio"])
+        out["days_since_earnings"] = er_bar["offset"]
+        out["gap_pct"]             = round(er_bar["gap_pct"], 2)
+        out["gap_vol_ratio"]       = round(er_bar["vol_ratio"], 2)
+
+        # ---- Gate 2: price held above the catalyst-day open since ----
+        er_offset = er_bar["offset"]
+        er_open   = er_bar["open"]
+        post_closes = df["Close"].iloc[-er_offset:].astype(float)
+        if len(post_closes) and float(post_closes.min()) < er_open:
+            out["fail_reason"] = "gap_fill_since_catalyst"
+            return out
+
+        # ---- Gate 3: recent volume quieted ----
+        # Loosened 2026-08-04 from 1.05x → 1.3x after user reported only 1
+        # PEAD candidate on a fresh-FTD post-Q2-earnings day. Rationale: even
+        # after the initial excitement fades, post-earnings tickers often carry
+        # elevated tail volume for 2-3 weeks as buyers cycle in. 1.05x meant
+        # only stocks with fully-normalized volume qualified — near-empty pool.
+        # 1.3x still filters out active distribution (2x+ volume) while
+        # accepting the still-somewhat-elevated but calming pattern that is
+        # the typical PEAD footprint.
+        recent_vol = float(df["Volume"].iloc[-5:].mean())
+        recent_vol_ratio = recent_vol / avg_vol_50
+        out["recent_vol_ratio"] = round(recent_vol_ratio, 2)
+        if recent_vol_ratio > 1.3:
+            out["fail_reason"] = f"still_active_vol_{round(recent_vol_ratio,2)}x"
+            return out
+
+        # ---- Gate 4: today within 5% of post-catalyst high ----
+        post_high   = float(df["High"].iloc[-er_offset:].max())
+        today_close = float(df["Close"].iloc[-1])
+        if post_high <= 0:
+            out["fail_reason"] = "invalid_post_high"
+            return out
+        pct_from_hi = (today_close - post_high) / post_high * 100
+        out["pct_from_post_er_hi"] = round(pct_from_hi, 2)
+        if pct_from_hi < -5.0:
+            out["fail_reason"] = f"too_far_below_hi_{round(pct_from_hi,1)}pct"
+            return out
+
+        out["is_pead"] = True
+    except Exception as e:
+        out["fail_reason"] = f"error:{type(e).__name__}"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# RETEST — pullback to a prior breakout pivot on quiet volume (2026-08-04)
+# ---------------------------------------------------------------------------
+
+def detect_breakout_retest(
+    df: pd.DataFrame,
+    breakout_entry: Optional[dict],
+    avg_vol_50: Optional[float],
+) -> dict:
+    """Detect a Minervini-style second-entry: pullback to a prior breakout pivot.
+
+    High hit-rate setup because you're buying a PROVEN breakout at a lower-risk
+    price. Requires memory across scans — see scanner/breakout_log.py for the
+    persistent log this reads from.
+
+    Rules:
+      1. There must be a prior breakout in the log for this ticker.
+      2. Breakout was 3-15 trading sessions ago (fresh but not stale).
+      3. Since breakout, price never CLOSED below the pivot — the base held.
+      4. Today's close is within 3% of the original pivot (pulled back cleanly).
+      5. Today's close is still ABOVE the pivot (not below — that's a failed
+         breakout, not a retest).
+      6. Recent 5-day volume is BELOW the 50d avg (quiet pullback, not
+         distribution). Ratio ≤ 1.0.
+
+    Returns:
+      is_retest             — bool
+      days_since_breakout   — trading days between breakout and today
+      breakout_pivot        — the original pivot being retested
+      pct_from_pivot        — today's close vs pivot (0 = at pivot, positive = above)
+      recent_vol_ratio      — last 5 sessions volume vs 50d avg
+      fail_reason           — human-readable failure category
+    """
+    out = {
+        "is_retest":           False,
+        "days_since_breakout": None,
+        "breakout_pivot":      None,
+        "pct_from_pivot":      None,
+        "recent_vol_ratio":    None,
+        "fail_reason":         "",
+    }
+
+    if not breakout_entry:
+        out["fail_reason"] = "no_prior_breakout"
+        return out
+    if df is None or len(df) < 20:
+        out["fail_reason"] = "insufficient_history"
+        return out
+    if avg_vol_50 is None or avg_vol_50 <= 0:
+        out["fail_reason"] = "no_avg_volume"
+        return out
+
+    try:
+        pivot = breakout_entry.get("breakout_pivot")
+        breakout_date_str = breakout_entry.get("breakout_date")
+        if not pivot or not breakout_date_str:
+            out["fail_reason"] = "log_entry_missing_fields"
+            return out
+        pivot = float(pivot)
+        out["breakout_pivot"] = pivot
+
+        # ---- Compute trading days since breakout ----
+        # The df index is trading-day timestamps. Count how many df bars
+        # exist strictly after the breakout date.
+        try:
+            import pandas as pd
+            breakout_dt = pd.to_datetime(breakout_date_str)
+        except Exception:
+            out["fail_reason"] = "bad_breakout_date"
+            return out
+        try:
+            idx = df.index
+            # Handle tz-aware vs naive index compare — normalize to naive dates.
+            try:
+                idx_dates = idx.tz_localize(None) if getattr(idx, "tz", None) else idx
+            except Exception:
+                idx_dates = idx
+            days_since = int((idx_dates > breakout_dt).sum())
+        except Exception:
+            out["fail_reason"] = "date_compare_error"
+            return out
+        out["days_since_breakout"] = days_since
+
+        # ---- Gate 1: 3-15 sessions window ----
+        if not (3 <= days_since <= 15):
+            out["fail_reason"] = f"outside_window_{days_since}d"
+            return out
+
+        # ---- Gate 2: base held — no close below pivot since breakout ----
+        # Slice df to bars strictly after the breakout date.
+        try:
+            post = df.loc[idx_dates > breakout_dt]
+        except Exception:
+            post = df.iloc[-days_since:]
+        if len(post) == 0:
+            out["fail_reason"] = "no_post_breakout_bars"
+            return out
+        min_close = float(post["Close"].min())
+        if min_close < pivot:
+            out["fail_reason"] = "closed_below_pivot"
+            return out
+
+        # ---- Gate 3: today within 3% of pivot AND still above it ----
+        today_close = float(df["Close"].iloc[-1])
+        pct_from_pivot = (today_close - pivot) / pivot * 100
+        out["pct_from_pivot"] = round(pct_from_pivot, 2)
+        if today_close < pivot:
+            out["fail_reason"] = "today_below_pivot"
+            return out
+        if pct_from_pivot > 3.0:
+            out["fail_reason"] = f"still_extended_{round(pct_from_pivot,1)}pct"
+            return out
+
+        # ---- Gate 4: recent volume is quiet ----
+        recent_vol = float(df["Volume"].iloc[-5:].mean())
+        recent_vol_ratio = recent_vol / avg_vol_50
+        out["recent_vol_ratio"] = round(recent_vol_ratio, 2)
+        if recent_vol_ratio > 1.0:
+            out["fail_reason"] = f"vol_not_quiet_{round(recent_vol_ratio,2)}x"
+            return out
+
+        out["is_retest"] = True
+    except Exception as e:
+        out["fail_reason"] = f"error:{type(e).__name__}"
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Breakout-today detection
 # ---------------------------------------------------------------------------
 
@@ -797,27 +1070,86 @@ def detect_breakout_today(
 ) -> dict:
     """Did today's bar break out above the pivot on volume?
 
-    Returns {is_breakout, vol_ratio, close_above_pivot_pct}.
+    FOUR gates required (tightened 2026-08-04 after FTRE false positive —
+    stock closed -5% on the day, gapped down from open $19.07 to close $17.99,
+    but the close still sat above a stale pivot from earlier in the base, so
+    the old two-gate logic labeled it a breakout):
+
+      1. close > pivot          — cleared the resistance level
+      2. vol_ratio >= 1.5       — real volume conviction (~50% above 50d avg)
+      3. close > prior_close    — UP on the day. A breakout is a bullish
+                                  ACTION; a red down-day that happens to close
+                                  above an ancient pivot is not a breakout,
+                                  it's a coincidence.
+      4. close_pos >= 0.5       — close in the upper half of the day's range.
+                                  Institutional commitment holds through the
+                                  close; if buyers dump into the last hour
+                                  and the stock closes near the low, that's
+                                  distribution disguised as a break.
+
+    Gates 1-2 are the original Minervini rule as I had it. Gates 3-4 close
+    the FTRE-class hole where a big red bar with elevated volume can
+    accidentally satisfy the pivot + volume test in isolation.
+
+    Returns {is_breakout, vol_ratio, close_above_pivot_pct, close_pos,
+             up_on_day, fail_reason}.
     """
     try:
         last = df.iloc[-1]
         close = float(last["Close"])
         vol = float(last["Volume"])
+        high = float(last["High"])
+        low  = float(last["Low"])
 
         close_above_pivot = close > pivot
         close_above_pct = (close - pivot) / pivot * 100 if pivot > 0 else 0
         vol_ratio = (vol / avg_vol_50) if (avg_vol_50 and avg_vol_50 > 0) else 0
 
-        # Minervini: breakout requires ~40-50%+ above-average volume.
-        # We use 1.5x as the threshold (50% above average).
-        is_breakout = bool(close_above_pivot and vol_ratio >= 1.5)
+        # Gate 3 — up on the day. Compare to prior close (needs 2+ bars).
+        prior_close = None
+        if len(df) >= 2:
+            try:
+                prior_close = float(df["Close"].iloc[-2])
+            except Exception:
+                prior_close = None
+        up_on_day = bool(prior_close is not None and close > prior_close)
+
+        # Gate 4 — close position within today's range. 0 = at day low, 1 = at
+        # day high. Require >= 0.5 (upper half). Handle zero-range doji days
+        # gracefully by treating them as neutral (0.5).
+        rng = high - low
+        close_pos = ((close - low) / rng) if rng > 0 else 0.5
+
+        # All four gates. If any fail, is_breakout is False.
+        checks = {
+            "close_above_pivot": close_above_pivot,
+            "vol_above_1_5x":    vol_ratio >= 1.5,
+            "up_on_day":         up_on_day,
+            "strong_close":      close_pos >= 0.5,
+        }
+        is_breakout = all(checks.values())
+
+        fail_reason = ""
+        if not is_breakout:
+            for name, passed in checks.items():
+                if not passed:
+                    fail_reason = f"failed_{name}"
+                    break
+
         return {
-            "is_breakout": is_breakout,
+            "is_breakout": bool(is_breakout),
             "vol_ratio": round(vol_ratio, 2),
             "close_above_pivot_pct": round(close_above_pct, 2),
+            "close_pos": round(close_pos, 2),
+            "up_on_day": up_on_day,
+            "fail_reason": fail_reason,
         }
     except Exception:
-        return {"is_breakout": False, "vol_ratio": 0.0, "close_above_pivot_pct": 0.0}
+        return {
+            "is_breakout": False, "vol_ratio": 0.0,
+            "close_above_pivot_pct": 0.0, "close_pos": 0.0,
+            "up_on_day": False, "fail_reason": "error",
+        }
 
 
 # ---------------------------------------------------------------------------

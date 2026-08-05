@@ -32,11 +32,13 @@ import yfinance as yf
 
 from .setups import (
     calc_atr,
+    detect_breakout_retest,
     detect_breakout_today,
     detect_cheat_setup,
     detect_extension_from_50ma,
     detect_gap_up_today,
     detect_ma_target,
+    detect_pead,
     detect_power_play,
     detect_vcp_contractions,
     find_pivot_point,
@@ -402,6 +404,25 @@ _FTD_MIN_DAY = 4
 # machine and the market-signal banner stay directionally aligned.
 _CORRECTION_DIST_THRESHOLD = 5
 
+# ---- Fresh-dist FTD-failure detector (added 2026-08-04) --------------------
+#
+# The trailing-25 counter above is a general environment gauge — it doesn't
+# know when the FTD happened, so an FTD printed with 6 old dist days already
+# in the window would immediately be at risk on the next dist day, which is
+# overly punitive on old data. The IBD rule is different: after an FTD, watch
+# for FRESH dist days accumulating in a compressed window. A third to half
+# of FTDs die exactly this way.
+#
+# Rule: if 2+ dist days accumulate within FRESH_DIST_WINDOW sessions AFTER
+# the FTD, the uptrend is judged to have failed → revert to CORRECTION with
+# the current close as the new correction_low. Fresh counter resets to 0
+# every time a new FTD prints (each FTD gets its own 10-session grace period).
+#
+# This is ADDITIVE to the trailing-25 detector, not a replacement — they
+# catch different failure modes (fast IBD kill vs. slow grind).
+_FRESH_DIST_FAILURE_THRESHOLD = 2   # 2+ fresh dist days kills the FTD
+_FRESH_DIST_FAILURE_WINDOW    = 10  # trading sessions after FTD
+
 
 def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
     """Walk forward through the price history for SPY/QQQ/IWM and produce
@@ -419,13 +440,26 @@ def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
                           most recent FTD in the window; None if none
       ftd_history       — list of every FTD detected in the window, oldest
                           first. Same shape as last_ftd.
+      ftd_failure_watch — post-FTD dist tracker (added 2026-08-04). Dict with:
+                            fresh_dist_count    — dist days since the FTD
+                            fresh_dist_dates    — ISO list of those days
+                            sessions_since_ftd  — trading days since FTD
+                            kill_threshold      — 2 (constant, for display)
+                            kill_window         — 10 (constant, for display)
+                          Populated only when state == UPTREND and there's
+                          a last_ftd. When state != UPTREND, returns an
+                          empty/zeroed dict (still present for schema stability).
 
     State transitions (walked chronologically, deterministic):
 
       UPTREND
-        └─ CORRECTION triggered when SPY dist-days in trailing 25 sessions
-           reach _CORRECTION_DIST_THRESHOLD (5). Marks correction_low =
-           SPY close on trigger day.
+        ├─ CORRECTION triggered by the SLOW-GRIND path: SPY dist-days in
+           trailing 25 sessions reach _CORRECTION_DIST_THRESHOLD (5). This
+           catches multi-week decay where no single day is dramatic but
+           the aggregate absorption is high.
+        └─ CORRECTION triggered by the FAST-KILL path: 2+ FRESH dist days
+           accumulate within 10 sessions AFTER the FTD. IBD's classic
+           FTD-failure rule — a third to half of FTDs die this way.
 
       CORRECTION
         ├─ correction_low updated on any new lower close.
@@ -438,7 +472,8 @@ def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
            (attempt failed; next up-day starts a new attempt).
         └─ UPTREND triggered when ANY of the three ETFs prints an FTD
            on Day 4+ of the current attempt. FTD = close +1.25%+ on
-           volume higher than prior session.
+           volume higher than prior session. The fresh-dist counter
+           resets to 0 on transition — each FTD gets its own grace period.
 
     The walk starts from the earliest usable bar (index 25+ so we have
     enough history to count dist-days for the correction trigger). If the
@@ -452,6 +487,13 @@ def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
         "rally_day": 0,
         "last_ftd": None,
         "ftd_history": [],
+        "ftd_failure_watch": {
+            "fresh_dist_count":   0,
+            "fresh_dist_dates":   [],
+            "sessions_since_ftd": 0,
+            "kill_threshold":     _FRESH_DIST_FAILURE_THRESHOLD,
+            "kill_window":        _FRESH_DIST_FAILURE_WINDOW,
+        },
     }
 
     try:
@@ -521,6 +563,14 @@ def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
         correction_low: dict | None = None  # {"date": iso, "close": float}
         rally_day = 0
 
+        # ---- Fresh-dist FTD-failure tracker (added 2026-08-04) ----
+        # These are ONLY meaningful when state == UPTREND and there's a
+        # last-known FTD. They reset each time we transition into UPTREND
+        # (i.e., each FTD gets its own grace period). When state is not
+        # UPTREND, these values are held but not evaluated.
+        last_ftd_i:        int | None = None  # index of the most recent FTD
+        fresh_dist_dates:  list[str]  = []    # dist days occurring AFTER last_ftd_i
+
         for i in range(1, n):
             date_iso = _iso(spy_closes.index[i])
             spy_pct = _pct(spy_closes, i)
@@ -529,12 +579,56 @@ def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
                 continue
 
             if state == "UPTREND":
-                # Trigger CORRECTION if trailing dist-days accumulated.
+                # ---- Fast-kill path: 2+ fresh dist days within 10 sessions after FTD ----
+                # Only evaluated when we have a known FTD to anchor against.
+                # If today itself is a fresh dist day (SPY down 0.2%+ on higher
+                # vol vs prior day AND date is after last_ftd_i), append to the
+                # fresh list. Then check if we've breached the kill threshold
+                # inside the rolling window.
+                if last_ftd_i is not None:
+                    if date_iso in sp_dist_iso_set:
+                        # Only count dist days STRICTLY after the FTD day itself
+                        # (an FTD is by definition a strong up-day, so the FTD
+                        # date can never be a dist day, but we belt-and-suspender
+                        # the check with a strict inequality).
+                        if i > last_ftd_i:
+                            fresh_dist_dates.append(date_iso)
+
+                    # Prune fresh_dist_dates to only those within the failure
+                    # window ending at today. Any dist day older than
+                    # last_ftd_i + kill_window has aged out — the trend has
+                    # survived that grace period and those days no longer count.
+                    window_start_i = i - _FRESH_DIST_FAILURE_WINDOW + 1
+                    fresh_dist_dates = [
+                        d for d in fresh_dist_dates
+                        if _iso(spy_closes.index[max(0, window_start_i)]) <= d <= date_iso
+                    ]
+
+                    # Trigger CORRECTION if the fresh count hits the threshold
+                    # inside the window. This fires INSTEAD of the slow-grind
+                    # path when applicable — it's tighter and more specific.
+                    if len(fresh_dist_dates) >= _FRESH_DIST_FAILURE_THRESHOLD:
+                        state = "CORRECTION"
+                        state_since_i = i
+                        correction_low = {"date": date_iso, "close": spy_close}
+                        rally_day = 0
+                        # Fresh tracker no longer relevant — we're back in
+                        # correction. Clear so the next FTD starts fresh.
+                        last_ftd_i = None
+                        fresh_dist_dates = []
+                        continue
+
+                # ---- Slow-grind path: trailing-25 dist count hits threshold ----
+                # This catches multi-week decay where no single day is dramatic
+                # but the aggregate absorption is high. Still valuable as a
+                # backstop — see the module-level docstring.
                 if i >= 25 and _dist_days_in_trailing_25(i) >= _CORRECTION_DIST_THRESHOLD:
                     state = "CORRECTION"
                     state_since_i = i
                     correction_low = {"date": date_iso, "close": spy_close}
                     rally_day = 0
+                    last_ftd_i = None
+                    fresh_dist_dates = []
 
             elif state == "CORRECTION":
                 # Track new lows.
@@ -592,10 +686,15 @@ def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
                         ftd_candidates.sort(key=lambda x: -x["pct_gain"])
                         result["ftd_history"].extend(ftd_candidates)
                         # Transition to UPTREND. state_since = today.
+                        # Fresh-dist tracker RESETS — each FTD gets its own
+                        # 10-session grace period. The old fresh_dist_dates
+                        # from any prior UPTREND are discarded.
                         state = "UPTREND"
                         state_since_i = i
                         correction_low = None
                         rally_day = 0
+                        last_ftd_i = i
+                        fresh_dist_dates = []
 
         # Materialize the final state.
         result["state"] = state
@@ -604,6 +703,17 @@ def detect_market_state_and_ftds(indices_df, sp_dist_dates: list) -> dict:
         result["rally_day"] = rally_day if state == "RALLY_ATTEMPT" else 0
         if result["ftd_history"]:
             result["last_ftd"] = result["ftd_history"][-1]
+
+        # Populate the ftd_failure_watch dict. Only meaningful in UPTREND
+        # with a known FTD; otherwise zeroed but present for schema stability.
+        if state == "UPTREND" and last_ftd_i is not None:
+            result["ftd_failure_watch"] = {
+                "fresh_dist_count":   len(fresh_dist_dates),
+                "fresh_dist_dates":   list(fresh_dist_dates),
+                "sessions_since_ftd": (n - 1) - last_ftd_i,
+                "kill_threshold":     _FRESH_DIST_FAILURE_THRESHOLD,
+                "kill_window":        _FRESH_DIST_FAILURE_WINDOW,
+            }
         return result
     except Exception:
         return result
@@ -2084,6 +2194,9 @@ def _build_signals_warnings(
     range_ratio_5v20: float = 1.0,
     ma_target: Optional[dict] = None,
     avg_dollar_volume_20d: float = 0.0,
+    market_state: Optional[dict] = None,
+    pead: Optional[dict] = None,
+    breakout_retest: Optional[dict] = None,
 ) -> tuple[list[str], list[str]]:
     """Build the green-signal + red-warning tag lists for a candidate.
 
@@ -2119,14 +2232,106 @@ def _build_signals_warnings(
     _MIN_BUY_ZONE_DOLLAR_VOLUME = 20_000_000
     pct_50ma = extension.get("pct_above_50ma", 0.0) if extension else 0.0
     vcp_quality = vcp.get("quality") if vcp else None
+
+    # ---- Adaptive BUY ZONE (added 2026-08-04) ----
+    # Rationale: on FTD day, the big index-wide rally pushes candidates past
+    # the pct_50ma cap (a stock that was 7% above 50MA is now 11%) AND lowers
+    # the trailing-20 pressure ratio for names that were leading the correction.
+    # This throttles the BUY ZONE list precisely when the user MOST wants
+    # candidates — the "post-FTD desert" the user saw on 2026-08-04.
+    #
+    # Two loosening regimes, based on market_state:
+    #   REGIME 1 — FRESH UPTREND (within 5 sessions of the FTD):
+    #     pct_50ma upper bound:  10% → 15%     (accept extended-by-rally names)
+    #     pressure_20d floor:    1.3 → 1.15    (accept names emerging from correction)
+    #   REGIME 2 — RALLY_ATTEMPT Day 4+ (FTD imminent, prep the queue):
+    #     pct_50ma upper bound:  10% → 12%     (mild loosening — not FTD yet)
+    #     pressure_20d floor:    1.3 → 1.20    (mild loosening)
+    #
+    # Once we're 5+ sessions past the FTD in a sustained UPTREND, gates
+    # snap back to normal. If the FTD fails (state → CORRECTION), gates also
+    # snap back automatically because the loosening keys off UPTREND state.
+    #
+    # VCP-quality gate and $20M ADV gate are UNCHANGED regardless of regime —
+    # they're quality/liquidity floors, not tape-sensitive thresholds.
+    pct_50ma_max     = 10.0   # default
+    pressure_floor   = 1.3    # default
+    buy_zone_regime  = "TIGHT"  # for reporting; not used in gate math
+    if market_state:
+        state       = market_state.get("state")
+        ffw         = market_state.get("ftd_failure_watch") or {}
+        sessions_since_ftd = ffw.get("sessions_since_ftd")
+        rally_day   = market_state.get("rally_day", 0) or 0
+        if (
+            state == "UPTREND"
+            and sessions_since_ftd is not None
+            and sessions_since_ftd <= 5
+        ):
+            pct_50ma_max    = 15.0
+            pressure_floor  = 1.15
+            buy_zone_regime = "LOOSE (fresh FTD)"
+        elif state == "RALLY_ATTEMPT" and rally_day >= _FTD_MIN_DAY:
+            pct_50ma_max    = 12.0
+            pressure_floor  = 1.20
+            buy_zone_regime = "LOOSE (FTD watch)"
+
     in_buy_zone = (
-        pressure_20d >= 1.3
-        and -3.0 <= pct_50ma <= 10.0
+        pressure_20d >= pressure_floor
+        and -3.0 <= pct_50ma <= pct_50ma_max
         and vcp_quality in ("A", "B", "C")
         and avg_dollar_volume_20d >= _MIN_BUY_ZONE_DOLLAR_VOLUME
     )
     if in_buy_zone:
         signals.append("BUY ZONE")
+
+    # ---- BZ-LITE (added 2026-08-04, revised same day) ----
+    # BUY ZONE variant that drops the VCP-grade quality requirement. Catches
+    # stocks in high-vol regimes where clean VCP structure can't form but the
+    # underlying institutional-accumulation signature (pressure_20d up,
+    # near 50MA, adequate liquidity) is still present.
+    #
+    # First-attempt (2026-08-04 morning) added `range_ratio_5v20 <= 1.30` as a
+    # "quality substitute for VCP." Result: 0 candidates. Root cause: vol
+    # contraction IS essentially what VCP measures. Stocks that fail VCP
+    # grading also tend to fail a vol-ratio gate, so the "substitute" just
+    # recreated the original requirement in a different shape. Removed.
+    #
+    # Gates now (three required):
+    #   - pressure_20d >= floor    (same as BUY ZONE, adapts to state)
+    #   - -3% <= pct_50ma <= max   (same as BUY ZONE, adapts to state)
+    #   - avg_dollar_volume_20d >= $20M (same liquidity floor)
+    #
+    # SIGNAL SEMANTICS: dedup remains. A stock with VCP grade A/B/C that meets
+    # all other BUY ZONE gates is tagged BUY ZONE only; it will NOT also carry
+    # a BZ-LITE tag. Keeps the Signals column clean and per-signal counts
+    # unambiguous.
+    #
+    # FILTER SEMANTICS: the BZ-LITE FILTER button (in app.py) shows the
+    # SUPERSET — every BUY ZONE stock PLUS every BZ-LITE-only stock. That
+    # matches the user's mental model of "a wider funnel." The filter-level
+    # superset is enforced in the filter-apply logic, not here.
+    #
+    # Note that all candidates in run_filters already pass the Minervini
+    # trend template (price > 50 > 150 > 200, 200MA rising, RS >= 70/85),
+    # so BZ-LITE isn't loosening trend quality — just the base-pattern gate.
+    in_buy_zone_lite = (
+        not in_buy_zone  # dedup: don't dual-tag; superset happens at filter time
+        and pressure_20d >= pressure_floor
+        and -3.0 <= pct_50ma <= pct_50ma_max
+        and avg_dollar_volume_20d >= _MIN_BUY_ZONE_DOLLAR_VOLUME
+    )
+    if in_buy_zone_lite:
+        signals.append("BZ-LITE")
+    # RETEST — pullback to a prior breakout pivot on quiet volume. Ranked
+    # high-priority because these are second-entries into proven leaders
+    # (Minervini "add on strength"). Added 2026-08-04.
+    if breakout_retest and breakout_retest.get("is_retest"):
+        signals.append("RETEST")
+    # PEAD — Post-Earnings Announcement Drift. Ranked ahead of BO TODAY
+    # because it identifies fundamentally-driven consolidations that often
+    # PRECEDE the breakout. Added 2026-08-04.
+    if pead and pead.get("is_pead"):
+        signals.append("PEAD")
     if breakout.get("is_breakout"):
         signals.append("BO TODAY")
     if cheat and cheat.get("is_cheat"):
@@ -2167,6 +2372,7 @@ def run_filters(
     progress: ProgressCallback = None,
     peg_map: Optional[dict] = None,
     inst_map: Optional[dict] = None,
+    market_state: Optional[dict] = None,
 ) -> tuple[list[dict], dict]:
     if peg_map is None:
         peg_map = {}
@@ -2176,6 +2382,16 @@ def run_filters(
     candidates: list[dict] = []
     d_rs = d_trend = d_funds = d_other = 0
     total = len(stock_cache)
+
+    # Load the recent-breakout map ONCE per scan (not per ticker) — used by
+    # the RETEST signal to detect pullbacks to prior breakout pivots. Returns
+    # {ticker → most-recent breakout entry within 30 days}. Empty dict on any
+    # error — RETEST simply won't fire without prior data.
+    try:
+        from .breakout_log import get_breakout_map
+        breakout_map = get_breakout_map(within_days=30)
+    except Exception:
+        breakout_map = {}
 
     for i, (ticker, data) in enumerate(stock_cache.items()):
         if progress and i % 50 == 0:
@@ -2354,6 +2570,24 @@ def run_filters(
                 pass
 
             days_to_er = days_until(earnings_map.get(ticker))
+            # PEAD (Post-Earnings Drift) — added 2026-08-04. days_since_earnings
+            # is the positive value of days_to_er when earnings are past. If
+            # earnings haven't happened yet (days_to_er >= 0), pass None so
+            # detect_pead short-circuits with fail_reason='no_earnings_date'.
+            days_since_er = (-days_to_er) if (days_to_er is not None and days_to_er < 0) else None
+            pead = detect_pead(data, days_since_er, float(avg_vol_50) if avg_vol_50 else None)
+
+            # RETEST (pullback to prior breakout pivot) — added 2026-08-04.
+            # Looks up this ticker's most-recent breakout in the persistent
+            # breakout log. Signal fires only if breakout was 3-15 sessions
+            # ago and current price is within 3% of the original pivot on
+            # quiet volume. Returns is_retest=False silently if the ticker
+            # has never broken out (breakout_map lookup miss).
+            breakout_retest = detect_breakout_retest(
+                data, breakout_map.get(ticker),
+                float(avg_vol_50) if avg_vol_50 else None,
+            )
+
             signals, warnings_list = _build_signals_warnings(
                 breakout=breakout, power_play=power_play,
                 rs_new_high=rs_new_high_bool, vcp=vcp_quality,
@@ -2364,6 +2598,9 @@ def run_filters(
                 range_ratio_5v20=range_ratio_5v20,
                 ma_target=ma_target,
                 avg_dollar_volume_20d=avg_dollar_volume_20d,
+                market_state=market_state,
+                pead=pead,
+                breakout_retest=breakout_retest,
             )
 
             sector_val, industry_val = sector_map.get(ticker, ("N/A", "N/A"))
@@ -2426,12 +2663,28 @@ def run_filters(
             d_other += 1
             continue
 
+    # Compute which BUY ZONE regime applied for this scan, so the user can
+    # see whether adaptive loosening kicked in. Mirrors the logic inside
+    # _build_signals_warnings — kept as a computed diagnostic rather than
+    # trying to bubble it up from inside the ticker loop.
+    bz_regime = "TIGHT"
+    if market_state:
+        _st = market_state.get("state")
+        _ffw = market_state.get("ftd_failure_watch") or {}
+        _ssft = _ffw.get("sessions_since_ftd")
+        _rd = market_state.get("rally_day", 0) or 0
+        if _st == "UPTREND" and _ssft is not None and _ssft <= 5:
+            bz_regime = "LOOSE (fresh FTD)"
+        elif _st == "RALLY_ATTEMPT" and _rd >= _FTD_MIN_DAY:
+            bz_regime = "LOOSE (FTD watch)"
+
     diagnostics = {
         "failed_rs": d_rs,
         "failed_trend": d_trend,
         "failed_fundamentals": d_funds,
         "other": d_other,
         "passed": len(candidates),
+        "buy_zone_regime": bz_regime,
     }
     if progress:
         progress("filter", total, total, f"Filter complete — {len(candidates)} candidates")
@@ -2524,6 +2777,7 @@ def run_scan(settings: ScanSettings, progress: ProgressCallback = None) -> ScanR
         stock_cache, rs_map, fund_map, sector_map, mktcap_map, earnings_map,
         industry_ranks, sp500_set, nq100_set, spy_hist, settings,
         progress=progress, peg_map=peg_map, inst_map=inst_map,
+        market_state=market_state,
     )
 
     if progress:

@@ -258,6 +258,48 @@ SIGNAL_DOCS = {
         "**VCP grade B.** 2+ contractions, current pullback <15%. Cleaner-than-average "
         "base structure, just not the perfect 3-stage tightening of grade A."
     ),
+    "BZ-LITE": (
+        "**BUY ZONE variant without the VCP-grade requirement** (added 2026-08-04). "
+        "Same pressure, near-50MA, and $20M ADV gates as full BUY ZONE — but "
+        "drops the requirement for a formal VCP pattern (A/B/C grade). No "
+        "substitute quality gate: because volatility contraction is essentially "
+        "what VCP measures, adding a vol-ratio filter here just recreated the "
+        "original requirement and produced zero candidates. This version leans "
+        "on the pressure + near-50MA + ADV gates alone as evidence of "
+        "institutional accumulation. **Signal labels are deduplicated** — a "
+        "stock is tagged BUY ZONE OR BZ-LITE, never both — but **the filter "
+        "surfaces the SUPERSET**. Clicking BZ-LITE shows every BUY ZONE stock "
+        "PLUS every stock that would have qualified except for missing VCP. "
+        "That matches the 'widen the funnel' intent. The underlying trend "
+        "template (price above 50MA > 150MA > 200MA, 200MA rising, RS ≥ 70/85) "
+        "is still enforced. Expect more false positives than full BUY ZONE — "
+        "sift the charts manually. Best used when BUY ZONE narrows and you "
+        "need a wider hunt zone."
+    ),
+    "PEAD": (
+        "**Post-Earnings Announcement Drift** (added 2026-08-04). Institutions "
+        "accumulate winners in the 3-15 sessions after an earnings beat. All five "
+        "gates must fire: (1) earnings happened 3-15 trading days ago, (2) that "
+        "session gapped up 5%+ on 2x+ volume AND closed in the upper half of the "
+        "day's range, (3) since the gap, no session has closed below the earnings-"
+        "day open (base held), (4) recent 5-day volume is BELOW the 50-day average "
+        "(quiet accumulation, not distribution), (5) today's close is within 5% of "
+        "the post-earnings high (consolidating near the top, not rolling over). "
+        "Fundamentally-driven — works when VCP fails because the catalyst provides "
+        "its own institutional demand. Especially valuable in high-vol tapes where "
+        "traditional consolidation patterns break down."
+    ),
+    "RETEST": (
+        "**Breakout retest / second entry** (added 2026-08-04). Ticker broke out "
+        "3-15 sessions ago (from the persistent breakout log), has held above the "
+        "original pivot every session since (no fill), and today's close is within "
+        "3% of that pivot on quiet volume (last 5 sessions ≤ 50-day avg). "
+        "Minervini's 'add on strength' setup — you're buying a PROVEN breakout at a "
+        "lower-risk price rather than chasing the initial extension. Highest hit "
+        "rate of the newer additions because you already have the volume "
+        "confirmation from the original breakout day. Requires the persistent "
+        "breakout log — will fire more often as your scan history builds up."
+    ),
 }
 
 

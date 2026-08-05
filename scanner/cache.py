@@ -125,6 +125,18 @@ def save_scan(result: ScanResult) -> tuple[Path, bool]:
         except Exception:
             # Never let a cohort-log failure block the main scan-save path.
             pass
+        # Log every BO TODAY breakout to the persistent breakout log so the
+        # RETEST signal (2026-08-04) can find pullback-to-pivot second-entries
+        # on future scans. Same idempotency guarantees as buy_zone snapshot.
+        try:
+            from .breakout_log import append_breakout_snapshot  # type: ignore
+            append_breakout_snapshot(
+                candidates=payload.get("candidates", []) or [],
+                market_signal=payload.get("market_signal", ""),
+                scan_timestamp=payload.get("timestamp"),
+            )
+        except Exception:
+            pass
         # Append market-state snapshot to the append-only jsonl log.
         # Used for diffing distribution-day counts across scans and
         # explaining any change ("what day appeared/disappeared and why").

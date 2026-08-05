@@ -73,6 +73,10 @@ def _compute_forward_metrics(row: dict) -> dict:
         "max_return_pct":        None,
         "max_drawdown_pct":      None,
         "hit_2r_before_neg_1r":  None,
+        "date_reached_5pct":     None,
+        "date_reached_10pct":    None,
+        "days_to_5pct":          None,
+        "days_to_10pct":         None,
         "close_5d":              None,
         "close_10d":             None,
         "close_20d":             None,
@@ -195,6 +199,81 @@ def _compute_forward_metrics(row: dict) -> dict:
             return None
         return round((target - flag_close) / flag_close * 100, 2)
 
+    # ---- Milestone dates: FIRST session where a REALIZABLE trade would
+    # have hit +5% (or +10%) above the flag close. Uses STRICT semantics
+    # (user request 2026-07-25):
+    #
+    #   1. Requires pivot to have cleared FIRST — no pivot clear = no
+    #      trade ever entered = milestone disqualified. Same rule as
+    #      the +2R hit-rate tile above.
+    #   2. Once pivot clears, if any subsequent close is at or below
+    #      the stop level BEFORE reaching the milestone, the milestone
+    #      is disqualified — the trader would have been stopped out
+    #      first and never captured the gain.
+    #
+    # This makes REACHED +5% and REACHED +10% honest measures of
+    # "would this have worked as a real trade?" rather than pure
+    # cohort momentum. If pivot or stop aren't available (legacy flags),
+    # falls back to lenient measurement (just checks the price target).
+    target_5  = flag_close * 1.05
+    target_10 = flag_close * 1.10
+    date_reached_5pct  = None
+    date_reached_10pct = None
+    days_to_5pct       = None
+    days_to_10pct      = None
+    try:
+        # Local pivot/stop parsing — separate from the pivot_cleared /
+        # stop_f already computed above, since those are only set when
+        # BOTH exist AND pivot > stop. For milestone tracking, do the
+        # same rigor.
+        _pivot_f = pivot_f if (pivot_f and stop_f and pivot_f > stop_f) else None
+        _stop_f  = stop_f  if (pivot_f and stop_f and pivot_f > stop_f) else None
+
+        milestone_pivot_cleared = False
+        stopped_out = False
+        for i, (idx_val, c_val) in enumerate(zip(post.index, closes)):
+            c_val = float(c_val)
+
+            # Phase 1: waiting for pivot to clear (only applies when we
+            # have pivot data — otherwise skip straight to milestone check
+            # so legacy flags without pivot/stop still get lenient tracking).
+            if _pivot_f is not None and not milestone_pivot_cleared:
+                if c_val >= _pivot_f:
+                    milestone_pivot_cleared = True
+                # Before entry, no milestone can be credited even if price
+                # briefly spikes above target — we never actually held the trade.
+                continue
+
+            # Phase 2: entered the trade (or lenient mode with no pivot).
+            # First check stop-out — if we're stopped, milestones from here
+            # on are disqualified.
+            if _stop_f is not None and c_val <= _stop_f:
+                stopped_out = True
+                break
+
+            # Not stopped out — check milestones.
+            if date_reached_5pct is None and c_val >= target_5:
+                try:
+                    date_reached_5pct = pd.to_datetime(idx_val).strftime("%Y-%m-%d")
+                except Exception:
+                    date_reached_5pct = str(idx_val)[:10]
+                days_to_5pct = i  # 0 = flag bar itself, 1 = next session, etc.
+            if date_reached_10pct is None and c_val >= target_10:
+                try:
+                    date_reached_10pct = pd.to_datetime(idx_val).strftime("%Y-%m-%d")
+                except Exception:
+                    date_reached_10pct = str(idx_val)[:10]
+                days_to_10pct = i
+            if date_reached_5pct is not None and date_reached_10pct is not None:
+                break
+
+        # If we exited without pivot ever clearing, both milestones stay
+        # None (undecided-never-entered) — that's the correct strict answer.
+        # If we exited via stopped_out, milestones already recorded before
+        # the stop hit stand; any that weren't reached before the stop stay None.
+    except Exception:
+        pass
+
     return {
         "current_close":         round(current_close, 2),
         "current_return_pct":    current_return_pct,
@@ -203,6 +282,10 @@ def _compute_forward_metrics(row: dict) -> dict:
         "max_return_pct":        max_return_pct,
         "max_drawdown_pct":      max_drawdown_pct,
         "hit_2r_before_neg_1r":  hit_2r,
+        "date_reached_5pct":     date_reached_5pct,
+        "date_reached_10pct":    date_reached_10pct,
+        "days_to_5pct":          days_to_5pct,
+        "days_to_10pct":         days_to_10pct,
         "close_5d":              round(close_5d, 2) if close_5d else None,
         "close_10d":             round(close_10d, 2) if close_10d else None,
         "close_20d":             round(close_20d, 2) if close_20d else None,
@@ -259,6 +342,13 @@ def _build_cohort_df() -> pd.DataFrame:
             "Return %":       fwd.get("current_return_pct"),
             "Max %":          fwd.get("max_return_pct"),
             "MaxDD %":        fwd.get("max_drawdown_pct"),
+            # Milestone dates — populated by _compute_forward_metrics.
+            # None if the ticker never reached that milestone. Used by
+            # the "Reached +5% / +10%" expander tables below the tiles.
+            "Reached 5%":     fwd.get("date_reached_5pct"),
+            "Reached 10%":    fwd.get("date_reached_10pct"),
+            "Days→5%":        fwd.get("days_to_5pct"),
+            "Days→10%":       fwd.get("days_to_10pct"),
             "5d %":           fwd.get("return_5d_pct"),
             "10d %":          fwd.get("return_10d_pct"),
             "20d %":          fwd.get("return_20d_pct"),
@@ -320,11 +410,23 @@ def _rollup_stats(df: pd.DataFrame) -> dict:
     # excluded from both numerator and denominator, so freshly-flagged
     # tickers don't drag the ratio down while they haven't had a chance
     # to move yet.
-    def _hit_rate_at(pct: float, col: str = "Max %") -> Optional[float]:
-        s = mature_df[col].dropna()
-        if s.empty:
+    #
+    # STRICT semantics (bug fix 2026-08-04): counts REACHABLE milestones only.
+    # A flag counts as "reached +N%" only if its `Reached N%` column is
+    # non-null, which comes from _compute_forward_metrics and requires:
+    #   (1) pivot cleared before the milestone was hit
+    #   (2) stop not hit before the milestone was hit
+    # Legacy: this previously used Max % (any peek above +N% at any moment,
+    # regardless of pivot / stop). That inflated the tiles vs. the drill-down
+    # tables which already used the strict rule, causing user-visible
+    # mismatches (e.g. tile said 9 tickers reached +10%, table showed 5).
+    # Tiles and tables now agree.
+    def _reached_rate(milestone_col: str) -> Optional[float]:
+        if mature_df.empty or milestone_col not in mature_df.columns:
             return None
-        return round((s >= pct).sum() / len(s) * 100, 1)
+        n_mature = len(mature_df)
+        n_reached = int(mature_df[milestone_col].notna().sum())
+        return round(n_reached / n_mature * 100, 1) if n_mature else None
 
     return {
         "n_total":       len(df),
@@ -332,8 +434,13 @@ def _rollup_stats(df: pd.DataFrame) -> dict:
         "n_developing":  int(developing_mask.sum()),
         "n_decided":     n_dec,
         "hit_rate_2r":   round(hit_rate_2r, 1) if hit_rate_2r is not None else None,
-        "hit_max_5pct":  _hit_rate_at(5,  "Max %"),
-        "hit_max_10pct": _hit_rate_at(10, "Max %"),
+        # Key names retained (hit_max_5pct / hit_max_10pct) so the historical
+        # cohort_history.jsonl schema stays compatible for chart continuity.
+        # The semantic content is now strict, not lenient — snapshots written
+        # from this point forward will be lower than pre-fix snapshots, so
+        # expect a one-time step-down on the trend chart on the day this ships.
+        "hit_max_5pct":  _reached_rate("Reached 5%"),
+        "hit_max_10pct": _reached_rate("Reached 10%"),
         "avg_5d":        _avg("5d %"),
         "avg_10d":       _avg("10d %"),
         "avg_20d":       _avg("20d %"),
@@ -532,19 +639,22 @@ def cohort_tracker_dialog():
         "Only statistically meaningful once decided count is 30+."
     )
     tip_reached_5 = (
-        "% of MATURE flags whose maximum post-flag price reached at least +5% "
-        "above the flagged close, at any point since the flag date. Includes "
-        "flags that later gave back the gain — this is 'ever reached', not "
-        "'still up'. Flags with fewer than "
-        f"{MATURITY_TRADING_DAYS} trading sessions since first flag are "
-        "EXCLUDED from both numerator and denominator, so freshly-flagged "
-        "tickers don't drag the ratio down before they've had a chance to move."
+        "% of MATURE flags where a REALIZABLE trade would have captured +5% "
+        "above the flagged close. STRICT rules: (1) pivot must have cleared "
+        "first — if the stock never triggered entry, the flag is DISQUALIFIED. "
+        "(2) after pivot clears, if any close hit the stop BEFORE reaching "
+        "+5%, the flag is DISQUALIFIED — the trader would have been stopped "
+        "out first. Freshly-flagged tickers with fewer than "
+        f"{MATURITY_TRADING_DAYS} trading sessions are EXCLUDED from both "
+        "numerator and denominator. This is 'would this trade have worked?', "
+        "not raw cohort momentum."
     )
     tip_reached_10 = (
-        "% of MATURE flags whose maximum post-flag price reached at least +10% "
-        "above the flagged close, at any point since the flag date. Same rules "
-        f"as +5% — 'ever reached', not 'still up', mature flags only "
-        f"(≥{MATURITY_TRADING_DAYS} trading sessions since first flag)."
+        "% of MATURE flags where a REALIZABLE trade would have captured +10% "
+        "above the flagged close. Same STRICT rules as +5%: requires pivot "
+        "clear before entry, and disqualifies any flag stopped out before "
+        f"reaching the target. Mature flags only (≥{MATURITY_TRADING_DAYS} "
+        "trading sessions since first flag)."
     )
     tip_avg_20d = (
         "Average return 20 trading sessions after the flag, across all flags "
@@ -651,35 +761,243 @@ def cohort_tracker_dialog():
             unsafe_allow_html=True,
         )
 
-    # ---- Trend chart of hit rates over time (added 2026-07-22) ----
+    # ---- Milestone drill-downs: which stocks reached +5% / +10% ----
+    # User request 2026-07-25: click-through on those tiles so I can go
+    # back and study what worked and what didn't. Rendered as expanders
+    # right below the tiles so they're one click away.
+    #
+    # Only shows tickers that ACTUALLY reached the milestone (date is
+    # non-null). Sort by days-to-milestone ascending so the fastest
+    # movers surface first — those are the best pattern studies.
+    reached_5_df  = df[df["Reached 5%"].notna()].copy() if "Reached 5%" in df.columns else pd.DataFrame()
+    reached_10_df = df[df["Reached 10%"].notna()].copy() if "Reached 10%" in df.columns else pd.DataFrame()
+
+    def _build_milestone_table(source_df: pd.DataFrame, milestone_col: str, days_col: str) -> pd.DataFrame:
+        """Slice + sort the cohort for a milestone drill-down."""
+        if source_df.empty:
+            return source_df
+        cols_to_keep = ["Ticker", "Flag Date", milestone_col, days_col,
+                        "Max %", "Return %", "Sector", "Signal", "VCP"]
+        cols_present = [c for c in cols_to_keep if c in source_df.columns]
+        out = source_df[cols_present].copy()
+        # Rename for clarity in the drill-down table
+        rename_map = {
+            milestone_col: "Reached On",
+            days_col:      "Days to Reach",
+            "Flag Date":   "First Flagged",
+            "Signal":      "Regime When Flagged",
+        }
+        out = out.rename(columns={k: v for k, v in rename_map.items() if k in out.columns})
+        if "Days to Reach" in out.columns:
+            out = out.sort_values("Days to Reach", ascending=True)
+        return out.reset_index(drop=True)
+
+    with st.expander(
+        f"📈 Show {len(reached_5_df)} stocks that reached +5% "
+        f"(click to study what worked)", expanded=False
+    ):
+        table_5 = _build_milestone_table(reached_5_df, "Reached 5%", "Days→5%")
+        if table_5.empty:
+            st.caption("No cohort members have reached +5% yet.")
+        else:
+            st.caption(
+                "**Strict rules:** pivot must have cleared AND stop not hit "
+                "before target. Sorted by fastest to reach the milestone. **First Flagged** = "
+                "the date this ticker first appeared on the BUY ZONE list. "
+                "**Reached On** = the first session where the close hit "
+                "+5% above the flagged close. **Days to Reach** = trading "
+                "sessions between the two (0 = same day)."
+            )
+            st.dataframe(
+                table_5, use_container_width=True, hide_index=True,
+                height=min(400, 80 + len(table_5) * 36),
+            )
+
+    with st.expander(
+        f"🚀 Show {len(reached_10_df)} stocks that reached +10% "
+        f"(click to study the big winners)", expanded=False
+    ):
+        table_10 = _build_milestone_table(reached_10_df, "Reached 10%", "Days→10%")
+        if table_10.empty:
+            st.caption("No cohort members have reached +10% yet.")
+        else:
+            st.caption(
+                "The setups that produced real profit. Study these charts "
+                "closely — they show what an A+ setup actually looks like "
+                "before it works. Sorted by fastest to reach +10%."
+            )
+            st.dataframe(
+                table_10, use_container_width=True, hide_index=True,
+                height=min(400, 80 + len(table_10) * 36),
+            )
+
+    # ---- Hit Rate drill-down: WINS and LOSSES side of the +2R tile ----
+    # Complements the +5% / +10% tables above. This shows the DECIDED
+    # flags (pivot cleared, race between +2R and -1R resolved) so the
+    # user can study which setups paid off vs which got stopped out.
+    #
+    # Two expanders — same structure as the milestone tables above:
+    #   🏆 WINS   = hit_2r_before_neg_1r is True  (Worked? = "✓")
+    #   💥 LOSSES = hit_2r_before_neg_1r is False (Worked? = "✗")
+    #
+    # Undecided ("…") flags — pivot never cleared or trade still in
+    # flight — are excluded because they're not yet part of the hit rate.
+    wins_df   = df[df["Worked?"] == "✓"].copy() if "Worked?" in df.columns else pd.DataFrame()
+    losses_df = df[df["Worked?"] == "✗"].copy() if "Worked?" in df.columns else pd.DataFrame()
+
+    def _build_hitrate_table(source_df: pd.DataFrame) -> pd.DataFrame:
+        """Slice + sort the cohort for a hit-rate drill-down.
+        Sorted by Max % descending so the biggest movers surface first
+        (for wins that's the runners; for losses it's the ones that
+        looked good before rolling over — most instructive)."""
+        if source_df.empty:
+            return source_df
+        cols_to_keep = ["Ticker", "Flag Date", "TDays", "Return %", "Max %",
+                        "MaxDD %", "Sector", "Signal", "VCP"]
+        cols_present = [c for c in cols_to_keep if c in source_df.columns]
+        out = source_df[cols_present].copy()
+        rename_map = {
+            "Flag Date":  "First Flagged",
+            "TDays":      "Trading Days",
+            "Signal":     "Regime When Flagged",
+        }
+        out = out.rename(columns={k: v for k, v in rename_map.items() if k in out.columns})
+        if "Max %" in out.columns:
+            out = out.sort_values("Max %", ascending=False)
+        return out.reset_index(drop=True)
+
+    with st.expander(
+        f"🏆 Show {len(wins_df)} WINS — trades that hit +2R before -1R "
+        f"(the payoff studies)", expanded=False
+    ):
+        table_wins = _build_hitrate_table(wins_df)
+        if table_wins.empty:
+            st.caption(
+                "No decided wins yet. A 'win' requires the pivot to clear "
+                "AND the trade to reach +2R above the pivot before dropping "
+                "-1R below it. Fresh flags where the pivot hasn't cleared "
+                "yet stay in the '…' bucket and don't count either way."
+            )
+        else:
+            st.caption(
+                "**Decided wins:** pivot cleared and price reached +2R above "
+                "pivot before falling -1R below it. Sorted by **Max %** "
+                "descending — the biggest runners at the top. Study these "
+                "charts to internalize what a working setup looks like "
+                "before and during the move."
+            )
+            st.dataframe(
+                table_wins, use_container_width=True, hide_index=True,
+                height=min(400, 80 + len(table_wins) * 36),
+            )
+
+    with st.expander(
+        f"💥 Show {len(losses_df)} LOSSES — trades that hit -1R before +2R "
+        f"(the failure studies)", expanded=False
+    ):
+        table_losses = _build_hitrate_table(losses_df)
+        if table_losses.empty:
+            st.caption(
+                "No decided losses yet. A 'loss' requires the pivot to have "
+                "cleared AND price to have fallen -1R below the pivot before "
+                "reaching +2R above it."
+            )
+        else:
+            st.caption(
+                "**Decided losses:** pivot cleared but price rolled over and "
+                "hit -1R before making +2R. Sorted by **Max %** descending — "
+                "the ones that pushed the furthest into profit before failing "
+                "are the most valuable studies. Ask: was the exit signal "
+                "there before the stop hit? Did I miss a warning?"
+            )
+            st.dataframe(
+                table_losses, use_container_width=True, hide_index=True,
+                height=min(400, 80 + len(table_losses) * 36),
+            )
+
+    # ---- Trend chart of hit rates over time ----
     # Line chart of the last ~60 days of REACHED +5%, +10%, and 2R hit rate.
-    # This is the direct visual answer to "are my numbers improving?" —
-    # rising lines = regime paying, flat/falling = probes should stay small.
-    # Silent no-op on first-ever open (needs ≥2 snapshots to draw a trend).
+    # Uses plotly (not st.line_chart) so we can force DATE-only x-axis
+    # ticks — Streamlit's built-in chart was showing hourly labels
+    # (09 AM, 03 PM, etc.) because it auto-formatted based on a short
+    # date range (user report 2026-07-25). Plotly with tickformat="%b %d"
+    # and dtick="D1" gives a clean one-tick-per-day day-month axis.
     _hist = load_history(days=60)
     if len(_hist) >= 2:
         import pandas as pd
-        chart_df = pd.DataFrame([
-            {
-                "Date":        h.get("date"),
-                "Reached +5%": h.get("hit_max_5pct"),
-                "Reached +10%": h.get("hit_max_10pct"),
-                "Hit Rate 2R": h.get("hit_rate_2r"),
-            }
-            for h in _hist
-        ])
         try:
-            chart_df["Date"] = pd.to_datetime(chart_df["Date"])
-            chart_df = chart_df.set_index("Date")
+            import plotly.graph_objects as go
+            chart_df = pd.DataFrame([
+                {
+                    "Date":         pd.to_datetime(h.get("date")),
+                    "Reached +5%":  h.get("hit_max_5pct"),
+                    "Reached +10%": h.get("hit_max_10pct"),
+                    "Hit Rate 2R":  h.get("hit_rate_2r"),
+                }
+                for h in _hist
+            ])
             st.markdown("### Hit-rate trend (last 60 days)")
             st.caption(
-                "Each point is one scan's cohort snapshot. **Rising** = the "
+                "Each point is one scan day's cohort snapshot. **Rising** = the "
                 "regime is starting to pay; **flat** = still developing; "
                 "**falling** = setups deteriorating (tighten stops, stop adding). "
-                "Missing days = no scan was run. First value shows once a "
-                "second scan has been logged."
+                "Missing days = no scan was run."
             )
-            st.line_chart(chart_df, height=280, use_container_width=True)
+
+            fig = go.Figure()
+            _COLORS = {
+                "Reached +5%":  "#EF4444",  # red — matches user's SMA 200 red
+                "Reached +10%": "#3B82F6",  # blue
+                "Hit Rate 2R":  "#22C55E",  # green
+            }
+            for col in ("Reached +5%", "Reached +10%", "Hit Rate 2R"):
+                fig.add_trace(go.Scatter(
+                    x=chart_df["Date"], y=chart_df[col],
+                    mode="lines+markers", name=col,
+                    line=dict(color=_COLORS[col], width=2.2),
+                    marker=dict(size=6),
+                    hovertemplate=f"{col}: %{{y:.1f}}%<br>%{{x|%b %d %Y}}<extra></extra>",
+                ))
+            # All text forced to #FFFFFF (pure white). Plotly-dark's default
+            # font color is ~#F0F0F0 which reads as dim grey against the
+            # near-black chart background (user report 2026-07-25).
+            _WHITE = "#FFFFFF"
+            fig.update_layout(
+                template="plotly_dark",
+                plot_bgcolor="#0F1620",
+                paper_bgcolor="#0F1620",
+                font=dict(family="JetBrains Mono, monospace", size=12,
+                          color=_WHITE),
+                height=320,
+                margin=dict(l=50, r=20, t=20, b=40),
+                xaxis=dict(
+                    # Day-level ticks only — no hour/minute labels
+                    tickformat="%b %d",
+                    dtick=86400000.0,  # one day in milliseconds
+                    gridcolor="#1F2937",
+                    tickangle=-30,
+                    tickfont=dict(color=_WHITE, size=12),
+                    color=_WHITE,
+                ),
+                yaxis=dict(
+                    title=dict(text="%", font=dict(color=_WHITE, size=12)),
+                    gridcolor="#1F2937",
+                    ticksuffix="%",
+                    tickfont=dict(color=_WHITE, size=12),
+                    color=_WHITE,
+                ),
+                legend=dict(
+                    orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="left", x=0,
+                    bgcolor="rgba(0,0,0,0)",
+                    font=dict(color=_WHITE, size=13),
+                ),
+                hoverlabel=dict(
+                    bgcolor="#0F1620", bordercolor="#00D4FF",
+                    font=dict(color=_WHITE),
+                ),
+            )
+            st.plotly_chart(fig, use_container_width=True)
         except Exception:
             pass  # never let chart failure block the rest of the dialog
     else:

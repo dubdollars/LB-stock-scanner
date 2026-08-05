@@ -117,13 +117,15 @@ def _init_state():
     # default view is shown. Two big buttons at the top of every page switch
     # between them.
     # Default mode + view = ⭐ TOP STOCKS (the new home page).
-    # Top Stocks is the intersection of the Long + Quality scans — only the
-    # very best stocks show up here. This is what the user sees when the
-    # app opens.
+    # Momentum is the default landing tab (changed 2026-08-04, was Top Stocks).
+    # Rationale: user wants to see the full BUY ZONE / VCP / signals table
+    # first, not the intersection view. Momentum surfaces the widest set of
+    # tradable candidates with the richest signal breakdown, and the new
+    # PEAD + RETEST signals live here.
     if "mode" not in st.session_state:
-        st.session_state.mode = "top_stocks"
+        st.session_state.mode = "longs"
     if "view" not in st.session_state:
-        st.session_state.view = "top_stocks"
+        st.session_state.view = "dashboard"
     if "deep_dive_ticker" not in st.session_state:
         st.session_state.deep_dive_ticker = None
     # deep_dive_origin tracks WHERE the user came from before landing on the
@@ -300,23 +302,42 @@ def _parse_utc_iso(iso_str: str):
 
 
 def _format_timestamp(iso_str: str) -> str:
-    """Render a UTC ISO timestamp in the USER\'S LOCAL TIMEZONE.
+    """Render a UTC ISO timestamp in US EASTERN TIME (EST/EDT).
 
-    Uses datetime.astimezone() with no argument, which converts to the
-    machine\'s configured local timezone. On the user\'s Windows machine
-    this is EST/EDT automatically (Windows handles DST). The displayed
-    label uses the local timezone abbreviation (e.g. EST, EDT)."""
+    Hard-coded to America/New_York because this scanner runs on both the
+    user\'s Windows machine AND Streamlit Cloud. On Streamlit Cloud the
+    host container is UTC — the old code relied on `astimezone()` with no
+    argument (system local time), which meant cloud runs displayed UTC
+    while local runs displayed ET. That inconsistency is the bug this fixes
+    (user report 2026-08-04): the scanner should ALWAYS display ET regardless
+    of where it\'s running, because the user\'s trading day IS the ET day.
+
+    America/New_York handles the EST/EDT DST switch automatically — no
+    manual offset math, no per-season bug window. Uses stdlib zoneinfo
+    (Python 3.9+). If zoneinfo can\'t find the tz database (rare — happens
+    on stripped-down Windows installs missing tzdata), falls back to the
+    system-local behavior with a warning label so the user knows to install
+    tzdata rather than silently seeing UTC times.
+    """
     dt_utc = _parse_utc_iso(iso_str)
     if dt_utc is None:
         return "never"
     try:
-        dt_local = dt_utc.astimezone()  # convert to system local time
-        tz_label = dt_local.tzname() or ""  # e.g. "EST" / "Eastern Standard Time"
-        # Windows tznames are sometimes verbose ("Eastern Standard Time" vs "EST").
-        # Compress multi-word names to their initials so the label stays short.
-        if " " in tz_label:
-            tz_label = "".join(w[0] for w in tz_label.split() if w)
-        return dt_local.strftime("%Y-%m-%d %H:%M ") + tz_label
+        try:
+            from zoneinfo import ZoneInfo
+            dt_et = dt_utc.astimezone(ZoneInfo("America/New_York"))
+            # tzname() will return "EST" or "EDT" depending on DST — exactly
+            # the two-letter label we want for the display.
+            tz_label = dt_et.tzname() or "ET"
+            return dt_et.strftime("%Y-%m-%d %H:%M ") + tz_label
+        except Exception:
+            # Fallback: system local time (old behavior). Label ends in "?" to
+            # signal that this is not confirmed to be Eastern Time.
+            dt_local = dt_utc.astimezone()
+            tz_label = dt_local.tzname() or ""
+            if " " in tz_label:
+                tz_label = "".join(w[0] for w in tz_label.split() if w)
+            return dt_local.strftime("%Y-%m-%d %H:%M ") + tz_label + "?"
     except Exception:
         return iso_str
 
@@ -901,6 +922,46 @@ def _render_market_strip(scan: dict):
                     f"{last_ftd.get('vol_ratio', 0):.2f}× prior-day volume "
                     f"(Day {last_ftd.get('rally_day', '?')} of rally attempt)"
                 )
+            # Fresh-dist post-FTD counter (added 2026-08-04). Only meaningful in
+            # UPTREND with a known FTD. Shows N / kill_threshold and how many
+            # sessions we are into the kill window. Red when counter reaches
+            # threshold-1 (one more dist day away from downgrade).
+            ffw = state.get("ftd_failure_watch") or {}
+            if state_name == "UPTREND" and last_ftd and last_ftd.get("date"):
+                fresh_ct  = int(ffw.get("fresh_dist_count", 0) or 0)
+                kill_thr  = int(ffw.get("kill_threshold", 2) or 2)
+                kill_win  = int(ffw.get("kill_window", 10) or 10)
+                sessions  = int(ffw.get("sessions_since_ftd", 0) or 0)
+                ct_color  = PALETTE["down_red"] if fresh_ct >= kill_thr - 1 else "#22C55E"
+                dates_str = ""
+                if ffw.get("fresh_dist_dates"):
+                    dates_str = f" — {', '.join(ffw['fresh_dist_dates'])}"
+                html_parts.append(
+                    f"<br><b>Fresh dist post-FTD:</b> "
+                    f"<span style='color:{ct_color};font-weight:700'>"
+                    f"{fresh_ct} / {kill_thr}</span> "
+                    f"<span style='color:#9CA3AF'>"
+                    f"(kill threshold — 2+ fresh dist days within {kill_win} "
+                    f"sessions downgrades UPTREND → CORRECTION. Currently "
+                    f"{sessions} sessions past FTD.{dates_str})</span>"
+                )
+            # BUY ZONE regime — surfaces which gate profile the scan used, so
+            # the user can verify adaptive loosening kicked in. Added 2026-08-04
+            # after user reported "BUY ZONE still only 10 tickers" — this makes
+            # the regime visible instead of a silent behind-the-scenes switch.
+            _diag = scan.get("diagnostics") or {}
+            _regime = _diag.get("buy_zone_regime")
+            if _regime:
+                _rcolor = PALETTE["up_green"] if "LOOSE" in _regime else "#9CA3AF"
+                html_parts.append(
+                    f"<br><b>BUY ZONE regime:</b> "
+                    f"<span style='color:{_rcolor};font-weight:700'>{_regime}</span> "
+                    f"<span style='color:#9CA3AF'>"
+                    f"(TIGHT = default gates: pressure ≥1.30, pct_50ma ≤10%. "
+                    f"LOOSE fresh FTD = ≤5 sessions post-FTD: pressure ≥1.15, "
+                    f"pct_50ma ≤15%. LOOSE FTD watch = RALLY_ATTEMPT Day 4+: "
+                    f"pressure ≥1.20, pct_50ma ≤12%.)</span>"
+                )
             html_parts.append("</div>")
 
             # FTD history table
@@ -1397,9 +1458,13 @@ def _render_results_table(scan: dict):
         st.info("No candidates passed the screen. The market may be in a bad regime, or settings are too strict.")
         return
 
-    # Initialize toggle state for the 6 filter buttons (persists across reruns)
+    # Initialize toggle state for the 9 filter buttons (persists across reruns).
+    # PEAD + RETEST + BZ-LITE added 2026-08-04 for post-FTD regime capture and
+    # VCP-independent wide funnel — see the signals section of the TOC dialog
+    # for their criteria.
     for _k in ("flt_trade_now", "flt_watch_list", "flt_vcp_ab", "flt_vcp_b",
-                "flt_breakout", "flt_buy_zone"):
+                "flt_breakout", "flt_buy_zone", "flt_bz_lite",
+                "flt_pead", "flt_retest"):
         if _k not in st.session_state:
             st.session_state[_k] = False
 
@@ -1427,7 +1492,26 @@ def _render_results_table(scan: dict):
         if "Signals_Display" in df.columns else 0
     )
     n_buy_zone = (
-        _count(df["Signals_Display"].astype(str).str.contains("BUY ZONE", na=False))
+        # word-boundary regex so "BUY ZONE" doesn't accidentally count BZ-LITE
+        # rows (unlikely given naming, but future-proof).
+        _count(df["Signals_Display"].astype(str).str.contains(r"\bBUY ZONE\b", na=False, regex=True))
+        if "Signals_Display" in df.columns else 0
+    )
+    # BZ-LITE count = SUPERSET of BUY ZONE + BZ-LITE-only. The signals
+    # themselves are deduped (a stock tagged BUY ZONE is NOT also tagged
+    # BZ-LITE), but the filter surfaces the union — that's the "widen the
+    # funnel" behavior the user asked for. Count reflects what clicking the
+    # BZ-LITE button will actually display.
+    n_bz_lite = (
+        _count(df["Signals_Display"].astype(str).str.contains(r"(?:BUY ZONE|BZ-LITE)", na=False, regex=True))
+        if "Signals_Display" in df.columns else 0
+    )
+    n_pead = (
+        _count(df["Signals_Display"].astype(str).str.contains("PEAD", na=False))
+        if "Signals_Display" in df.columns else 0
+    )
+    n_retest = (
+        _count(df["Signals_Display"].astype(str).str.contains("RETEST", na=False))
         if "Signals_Display" in df.columns else 0
     )
 
@@ -1480,11 +1564,15 @@ def _render_results_table(scan: dict):
     with fcol_search:
         search = st.text_input("Search", placeholder="e.g. NVDA or tech")
 
-    # Row 2 — 7 blue filter buttons, evenly spaced across the full panel width.
-    # Order: Trade Now · Watch List · VCP A · VCP B · Breakout · BUY ZONE ·
-    # Cohort Tracker. Cohort Tracker sits next to BUY ZONE per user request
-    # 2026-07-10 so the buy-zone workflow (find candidates → check historical
-    # performance of the buy-zone cohort) is co-located.
+    # Row 2 — 9 blue filter buttons, ordered LEFT-TO-RIGHT by signal priority
+    # per user request 2026-08-04 (was: Trade Now first, filters second).
+    # New order matches the entry-signal priority stack:
+    #   BUY ZONE → RETEST → PEAD → BREAKOUT → VCP A → VCP B → TRADE NOW → WATCH LIST → COHORT
+    # BUY ZONE first because it's the highest-leverage anticipatory signal.
+    # RETEST/PEAD/BREAKOUT are the three execution triggers in priority order.
+    # VCP A/B are the pattern-quality filters. TRADE NOW/WATCH LIST are tier
+    # filters that stack on top of any signal filter. COHORT is a dialog, not
+    # a filter — it sits last so it doesn't get muddled with the toggle set.
     try:
         from scanner.buy_zone_cohort import cohort_summary as _cohort_summary
         _cs = _cohort_summary()
@@ -1492,42 +1580,11 @@ def _render_results_table(scan: dict):
     except Exception:
         _cohort_label = "📊 COHORT"
 
-    fcol2, fcol3, fcol4, fcol_b, fcol5, fcol_bz, fcol_ct = st.columns(7)
-    with fcol2:
-        label = _btn_label("TRADE NOW", st.session_state.flt_trade_now, n_trade_now)
-        if st.button(label, type="primary", use_container_width=True, key="btn_trade_now",
-                     help="A-Tier only — strict Minervini criteria: RS≥90, VCP A/B, within 5% of pivot, <20% above 50MA, strong fundamentals, top-15 industry rank, no earnings within 14 days. Typically 5-15 names."):
-            st.session_state.flt_trade_now = not st.session_state.flt_trade_now
-            st.rerun()
-        trade_now = st.session_state.flt_trade_now
-    with fcol3:
-        label = _btn_label("WATCH LIST", st.session_state.flt_watch_list, n_watch_list)
-        if st.button(label, type="primary", use_container_width=True, key="btn_watch_list",
-                     help="B-Tier only — looser: RS≥85, VCP A/B/C, within 10% of pivot, <25% above 50MA, fundamentals or RS new high, no earnings within 14 days. Setups developing — monitor for trigger."):
-            st.session_state.flt_watch_list = not st.session_state.flt_watch_list
-            st.rerun()
-        watch_list = st.session_state.flt_watch_list
-    with fcol4:
-        label = _btn_label("VCP A ONLY", st.session_state.flt_vcp_ab, n_vcp_ab)
-        if st.button(label, type="primary", use_container_width=True, key="btn_vcp_ab",
-                     help="Only show grade-A VCP setups — the cleanest, textbook Minervini contraction pattern (3+ contractions, monotonically tightening)."):
-            st.session_state.flt_vcp_ab = not st.session_state.flt_vcp_ab
-            st.rerun()
-        vcp_a_only = st.session_state.flt_vcp_ab
-    with fcol_b:
-        label = _btn_label("VCP B ONLY", st.session_state.flt_vcp_b, n_vcp_b)
-        if st.button(label, type="primary", use_container_width=True, key="btn_vcp_b",
-                     help="Only show grade-B VCP setups — meaningful multi-contraction structure that didn't quite meet every A criterion. The practical daily watchlist filter when A-grade is empty."):
-            st.session_state.flt_vcp_b = not st.session_state.flt_vcp_b
-            st.rerun()
-        vcp_b_only = st.session_state.flt_vcp_b
-    with fcol5:
-        label = _btn_label("BREAKOUT", st.session_state.flt_breakout, n_breakout)
-        if st.button(label, type="primary", use_container_width=True, key="btn_breakout",
-                     help="Stocks that broke out above pivot today on volume"):
-            st.session_state.flt_breakout = not st.session_state.flt_breakout
-            st.rerun()
-        breakout_only = st.session_state.flt_breakout
+    # 10-column filter row (BZ-LITE added 2026-08-04 right after BUY ZONE
+    # since they're conceptual siblings — full-quality vs wider-funnel).
+    (fcol_bz, fcol_bzl, fcol_retest, fcol_pead, fcol_breakout,
+     fcol_vcpa, fcol_vcpb, fcol_trade, fcol_watch, fcol_ct) = st.columns(10)
+
     with fcol_bz:
         label = _btn_label("BUY ZONE", st.session_state.flt_buy_zone, n_buy_zone)
         if st.button(label, type="primary", use_container_width=True, key="btn_buy_zone",
@@ -1535,10 +1592,89 @@ def _render_results_table(scan: dict):
                           "(Pressure 20d ≥1.3) while still near 50MA (-3% to +10%) "
                           "with a VCP pattern forming. Anticipatory pre-breakout "
                           "entry window — buy near support with tight stop, before "
-                          "the obvious breakout when you'd be extended."):
+                          "the obvious breakout when you'd be extended. Gates loosen "
+                          "automatically in the 5 sessions after a fresh FTD."):
             st.session_state.flt_buy_zone = not st.session_state.flt_buy_zone
             st.rerun()
         buy_zone_only = st.session_state.flt_buy_zone
+    with fcol_bzl:
+        label = _btn_label("BZ-LITE", st.session_state.flt_bz_lite, n_bz_lite)
+        if st.button(label, type="primary", use_container_width=True, key="btn_bz_lite",
+                     help="SUPERSET of BUY ZONE — shows every BUY ZONE candidate PLUS "
+                          "stocks that meet the same pressure, near-50MA, and $20M ADV "
+                          "gates but LACK a formal VCP grade. Catches stocks in high-vol "
+                          "regimes where clean VCP structure can't form but the "
+                          "institutional-accumulation signature is still there. Signal "
+                          "column shows either BUY ZONE (with VCP) or BZ-LITE (without) "
+                          "— never both — but the filter surfaces the union. Use when "
+                          "BUY ZONE narrows and you want a wider candidate pool. Expect "
+                          "more false positives than full BUY ZONE — sift charts manually."):
+            st.session_state.flt_bz_lite = not st.session_state.flt_bz_lite
+            st.rerun()
+        bz_lite_only = st.session_state.flt_bz_lite
+    with fcol_retest:
+        label = _btn_label("RETEST", st.session_state.flt_retest, n_retest)
+        if st.button(label, type="primary", use_container_width=True, key="btn_retest",
+                     help="Second-entry pullback to a prior breakout pivot. Ticker fired "
+                          "BO TODAY 3-15 sessions ago (recorded in the persistent breakout "
+                          "log), held above the pivot since, and today is within 3% of the "
+                          "original pivot on quiet volume. Minervini 'add on strength' "
+                          "setup — proven breakout, lower-risk price. Highest-hit-rate "
+                          "signal of the newer additions."):
+            st.session_state.flt_retest = not st.session_state.flt_retest
+            st.rerun()
+        retest_only = st.session_state.flt_retest
+    with fcol_pead:
+        label = _btn_label("PEAD", st.session_state.flt_pead, n_pead)
+        if st.button(label, type="primary", use_container_width=True, key="btn_pead",
+                     help="Post-Earnings Announcement Drift. Stock beat earnings 3-15 "
+                          "sessions ago (5%+ gap on 2x+ vol, closed strong), held above "
+                          "the gap-open since, quieted down on volume, and is now within "
+                          "5% of the post-earnings high. Fundamentally-driven consolidations "
+                          "that often precede the next breakout — captures the regime where "
+                          "VCP fails and BUY ZONE narrows."):
+            st.session_state.flt_pead = not st.session_state.flt_pead
+            st.rerun()
+        pead_only = st.session_state.flt_pead
+    with fcol_breakout:
+        label = _btn_label("BREAKOUT", st.session_state.flt_breakout, n_breakout)
+        if st.button(label, type="primary", use_container_width=True, key="btn_breakout",
+                     help="Stocks that broke out above pivot today on volume — four gates: "
+                          "close > pivot, volume ≥1.5x 50d avg, up on the day (close > prior "
+                          "close), and close in upper half of today's range. Tightened "
+                          "2026-08-04 to eliminate false positives on big red down days "
+                          "that happen to close above an old pivot."):
+            st.session_state.flt_breakout = not st.session_state.flt_breakout
+            st.rerun()
+        breakout_only = st.session_state.flt_breakout
+    with fcol_vcpa:
+        label = _btn_label("VCP A ONLY", st.session_state.flt_vcp_ab, n_vcp_ab)
+        if st.button(label, type="primary", use_container_width=True, key="btn_vcp_ab",
+                     help="Only show grade-A VCP setups — the cleanest, textbook Minervini contraction pattern (3+ contractions, monotonically tightening)."):
+            st.session_state.flt_vcp_ab = not st.session_state.flt_vcp_ab
+            st.rerun()
+        vcp_a_only = st.session_state.flt_vcp_ab
+    with fcol_vcpb:
+        label = _btn_label("VCP B ONLY", st.session_state.flt_vcp_b, n_vcp_b)
+        if st.button(label, type="primary", use_container_width=True, key="btn_vcp_b",
+                     help="Only show grade-B VCP setups — meaningful multi-contraction structure that didn't quite meet every A criterion. The practical daily watchlist filter when A-grade is empty."):
+            st.session_state.flt_vcp_b = not st.session_state.flt_vcp_b
+            st.rerun()
+        vcp_b_only = st.session_state.flt_vcp_b
+    with fcol_trade:
+        label = _btn_label("TRADE NOW", st.session_state.flt_trade_now, n_trade_now)
+        if st.button(label, type="primary", use_container_width=True, key="btn_trade_now",
+                     help="A-Tier only — strict Minervini criteria: RS≥90, VCP A/B, within 5% of pivot, <20% above 50MA, strong fundamentals, top-15 industry rank, no earnings within 14 days. Typically 5-15 names."):
+            st.session_state.flt_trade_now = not st.session_state.flt_trade_now
+            st.rerun()
+        trade_now = st.session_state.flt_trade_now
+    with fcol_watch:
+        label = _btn_label("WATCH LIST", st.session_state.flt_watch_list, n_watch_list)
+        if st.button(label, type="primary", use_container_width=True, key="btn_watch_list",
+                     help="B-Tier only — looser: RS≥85, VCP A/B/C, within 10% of pivot, <25% above 50MA, fundamentals or RS new high, no earnings within 14 days. Setups developing — monitor for trigger."):
+            st.session_state.flt_watch_list = not st.session_state.flt_watch_list
+            st.rerun()
+        watch_list = st.session_state.flt_watch_list
     with fcol_ct:
         if st.button(
             _cohort_label,
@@ -1571,7 +1707,19 @@ def _render_results_table(scan: dict):
     if breakout_only and "Signals_Display" in filtered.columns:
         filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("BO TODAY", na=False)]
     if buy_zone_only and "Signals_Display" in filtered.columns:
-        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("BUY ZONE", na=False)]
+        # word-boundary regex so BUY ZONE filter doesn't accidentally pull in
+        # BZ-LITE rows — the two signals are deliberately deduplicated at the
+        # detector level and should be filtered separately here too.
+        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains(r"\bBUY ZONE\b", na=False, regex=True)]
+    if bz_lite_only and "Signals_Display" in filtered.columns:
+        # SUPERSET filter: match either BUY ZONE or BZ-LITE. Signals are deduped
+        # at detection time so a stock only carries one label, but the filter
+        # shows both categories together — that's the "widen the funnel" intent.
+        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains(r"(?:BUY ZONE|BZ-LITE)", na=False, regex=True)]
+    if pead_only and "Signals_Display" in filtered.columns:
+        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("PEAD", na=False)]
+    if retest_only and "Signals_Display" in filtered.columns:
+        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("RETEST", na=False)]
     # Tier filters — if both Trade Now AND Watch List are checked, show A+B
     if (trade_now or watch_list) and "Tier" in filtered.columns:
         accepted_tiers = []
@@ -2148,19 +2296,31 @@ def _show_control_tower_dialog():
             "Probe #1 and watching three specific signals:\n\n"
             "**1. Probe #1 performance.** Is it up +1R (one full unit of your initial "
             "risk)? Then it's proving the FTD was real.\n\n"
-            "**2. Fresh distribution day count.** Count how many NEW distribution "
-            "days print AFTER the FTD. Two or three inside two weeks is the kill "
-            "switch — institutions are selling into the bounce.\n\n"
+            "**2. Fresh distribution day count — automated as of 2026-08-04.** The "
+            "market state detail expander now shows a **Fresh dist post-FTD** counter "
+            "that resets at every new FTD and rolls off after 10 sessions. If it "
+            "hits **2 within 10 trading days**, the state machine automatically "
+            "downgrades UPTREND back to CORRECTION. That's the IBD 'FTD failure' "
+            "rule — a third to half of FTDs die exactly that way. You no longer "
+            "have to count manually.\n\n"
             "**3. Cohort hit rate on mature flags.** Reopen the Cohort Tracker "
             "periodically. If freshly-mature flags start reaching +5% at higher "
             "rates than during the prior correction, that's empirical confirmation.\n\n"
             "**What to do based on what you see:**\n"
-            "- **Probe #1 up +1R AND no fresh distribution days AND cohort improving** "
+            "- **Probe #1 up +1R AND fresh dist counter still 0-1 AND cohort improving** "
             "→ deploy Probe #2 at half size on a different A+ setup\n"
-            "- **2-3 fresh distribution days accumulate** → CLOSE probes and back to "
-            "Stage 2 (the FTD failed)\n"
+            "- **Fresh dist counter hits 2** → CLOSE probes; the state machine has "
+            "already reverted to CORRECTION\n"
             "- **Probe stalls (flat or slightly negative)** → hold with tight stop; "
             "don't add. Wait another few sessions for clarity.\n\n"
+            "**Why two dist counters exist:** the top-of-page **RED/YELLOW/GREEN "
+            "banner** is the **trailing-25 counter** — a general absorption gauge "
+            "that runs all the time. It won't reset just because we got an FTD, and "
+            "it stays elevated for weeks. The **Fresh dist post-FTD counter** is "
+            "different: it starts at 0 the day the FTD prints and counts only NEW "
+            "distribution days from that point forward. Two counters, two jobs — the "
+            "banner tracks environment quality, the fresh counter tracks whether the "
+            "new uptrend is holding.\n\n"
             "**Why this stage exists:** this is where good FTDs get separated from "
             "failed ones. The framework's power comes from having a mechanical "
             "kill switch — you retreat on evidence, not emotion."
@@ -3576,13 +3736,15 @@ def render_rotation_page():
 # ---------------------------------------------------------------------------
 
 view = st.session_state.view
-mode = st.session_state.get("mode", "top_stocks")
+# Default landing changed to Momentum 2026-08-04 (was top_stocks).
+mode = st.session_state.get("mode", "longs")
 
 # Recover from stale modes that were deleted. shorts (2026-06-06) and early
-# (2026-06-11) both removed. Anyone with one cached gets sent back to Top Stocks.
+# (2026-06-11) both removed. Anyone with one cached gets sent to Momentum
+# (default). Prior recovery routed to Top Stocks; changed with the default.
 if mode in ("shorts", "early") or view in ("short_candidates", "early"):
-    mode = "top_stocks"
-    view = "top_stocks"
+    mode = "longs"
+    view = "dashboard"
     st.session_state.mode = mode
     st.session_state.view = view
 
