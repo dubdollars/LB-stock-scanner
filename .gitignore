@@ -51,3 +51,7 @@ tools/*.txt
 build/
 dist/
 *.egg-info/
+data/journal.json
+data/*.jsonl
+data/scans/*.jsonl
+Claude outputs/
