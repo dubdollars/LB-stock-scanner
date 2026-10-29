@@ -1,0 +1,167 @@
+[
+  {
+    "id": "s1a2b3c4",
+    "ticker": "NVDA",
+    "setup_tag": "Breakout",
+    "source": "Momentum - BUY ZONE",
+    "stop_price": 141.2,
+    "initial_stop_price": 133.5,
+    "notes": "SAMPLE DATA \u2014 illustrative only",
+    "created_at": "2026-06-02T14:30:00Z",
+    "transactions": [
+      {
+        "kind": "BUY",
+        "date": "2026-06-02",
+        "price": 141.2,
+        "shares": 20
+      },
+      {
+        "kind": "SELL",
+        "date": "2026-07-15",
+        "price": 162.8,
+        "shares": 20
+      }
+    ],
+    "stop_history": [
+      {
+        "date": "2026-06-24",
+        "old_stop": 133.5,
+        "new_stop": 141.2,
+        "note": "raised to breakeven after 1R"
+      }
+    ]
+  },
+  {
+    "id": "s2b3c4d5",
+    "ticker": "AAPL",
+    "setup_tag": "Pullback to 50MA",
+    "source": "Top Stocks",
+    "stop_price": 189.9,
+    "initial_stop_price": 189.9,
+    "notes": "SAMPLE DATA \u2014 stopped near risk",
+    "created_at": "2026-06-10T14:30:00Z",
+    "transactions": [
+      {
+        "kind": "BUY",
+        "date": "2026-06-10",
+        "price": 198.4,
+        "shares": 25
+      },
+      {
+        "kind": "SELL",
+        "date": "2026-06-30",
+        "price": 193.1,
+        "shares": 25
+      }
+    ],
+    "stop_history": []
+  },
+  {
+    "id": "s3c4d5e6",
+    "ticker": "MSFT",
+    "setup_tag": "VCP-A",
+    "source": "Momentum - Other Filter",
+    "stop_price": 452.0,
+    "initial_stop_price": 431.0,
+    "notes": "SAMPLE DATA",
+    "created_at": "2026-07-08T14:30:00Z",
+    "transactions": [
+      {
+        "kind": "BUY",
+        "date": "2026-07-08",
+        "price": 452.0,
+        "shares": 10
+      },
+      {
+        "kind": "SELL",
+        "date": "2026-08-20",
+        "price": 498.5,
+        "shares": 10
+      }
+    ],
+    "stop_history": [
+      {
+        "date": "2026-07-29",
+        "old_stop": 431.0,
+        "new_stop": 452.0,
+        "note": "trail under swing low"
+      }
+    ]
+  },
+  {
+    "id": "s4d5e6f7",
+    "ticker": "AMZN",
+    "setup_tag": "Power Play",
+    "source": "Momentum - Power Play",
+    "stop_price": 209.8,
+    "initial_stop_price": 209.8,
+    "notes": "SAMPLE DATA \u2014 failed breakout",
+    "created_at": "2026-07-21T14:30:00Z",
+    "transactions": [
+      {
+        "kind": "BUY",
+        "date": "2026-07-21",
+        "price": 221.3,
+        "shares": 20
+      },
+      {
+        "kind": "SELL",
+        "date": "2026-07-28",
+        "price": 208.9,
+        "shares": 20
+      }
+    ],
+    "stop_history": []
+  },
+  {
+    "id": "s5e6f7a8",
+    "ticker": "GOOGL",
+    "setup_tag": "VCP-B",
+    "source": "Quality",
+    "stop_price": 180.0,
+    "initial_stop_price": 175.0,
+    "notes": "SAMPLE DATA \u2014 open position",
+    "created_at": "2026-08-05T14:30:00Z",
+    "transactions": [
+      {
+        "kind": "BUY",
+        "date": "2026-08-05",
+        "price": 184.6,
+        "shares": 25
+      }
+    ],
+    "stop_history": [
+      {
+        "date": "2026-08-26",
+        "old_stop": 175.0,
+        "new_stop": 180.0,
+        "note": "raised under 21EMA"
+      }
+    ]
+  },
+  {
+    "id": "s6f7a8b9",
+    "ticker": "COST",
+    "setup_tag": "Breakout",
+    "source": "Top Stocks",
+    "stop_price": 878.0,
+    "initial_stop_price": 878.0,
+    "notes": "SAMPLE DATA",
+    "created_at": "2026-08-12T14:30:00Z",
+    "transactions": [
+      {
+        "kind": "BUY",
+        "date": "2026-08-12",
+        "price": 912.0,
+        "shares": 5
+      },
+      {
+        "kind": "SELL",
+        "date": "2026-09-09",
+        "price": 961.4,
+        "shares": 5
+      }
+    ],
+    "stop_history": []
+  }
+]

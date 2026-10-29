@@ -1,128 +1,149 @@
-# Minervini SEPA Scanner
+# Legacy Brands Money Making Machine
 
-A local dashboard wrapping your Minervini/O'Neil SEPA scanner. Dark Bloomberg/TradingView aesthetic, one-click rescan, and a deep-dive view for every flagged stock with charts, RS line analysis, fundamentals, and a pre-computed trade execution ticket.
+A Minervini/O'Neil momentum scanner and trade journal, Python/Streamlit. Runs locally against the full US equity universe (~3,225 tickers), implements SEPA and CAN SLIM filtering rules, and includes a built-in position journal with full R-multiple accounting, a market state machine, industry rotation analysis, and seven distinct scan modes.
 
----
-
-## One-time setup
-
-### 1. Install Python
-
-Download Python **3.11 or newer** from:
-
-  **<https://www.python.org/downloads/>**
-
-⚠️ **During install, CHECK the box that says "Add python.exe to PATH".** Without this, the launcher won't find Python.
-
-### 2. Launch the app
-
-Double-click **`run.bat`** in this folder.
-
-The first run will:
-- Create a virtual environment (`.venv/` folder)
-- Install all dependencies from `requirements.txt` (~3-5 minutes, one time only)
-- Start the dashboard
-- Open your browser to <http://localhost:8501>
-
-Future launches skip setup and start in a few seconds.
+![Dashboard — Momentum Control Tower](docs/screenshots/01_dashboard_hero.png)
 
 ---
 
-## Daily use
+## How this was built
 
-1. Double-click **`run.bat`**.
-2. Browser opens to the dashboard.
-3. The **last cached scan** loads instantly. If it's stale, click **▶ Rescan Now** in the sidebar (~25 min for the full S&P 500 + Nasdaq-100 + Russell 2000 universe).
-4. Click any row in the candidates table to **deep-dive** that stock — charts, RS line, fundamentals, trade ticket.
+I'm not a professional developer. I designed the system, wrote the specification, and directed Claude (Anthropic's coding model) to implement, test, and ship it iteratively over roughly six months — moving from a working Google Colab notebook through a Streamlit v1, then through hundreds of review-and-revise iterations across 14 pushed releases.
 
-When you're done, just close the browser tab and press `Ctrl+C` in the black launcher window (or just close it).
+The original specification I wrote and worked from is preserved in [`docs/original_colab_spec_v8.docx`](docs/original_colab_spec_v8.docx). Every subsequent change was reviewed, tested in the running app, and either accepted or sent back for revision — AI-assisted construction with human spec, judgment, and acceptance testing throughout.
 
 ---
 
-## What's in the dashboard
+## What it does
 
-### Top strip — Market context (the "M" factor)
-Color-coded GREEN / YELLOW / RED banner showing the current Minervini market signal, with S&P 500, Nasdaq, and Russell 2000 trend status and distribution-day counts.
+The app runs after the market close, pulls daily OHLCV data for the US equity universe, applies the Minervini trend template (price > 50MA > 150MA > 200MA, 200MA rising, relative strength ≥ 85 in Elite mode), and surfaces candidates passing additional entry-signal detectors:
 
-### Breadth metrics row
-- Universe size scanned
-- % of stocks above 50-day and 200-day MAs
-- Up/down volume ratio
-- New highs vs new lows
-- Internal breadth status
+- **BUY ZONE** — anticipatory composite (accumulation pressure + near-50MA + VCP pattern + $20M ADV liquidity floor)
+- **RETEST** — pullback to a prior breakout pivot on quiet volume
+- **EP** — Qullamaggie-style Episodic Pivot (8% gap on 3× volume from neglected base)
+- **PEAD** — Post-Earnings Announcement Drift
+- **BREAKOUT** — confirmed pivot-cross with volume
+- **VCP A / B** — graded Volatility Contraction Patterns
+- **POWER PLAY**, **CHEAT**, **GAP UP**, **RS✓** — supporting signals
 
-### Candidates table
-Sortable, filterable list of stocks that passed the SEPA screen. Columns:
-- **RS** — Relative Strength rating (1-99)
-- **RSI** — 14-day RSI
-- **RS_NH** — RS line at new 50-day high (leadership signal)
-- **VCP** — Volatility contraction detected
-- **VDU** — Volume dry-up
-- **Squat** — Bearish reversal candle (avoid these)
-- **Fundamentals** — EPS+ / EPS++ / Sale+ tags
-- **Buy >** / **Stop <** / **Risk %** / **Shares** — Pre-computed trade execution
-
-Click any row → deep dive.
-
-### Deep dive (per stock)
-Four tabs:
-- **📈 Price & VCP** — Candlestick + 50/150/200 SMAs, volume bars, buy/stop horizontal lines, VCP contraction zones highlighted
-- **📊 RS Line** — Relative strength vs SPY with new-high markers
-- **💰 Fundamentals** — 8 quarters of net income & revenue with YoY growth, profit/operating margins
-- **🎯 Execution** — Trade ticket, R-multiple targets, sector context, next earnings date
+Alongside the main Momentum scan, the app includes a reverse-funnel **MOVERS** scan (demand-first instead of structure-first), an IBD-style **QUALITY** fundamentals scan, industry **ROTATION** analysis, a **TOP STOCKS** intersection view, and a complete **PERFORMANCE** journal.
 
 ---
 
-## Sidebar settings
+## Control Tower and signals
 
-| Setting | What it does |
+![Control Tower — CORRECTION state from a later scan, included to show the state machine in a different regime from the hero shot above](docs/screenshots/02_control_tower.png)
+
+Every scan session opens with the **Control Tower** — a market context layer showing the Minervini distribution-day signal (GREEN/YELLOW/RED), the O'Neil state machine (UPTREND / RALLY_ATTEMPT / CORRECTION) with Follow-Through-Day detection, breadth tiles, and composite internal breadth. The signal filter buttons below (BUY ZONE, RETEST, EP, PEAD, BREAKOUT, VCP A, VCP B, TRADE NOW, COHORT) let you narrow the candidate list by setup type.
+
+The state machine implements O'Neil-style methodology with two downgrade paths: fast-kill (≥2 fresh distribution days post-FTD) and slow-grind (≥5 distribution days in trailing 25 sessions, with a 10-session grace period post-FTD). Correction-low tracking supports proper RALLY_ATTEMPT → UPTREND progression on the next qualifying FTD.
+
+---
+
+## Trade journal with R-multiple accounting
+
+![Performance Journal — open and closed positions with R-multiples](docs/screenshots/03_performance_journal.png)
+
+The **PERFORMANCE** tab is a full position-tracking journal, not just a trade log. It supports:
+
+- Multi-tranche positions with adds and partial exits
+- Immutable initial-stop anchor (R-multiples stay honest even after stop moves)
+- Live risk calculation (current stop) vs. historical R calculation (initial stop)
+- Days held, cost basis, realized vs. unrealized P&L, G/L%, and Open R per position
+- Dashboard tiles for Total P&L, Open P&L, Portfolio Value, Live Risk, and Total R
+- Per-trade Decision Snapshot panel that captures the setup context at the time of entry
+
+Open R on a held position tells you how far into the trade you are relative to your original risk. Realized R on a closed trade tells you what you actually extracted. Both numbers survive stop moves cleanly.
+
+A loadable demo dataset lives at [`docs/journal.sample.json`](docs/journal.sample.json) — six made-up trades on well-known tickers, labeled SAMPLE DATA in the notes. Copy it into `data/journal.json` to populate the Performance tab with example positions without needing your own trading history.
+
+---
+
+## Technical overview
+
+| Layer | Implementation |
 |---|---|
-| **Elite mode** | RS≥85, VDU+EPS required (vs RS≥70 standard) |
-| **Account size** | Used for share count calculation |
-| **Risk per trade** | % of account risked per position |
-| **Min price** | Filter out cheap stocks |
-| **Min avg volume** | Liquidity filter |
+| Front-end | Streamlit with custom dark-theme CSS (Bloomberg-vibe) |
+| Charts | Plotly (candlesticks, VCP contraction zones, Fibonacci overlays) |
+| Data | yfinance (primary) + Stooq (secondary fallback) |
+| Persistence | JSON for scan archives, pickle for per-ticker price cache, atomic writes with rate-limit guardrail |
+| Fundamentals | yfinance quarterly income statements with TTL cache |
+| State | SPY-driven FTD state machine with trailing-25 distribution counter |
+| Universe | NASDAQ Trader + S&P 500 + Nasdaq-100 + iShares IWM/IWV, with fallback to the last healthy scan's ticker list |
 
-Changes apply on the next scan.
+Architecture favors module boundaries over inheritance — scanner logic (`scanner/*.py`) is pure-function where possible, UI (`ui/*.py`) is dumb render, data layer (`scanner/data_cache.py`, `scanner/cache.py`) handles persistence. 26,000 lines across ~40 files, all under version control.
 
 ---
 
-## Files
+## Repository layout
 
 ```
 Stock Scanner/
-├── app.py                  ← Streamlit entry point
-├── run.bat                 ← Double-click launcher
+├── app.py                      Streamlit entry point + mode router
+├── run.bat                     Windows launcher
 ├── requirements.txt
-├── README.md
+├── diagnose_data.py            Standalone Yahoo/Stooq connectivity test
 ├── scanner/
-│   ├── core.py             ← Scan pipeline (refactored from your notebook)
-│   ├── deepdive.py         ← Per-stock data fetcher
-│   └── cache.py            ← Save/load scan results
+│   ├── core.py                 Scan pipeline, universe collection, RS calc, run_scan
+│   ├── setups.py               VCP, breakout, buy zone, EP, PEAD, retest detectors
+│   ├── cache.py                Scan save/load with rate-limit guardrail
+│   ├── data_cache.py           Per-ticker price + fundamentals cache
+│   ├── movers.py               Reverse-funnel demand scanner
+│   ├── quality.py              IBD-style fundamentals scan
+│   ├── rotation.py             Industry group rotation
+│   ├── mean_reversion.py       Oversold-bounce scanner
+│   ├── journal.py              Trade journal data layer
+│   ├── buy_zone_cohort.py      Persistent BUY ZONE cohort log
+│   ├── breakout_log.py         Persistent breakout log (powers RETEST)
+│   ├── top_stocks.py           Momentum ∩ Quality intersection
+│   ├── stooq.py                Secondary data source
+│   └── ...
 ├── ui/
-│   ├── style.py            ← Dark theme CSS
-│   └── deepdive_view.py    ← Charts and panels
-└── data/scans/             ← Cached scan results (kept: last 30)
+│   ├── style.py                Global CSS theme
+│   ├── toc.py                  Table-of-contents dialogs
+│   ├── deepdive_view.py        Per-ticker deep-dive
+│   ├── journal_view.py         Performance tab
+│   ├── movers_view.py
+│   ├── quality_view.py
+│   ├── top_stocks_view.py
+│   ├── mean_reversion_view.py
+│   └── cohort_view.py
+├── tools/                      Debug/inspection scripts
+├── docs/
+│   ├── original_colab_spec_v8.docx   Original written specification
+│   ├── CHANGES_SINCE_LAST_PUSH*.md   Historical release notes
+│   ├── journal.sample.json           Demo trades for the Performance tab
+│   └── screenshots/
+└── data/                       Local scan + cache storage (gitignored)
 ```
 
 ---
 
-## Demo mode
+## Setup and run
 
-The sidebar has a **⚡ Demo (~2 min)** button that runs the scan against just 20 well-known mega-cap tickers. Use this on first launch to verify everything works without waiting 25 minutes.
+Full first-time setup and daily-use instructions are in **[GETTING_STARTED.md](GETTING_STARTED.md)**. The short version:
+
+```
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+run.bat
+```
+
+Dashboard opens at `http://localhost:8501`. First scan takes 30–60 minutes (cold cache); subsequent scans are 10–20 minutes.
 
 ---
 
-## Troubleshooting
+## Known limitations
 
-**"Python is not installed or not on PATH"** when launching `run.bat`
-→ You either didn't install Python, or didn't check "Add to PATH" during install. Reinstall from <https://www.python.org/downloads/> with that box checked.
+- **yfinance is not an SLA'd data source.** It's an undocumented scraper that works until it doesn't. Reliability is the biggest architectural weakness. See `diagnose_data.py` for a one-command check of whether Yahoo/Stooq are reachable from your IP.
+- **End-of-day data only.** No intraday feed, no live quotes.
+- **Signal thresholds are heuristics**, not backtested at scale. Treat them as filters, not guarantees.
+- **No slippage/spread modeling.** Suggested buy triggers assume you can fill at the pivot.
+- **No autonomous execution.** The Journal tracks what the user did; it doesn't place orders.
 
-**Dependency install fails**
-→ Open a Command Prompt in this folder and run `pip install -r requirements.txt` manually to see the full error.
+---
 
-**Scan is very slow / timing out**
-→ Yahoo Finance occasionally rate-limits. Try again later. The cached results from your last successful scan still load instantly.
+## License
 
-**Browser doesn't open**
-→ Manually navigate to <http://localhost:8501> in any browser.
+© 2026 Elliott Walter. All rights reserved. Shared for review; not licensed for reuse.
