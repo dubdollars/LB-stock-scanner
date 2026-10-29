@@ -150,6 +150,38 @@ def _init_state():
         st.session_state.latest_social_scan = load_latest_social_snapshot()
 
 
+@st.dialog("More modes")
+def _more_modes_dialog():
+    """Popup with MEAN REVERSION / SOCIAL / RESEARCH buttons.
+
+    Added 2026-08-07 to declutter the main mode row. These three modes are
+    used less often than TOP STOCKS / MOMENTUM / QUALITY / ROTATION /
+    PERFORMANCE and consolidating them behind MORE lets every top-level
+    button fit on one line without label wrapping.
+    """
+    st.markdown(
+        "Additional tools. Click one to switch modes."
+    )
+    if st.button("🔁 MEAN REVERSION", type="primary",
+                 use_container_width=True, key="more_dlg_mean_reversion"):
+        st.session_state.mode = "mean_reversion"
+        st.session_state.view = "mean_reversion"
+        st.session_state.research_ticker = None
+        st.rerun()
+    if st.button("🐦 SOCIAL", type="primary",
+                 use_container_width=True, key="more_dlg_twitter"):
+        st.session_state.mode = "twitter"
+        st.session_state.view = "twitter"
+        st.session_state.research_ticker = None
+        st.rerun()
+    if st.button("🔎 RESEARCH", type="primary",
+                 use_container_width=True, key="more_dlg_research"):
+        st.session_state.mode = "research"
+        st.session_state.view = "research"
+        st.session_state.research_ticker = None
+        st.rerun()
+
+
 def _render_mode_switcher():
     """Mode buttons at the top of every page.
     The currently-active mode renders as a solid cyan PRIMARY button; the
@@ -172,6 +204,39 @@ def _render_mode_switcher():
     def _btn_type(mode_name: str) -> str:
         return "primary" if current == mode_name else "secondary"
 
+    # ---- Uniform mode-button sizing (added 2026-08-07) ----------------------
+    # Force every mode-switcher button to the same height so single-line labels
+    # visually match wrapped ones. Scoped to just the mode-row keys so filter
+    # buttons elsewhere aren't affected. Height tuned to comfortably fit a
+    # single line — with 6 columns instead of 8, every label now fits on one
+    # line after the MORE consolidation, so we don't need to reserve 2-line
+    # space anymore. 2026-08-07: MEAN REV / SOCIAL / RESEARCH moved into MORE
+    # dialog per user request — 8 chips wouldn't fit without wrapping.
+    st.markdown(
+        """
+        <style>
+        .st-key-mode_btn_top_stocks button,
+        .st-key-mode_btn_longs button,
+        .st-key-mode_btn_movers button,
+        .st-key-mode_btn_quality button,
+        .st-key-mode_btn_rotation button,
+        .st-key-mode_btn_journal button,
+        .st-key-mode_btn_more button {
+            min-height: 2.6rem !important;
+            height: 2.6rem !important;
+            padding: 0.25rem 0.5rem !important;
+            white-space: nowrap !important;
+            line-height: 1.15 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            text-align: center !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # Display order: TOP STOCKS · MOMENTUM · QUALITY · MEAN REVERSION · SOCIAL · ROTATION · JOURNAL · RESEARCH.
     # MEAN REVERSION sits next to QUALITY because it consumes the Quality scan
     # (its universe = Quality candidates with Composite ≥ 70).
@@ -182,12 +247,19 @@ def _render_mode_switcher():
     # SHORTS was removed 2026-06-06.
     # Internal mode key for the social mode stays "twitter" so existing
     # session state / snapshots keep working — only the LABEL is "SOCIAL".
-    # Equal column widths for every mode button so the chips look uniform.
-    # MEAN REVERSION's two-word label wraps to a second line at this width;
-    # that's better than making one button noticeably wider than the rest.
-    (col_top, col_long, col_quality, col_mr, col_social, col_rotation,
-     col_journal, col_research, col_spacer) = st.columns(
-        [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.0]
+    # 6-column row (was 8) — MEAN REV / SOCIAL / RESEARCH consolidated behind
+    # a single MORE button that opens a dialog with those three options.
+    # Rationale (2026-08-07 per user request): with 8 chips the labels were
+    # wrapping ugly and icons landed in weird spots. Six chips leaves room for
+    # every label to fit on one line. The MORE button lights up as "primary"
+    # (active) if the current mode is one of the three consolidated ones —
+    # that way you can still tell at a glance which section you're in.
+    MORE_MODES = {"mean_reversion", "twitter", "research"}
+    more_active = current in MORE_MODES
+
+    (col_top, col_long, col_movers, col_quality, col_rotation,
+     col_journal, col_more, col_spacer) = st.columns(
+        [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.5]
     )
     with col_top:
         if st.button("⭐ TOP STOCKS", type=_btn_type("top_stocks"),
@@ -203,28 +275,21 @@ def _render_mode_switcher():
             st.session_state.view = "dashboard"
             st.session_state.research_ticker = None
             st.rerun()
+    with col_movers:
+        # MOVERS (added 2026-08-07) — reverse funnel: what's actually moving
+        # on demand today, regardless of whether the structural filter
+        # nominates it. Complements MOMENTUM, doesn't replace it.
+        if st.button("🚀 MOVERS", type=_btn_type("movers"),
+                     use_container_width=True, key="mode_btn_movers"):
+            st.session_state.mode = "movers"
+            st.session_state.view = "movers"
+            st.session_state.research_ticker = None
+            st.rerun()
     with col_quality:
         if st.button("💎 QUALITY", type=_btn_type("quality"),
                      use_container_width=True, key="mode_btn_quality"):
             st.session_state.mode = "quality"
             st.session_state.view = "quality"
-            st.session_state.research_ticker = None
-            st.rerun()
-    with col_mr:
-        # Label kept short ("MEAN REV") so the button stays on one line and
-        # matches the height of its neighbors. Full "Mean Reversion" name still
-        # appears in the page header, sidebar, and TOC dialog.
-        if st.button("🔁 MEAN REV", type=_btn_type("mean_reversion"),
-                     use_container_width=True, key="mode_btn_mean_reversion"):
-            st.session_state.mode = "mean_reversion"
-            st.session_state.view = "mean_reversion"
-            st.session_state.research_ticker = None
-            st.rerun()
-    with col_social:
-        if st.button("🐦 SOCIAL", type=_btn_type("twitter"),
-                     use_container_width=True, key="mode_btn_twitter"):
-            st.session_state.mode = "twitter"
-            st.session_state.view = "twitter"
             st.session_state.research_ticker = None
             st.rerun()
     with col_rotation:
@@ -247,13 +312,11 @@ def _render_mode_switcher():
             # a while. Cheap enough (~10-30s) that we can do it every entry.
             st.session_state.journal_auto_refresh_pending = True
             st.rerun()
-    with col_research:
-        if st.button("🔎 RESEARCH", type=_btn_type("research"),
-                     use_container_width=True, key="mode_btn_research"):
-            st.session_state.mode = "research"
-            st.session_state.view = "research"
-            st.session_state.research_ticker = None
-            st.rerun()
+    with col_more:
+        if st.button("➕ MORE",
+                     type="primary" if more_active else "secondary",
+                     use_container_width=True, key="mode_btn_more"):
+            _more_modes_dialog()
 
     # Belt-and-braces: small text caption so the active mode is also in writing
     cyan = PALETTE["accent_cyan"]
@@ -262,6 +325,7 @@ def _render_mode_switcher():
         "top_stocks": "TOP STOCKS",
         "journal": "PERFORMANCE",
         "longs": "MOMENTUM",
+        "movers": "MOVERS",
         "research": "RESEARCH", "twitter": "SOCIAL",
         "rotation": "ROTATION", "quality": "QUALITY",
         "mean_reversion": "MEAN REVERSION",
@@ -340,6 +404,32 @@ def _format_timestamp(iso_str: str) -> str:
             return dt_local.strftime("%Y-%m-%d %H:%M ") + tz_label + "?"
     except Exception:
         return iso_str
+
+
+def _active_momentum_filter_tag() -> str:
+    """Return a filename-safe suffix describing which Momentum filter buttons
+    are currently active. Used in download filenames so a BUY-ZONE-filtered
+    export becomes legacy_brands_buy_zone_DDMMMYYYY.xlsx (not just _scan_).
+
+    Reads the flt_* session state keys. When multiple filters are active,
+    concatenates them in the same left-to-right priority order the filter
+    buttons appear on the page (signal filters first, then tier filters).
+
+    Returns 'momentum' as the default when nothing is filtered — that way
+    the tab context is still clear in the filename.
+    """
+    tags = []
+    if st.session_state.get("flt_buy_zone"):   tags.append("buy_zone")
+    if st.session_state.get("flt_retest"):     tags.append("retest")
+    if st.session_state.get("flt_ep"):         tags.append("ep")
+    if st.session_state.get("flt_pead"):       tags.append("pead")
+    if st.session_state.get("flt_breakout"):   tags.append("breakout")
+    if st.session_state.get("flt_vcp_ab"):     tags.append("vcp_a")
+    if st.session_state.get("flt_vcp_b"):      tags.append("vcp_b")
+    if st.session_state.get("flt_trade_now"):  tags.append("trade_now")
+    if not tags:
+        return "momentum"
+    return "_".join(tags)
 
 
 def _is_intraday_scan_window() -> bool:
@@ -579,6 +669,11 @@ def _render_long_sidebar():
     has_results = filtered_df is not None and len(filtered_df) > 0
 
     if has_results:
+        # Filename tag reflects the active filter(s) so a BUY-ZONE-filtered
+        # export becomes legacy_brands_buy_zone_DDMMMYYYY.xlsx. Added 2026-08-07
+        # so the user (and anyone shared with) can tell at a glance which
+        # slice of the scan a saved file represents.
+        filter_tag = _active_momentum_filter_tag()
         try:
             stamp = datetime.utcnow().strftime("%d%b%Y")
             excel_bytes = format_dataframe_to_excel(
@@ -589,7 +684,7 @@ def _render_long_sidebar():
             st.download_button(
                 label="📥 Download Excel",
                 data=excel_bytes,
-                file_name=f"legacy_brands_scan_{stamp}.xlsx",
+                file_name=f"legacy_brands_{filter_tag}_{stamp}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 type="primary",
@@ -604,7 +699,7 @@ def _render_long_sidebar():
         st.download_button(
             label="📥 Download Tickers (.txt)",
             data=tickers_text,
-            file_name=f"legacy_brands_tickers_{stamp}.txt",
+            file_name=f"legacy_brands_{filter_tag}_tickers_{stamp}.txt",
             mime="text/plain",
             use_container_width=True,
             type="primary",
@@ -1437,16 +1532,55 @@ def _classify_tier(c: dict) -> str:
     return "C"
 
 
+def _load_quality_enrichment_map() -> dict:
+    """Return {ticker → quality-row dict} from the latest Quality scan.
+
+    Used to enrich Momentum candidates with Quality-side fields (Composite_
+    Rating, EPS_Rating, Acc_Dis_Rating, UD_Vol_Ratio, Fwd_EPS_Growth) so
+    both tables display the same columns per user request 2026-08-07.
+
+    Silent fallback to empty dict on any error — Momentum table should still
+    render normally without Quality fields (they'll just be blank).
+    """
+    try:
+        from scanner.quality import load_latest_quality_scan
+        q = load_latest_quality_scan() or {}
+        candidates = q.get("candidates", []) or []
+        return {c.get("Ticker"): c for c in candidates if c.get("Ticker")}
+    except Exception:
+        return {}
+
+
 def _candidates_dataframe(candidates: list[dict]) -> pd.DataFrame:
     """Normalize candidates into a display dataframe.
 
     Handles two schemas transparently:
       - new: separate `Sector` and `Industry` columns
       - legacy: combined `Sector_Industry` column (split on " | ")
+
+    2026-08-07: also enriches each row with Quality-side fields
+    (Composite_Rating, EPS_Rating, etc.) so the Momentum table has column
+    parity with Top Stocks. Fields are null when the ticker isn't in the
+    Quality scan universe or a Quality scan hasn't been run yet — that's
+    fine, Streamlit renders blank cells cleanly.
     """
     if not candidates:
         return pd.DataFrame()
     df = pd.DataFrame(candidates)
+
+    # ---- Quality enrichment (added 2026-08-07 for column parity) ----
+    # Load latest Quality scan and merge in the composite/eps/a-d/ud-vol/
+    # fwd-eps columns for tickers present in both scans.
+    q_map = _load_quality_enrichment_map()
+    if q_map and "Ticker" in df.columns:
+        def _q_get(t, field):
+            row = q_map.get(t)
+            return row.get(field) if row else None
+        df["Composite_Rating"] = df["Ticker"].apply(lambda t: _q_get(t, "Composite_Rating"))
+        df["EPS_Rating"]       = df["Ticker"].apply(lambda t: _q_get(t, "EPS_Rating"))
+        df["Acc_Dis_Rating"]   = df["Ticker"].apply(lambda t: _q_get(t, "Acc_Dis_Rating"))
+        df["UD_Vol_Ratio"]     = df["Ticker"].apply(lambda t: _q_get(t, "UD_Vol_Ratio"))
+        df["Fwd_EPS_Growth"]   = df["Ticker"].apply(lambda t: _q_get(t, "Fwd_EPS_Growth"))
 
     # Legacy cache compatibility: split Sector_Industry into two columns.
     # IMPORTANT: regex=False so the literal pipe isn't interpreted as alternation.
@@ -1491,9 +1625,16 @@ def _candidates_dataframe(candidates: list[dict]) -> pd.DataFrame:
     # almost no Momentum candidate is RS-leading-its-price (they're already in
     # Stage 2 near new highs). The signal lives where it can actually fire:
     # in the EARLY scan against the full universe.
+    # Column order — Quality-parity columns (Composite/EPS/A_D/UDVol/FwdEPS)
+    # inserted after Tier so the "quality ratings" cluster is co-located near
+    # the front of the table where the eye lands first.
     column_order = [
-        "Ticker", "Tier", "RS", "RSI", "PEG", "Signals_Display", "Warnings_Display",
+        "Ticker", "Tier",
+        "Composite_Rating", "EPS_Rating", "Acc_Dis_Rating", "UD_Vol_Ratio",
+        "RS", "RSI", "PEG",
+        "Signals_Display", "Warnings_Display",
         "RS_NH", "VCP_Quality", "VDU", "Pressure_20d", "Fundamentals",
+        "Fwd_EPS_Growth",
         "Price", "Buy_Trigger", "Stop", "Risk_Pct",
         "Pct_Above_50MA", "Vol_vs_Avg", "Days_To_Earnings", "Earnings_Date",
         "Index", "Industry_Rank", "Sector", "Market_Cap", "Industry",
@@ -1509,13 +1650,14 @@ def _render_results_table(scan: dict):
         st.info("No candidates passed the screen. The market may be in a bad regime, or settings are too strict.")
         return
 
-    # Initialize toggle state for the 9 filter buttons (persists across reruns).
-    # PEAD + RETEST + BZ-LITE added 2026-08-04 for post-FTD regime capture and
-    # VCP-independent wide funnel — see the signals section of the TOC dialog
-    # for their criteria.
-    for _k in ("flt_trade_now", "flt_watch_list", "flt_vcp_ab", "flt_vcp_b",
-                "flt_breakout", "flt_buy_zone", "flt_bz_lite",
-                "flt_pead", "flt_retest"):
+    # Initialize toggle state for the 8 filter buttons (persists across reruns).
+    # 2026-08-04: added PEAD + RETEST.
+    # 2026-08-07: added EP. Removed BZ-LITE and WATCH LIST (user asked to
+    # simplify the row and BZ-LITE wasn't earning its keep — see signal-
+    # dedupe explanation kept in the git history for future reference).
+    for _k in ("flt_trade_now", "flt_vcp_ab", "flt_vcp_b",
+                "flt_breakout", "flt_buy_zone",
+                "flt_pead", "flt_retest", "flt_ep"):
         if _k not in st.session_state:
             st.session_state[_k] = False
 
@@ -1529,7 +1671,6 @@ def _render_results_table(scan: dict):
         except Exception:
             return 0
     n_trade_now = _count(df["Tier"] == "A") if "Tier" in df.columns else 0
-    n_watch_list = _count(df["Tier"] == "B") if "Tier" in df.columns else 0
     n_vcp_ab = (
         _count(df["VCP_Quality"] == "A")
         if "VCP_Quality" in df.columns else 0
@@ -1543,18 +1684,7 @@ def _render_results_table(scan: dict):
         if "Signals_Display" in df.columns else 0
     )
     n_buy_zone = (
-        # word-boundary regex so "BUY ZONE" doesn't accidentally count BZ-LITE
-        # rows (unlikely given naming, but future-proof).
-        _count(df["Signals_Display"].astype(str).str.contains(r"\bBUY ZONE\b", na=False, regex=True))
-        if "Signals_Display" in df.columns else 0
-    )
-    # BZ-LITE count = SUPERSET of BUY ZONE + BZ-LITE-only. The signals
-    # themselves are deduped (a stock tagged BUY ZONE is NOT also tagged
-    # BZ-LITE), but the filter surfaces the union — that's the "widen the
-    # funnel" behavior the user asked for. Count reflects what clicking the
-    # BZ-LITE button will actually display.
-    n_bz_lite = (
-        _count(df["Signals_Display"].astype(str).str.contains(r"(?:BUY ZONE|BZ-LITE)", na=False, regex=True))
+        _count(df["Signals_Display"].astype(str).str.contains("BUY ZONE", na=False))
         if "Signals_Display" in df.columns else 0
     )
     n_pead = (
@@ -1563,6 +1693,11 @@ def _render_results_table(scan: dict):
     )
     n_retest = (
         _count(df["Signals_Display"].astype(str).str.contains("RETEST", na=False))
+        if "Signals_Display" in df.columns else 0
+    )
+    n_ep = (
+        # Word-boundary regex so EP doesn't match PEAD as a substring.
+        _count(df["Signals_Display"].astype(str).str.contains(r"\bEP\b", na=False, regex=True))
         if "Signals_Display" in df.columns else 0
     )
 
@@ -1631,10 +1766,12 @@ def _render_results_table(scan: dict):
     except Exception:
         _cohort_label = "📊 COHORT"
 
-    # 10-column filter row (BZ-LITE added 2026-08-04 right after BUY ZONE
-    # since they're conceptual siblings — full-quality vs wider-funnel).
-    (fcol_bz, fcol_bzl, fcol_retest, fcol_pead, fcol_breakout,
-     fcol_vcpa, fcol_vcpb, fcol_trade, fcol_watch, fcol_ct) = st.columns(10)
+    # 9-column filter row (rebuilt 2026-08-07). Removed BZ-LITE + WATCH LIST
+    # per user request. Added EP (Episodic Pivot) between RETEST and PEAD.
+    # All columns are equal-width so COHORT is visually identical to the
+    # other filter buttons.
+    (fcol_bz, fcol_retest, fcol_ep, fcol_pead, fcol_breakout,
+     fcol_vcpa, fcol_vcpb, fcol_trade, fcol_ct) = st.columns(9)
 
     with fcol_bz:
         label = _btn_label("BUY ZONE", st.session_state.flt_buy_zone, n_buy_zone)
@@ -1648,21 +1785,6 @@ def _render_results_table(scan: dict):
             st.session_state.flt_buy_zone = not st.session_state.flt_buy_zone
             st.rerun()
         buy_zone_only = st.session_state.flt_buy_zone
-    with fcol_bzl:
-        label = _btn_label("BZ-LITE", st.session_state.flt_bz_lite, n_bz_lite)
-        if st.button(label, type="primary", use_container_width=True, key="btn_bz_lite",
-                     help="SUPERSET of BUY ZONE — shows every BUY ZONE candidate PLUS "
-                          "stocks that meet the same pressure, near-50MA, and $20M ADV "
-                          "gates but LACK a formal VCP grade. Catches stocks in high-vol "
-                          "regimes where clean VCP structure can't form but the "
-                          "institutional-accumulation signature is still there. Signal "
-                          "column shows either BUY ZONE (with VCP) or BZ-LITE (without) "
-                          "— never both — but the filter surfaces the union. Use when "
-                          "BUY ZONE narrows and you want a wider candidate pool. Expect "
-                          "more false positives than full BUY ZONE — sift charts manually."):
-            st.session_state.flt_bz_lite = not st.session_state.flt_bz_lite
-            st.rerun()
-        bz_lite_only = st.session_state.flt_bz_lite
     with fcol_retest:
         label = _btn_label("RETEST", st.session_state.flt_retest, n_retest)
         if st.button(label, type="primary", use_container_width=True, key="btn_retest",
@@ -1670,20 +1792,31 @@ def _render_results_table(scan: dict):
                           "BO TODAY 3-15 sessions ago (recorded in the persistent breakout "
                           "log), held above the pivot since, and today is within 3% of the "
                           "original pivot on quiet volume. Minervini 'add on strength' "
-                          "setup — proven breakout, lower-risk price. Highest-hit-rate "
-                          "signal of the newer additions."):
+                          "setup — proven breakout, lower-risk price."):
             st.session_state.flt_retest = not st.session_state.flt_retest
             st.rerun()
         retest_only = st.session_state.flt_retest
+    with fcol_ep:
+        label = _btn_label("EP", st.session_state.flt_ep, n_ep)
+        if st.button(label, type="primary", use_container_width=True, key="btn_ep",
+                     help="Episodic Pivot (Qullamaggie-style, added 2026-08-07). "
+                          "Big catalyst-day gap-up: gap ≥8%, volume ≥3x 50d avg, "
+                          "closed in upper half of day's range, FROM a neglected base "
+                          "(pct_50ma ≤20% before the move, prior 20d ATR ≤5% of price). "
+                          "Fires on the day of the gap or one session later — a short "
+                          "entry window on the unfakeable institutional footprint. "
+                          "Rare (typically 0-3 per scan), high-conviction when it fires."):
+            st.session_state.flt_ep = not st.session_state.flt_ep
+            st.rerun()
+        ep_only = st.session_state.flt_ep
     with fcol_pead:
         label = _btn_label("PEAD", st.session_state.flt_pead, n_pead)
         if st.button(label, type="primary", use_container_width=True, key="btn_pead",
                      help="Post-Earnings Announcement Drift. Stock beat earnings 3-15 "
                           "sessions ago (5%+ gap on 2x+ vol, closed strong), held above "
                           "the gap-open since, quieted down on volume, and is now within "
-                          "5% of the post-earnings high. Fundamentally-driven consolidations "
-                          "that often precede the next breakout — captures the regime where "
-                          "VCP fails and BUY ZONE narrows."):
+                          "5% of the post-earnings high. The second-chance filter after "
+                          "EP's entry window closes."):
             st.session_state.flt_pead = not st.session_state.flt_pead
             st.rerun()
         pead_only = st.session_state.flt_pead
@@ -1692,9 +1825,7 @@ def _render_results_table(scan: dict):
         if st.button(label, type="primary", use_container_width=True, key="btn_breakout",
                      help="Stocks that broke out above pivot today on volume — four gates: "
                           "close > pivot, volume ≥1.5x 50d avg, up on the day (close > prior "
-                          "close), and close in upper half of today's range. Tightened "
-                          "2026-08-04 to eliminate false positives on big red down days "
-                          "that happen to close above an old pivot."):
+                          "close), and close in upper half of today's range."):
             st.session_state.flt_breakout = not st.session_state.flt_breakout
             st.rerun()
         breakout_only = st.session_state.flt_breakout
@@ -1719,13 +1850,6 @@ def _render_results_table(scan: dict):
             st.session_state.flt_trade_now = not st.session_state.flt_trade_now
             st.rerun()
         trade_now = st.session_state.flt_trade_now
-    with fcol_watch:
-        label = _btn_label("WATCH LIST", st.session_state.flt_watch_list, n_watch_list)
-        if st.button(label, type="primary", use_container_width=True, key="btn_watch_list",
-                     help="B-Tier only — looser: RS≥85, VCP A/B/C, within 10% of pivot, <25% above 50MA, fundamentals or RS new high, no earnings within 14 days. Setups developing — monitor for trigger."):
-            st.session_state.flt_watch_list = not st.session_state.flt_watch_list
-            st.rerun()
-        watch_list = st.session_state.flt_watch_list
     with fcol_ct:
         if st.button(
             _cohort_label,
@@ -1758,25 +1882,17 @@ def _render_results_table(scan: dict):
     if breakout_only and "Signals_Display" in filtered.columns:
         filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("BO TODAY", na=False)]
     if buy_zone_only and "Signals_Display" in filtered.columns:
-        # word-boundary regex so BUY ZONE filter doesn't accidentally pull in
-        # BZ-LITE rows — the two signals are deliberately deduplicated at the
-        # detector level and should be filtered separately here too.
-        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains(r"\bBUY ZONE\b", na=False, regex=True)]
-    if bz_lite_only and "Signals_Display" in filtered.columns:
-        # SUPERSET filter: match either BUY ZONE or BZ-LITE. Signals are deduped
-        # at detection time so a stock only carries one label, but the filter
-        # shows both categories together — that's the "widen the funnel" intent.
-        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains(r"(?:BUY ZONE|BZ-LITE)", na=False, regex=True)]
+        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("BUY ZONE", na=False)]
     if pead_only and "Signals_Display" in filtered.columns:
         filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("PEAD", na=False)]
     if retest_only and "Signals_Display" in filtered.columns:
         filtered = filtered[filtered["Signals_Display"].astype(str).str.contains("RETEST", na=False)]
-    # Tier filters — if both Trade Now AND Watch List are checked, show A+B
-    if (trade_now or watch_list) and "Tier" in filtered.columns:
-        accepted_tiers = []
-        if trade_now: accepted_tiers.append("A")
-        if watch_list: accepted_tiers.append("B")
-        filtered = filtered[filtered["Tier"].isin(accepted_tiers)]
+    if ep_only and "Signals_Display" in filtered.columns:
+        # Word-boundary regex so EP doesn't match PEAD as a substring.
+        filtered = filtered[filtered["Signals_Display"].astype(str).str.contains(r"\bEP\b", na=False, regex=True)]
+    # Tier filter — Trade Now only (WATCH LIST removed 2026-08-07 per user request)
+    if trade_now and "Tier" in filtered.columns:
+        filtered = filtered[filtered["Tier"] == "A"]
     if search:
         s = search.upper()
         mask = filtered["Ticker"].astype(str).str.upper().str.contains(s, na=False)
@@ -1804,6 +1920,23 @@ def _render_results_table(scan: dict):
         "Tier": st.column_config.TextColumn(
             "TIER", width="small",
             help="A = Trade Now (strict Minervini criteria) · B = Watch List (looser, setups developing) · C = qualifying but not focus-list worthy",
+        ),
+        # ---- Quality-parity columns (added 2026-08-07) ----
+        "Composite_Rating": st.column_config.NumberColumn(
+            "COMP", format="%d", width="small",
+            help="Composite Rating (1-99): IBD-style blend from Quality scan. Higher = stronger overall. Blank = ticker not in latest Quality scan.",
+        ),
+        "EPS_Rating": st.column_config.NumberColumn(
+            "EPS", format="%d", width="small",
+            help="EPS Rating (1-99): percentile of forward EPS growth vs universe (from Quality scan).",
+        ),
+        "Acc_Dis_Rating": st.column_config.TextColumn(
+            "A/D", width="small",
+            help="Accumulation/Distribution Rating from Quality scan: A+/A = strong accumulation, D/E = distribution.",
+        ),
+        "UD_Vol_Ratio": st.column_config.NumberColumn(
+            "U/D VOL", format="%.2f", width="small",
+            help="Up/Down volume ratio over 50 days (from Quality scan). >1.0 = more up-day volume. Higher = accumulation.",
         ),
         "RS": st.column_config.ProgressColumn("RS", min_value=0, max_value=99, format="%d", width="small"),
         "RSI": st.column_config.NumberColumn("RSI", format="%.1f", width="small"),
@@ -1833,6 +1966,10 @@ def _render_results_table(scan: dict):
                  "<1.0 = distribution.",
         ),
         "Fundamentals": st.column_config.TextColumn("FUND", width="small"),
+        "Fwd_EPS_Growth": st.column_config.NumberColumn(
+            "FWD EPS GR%", format="%.0f%%", width="small",
+            help="Forward EPS growth estimate (next fiscal year vs current, from Quality scan).",
+        ),
         "Price": st.column_config.NumberColumn("PRICE", format="$%.2f", width="small"),
         "Buy_Trigger": st.column_config.NumberColumn("BUY >", format="$%.2f", width="small"),
         "Stop": st.column_config.NumberColumn("STOP <", format="$%.2f", width="small"),
@@ -3824,6 +3961,9 @@ elif mode == "quality" and view not in ("quality", "deepdive"):
 elif mode == "mean_reversion" and view not in ("mean_reversion", "deepdive"):
     view = "mean_reversion"
     st.session_state.view = view
+elif mode == "movers" and view not in ("movers", "deepdive"):
+    view = "movers"
+    st.session_state.view = view
 
 if view == "deepdive" and st.session_state.deep_dive_ticker:
     render_deep_dive_page()
@@ -3845,6 +3985,10 @@ elif view == "quality":
 elif view == "mean_reversion":
     _render_mode_switcher()
     render_mean_reversion_page()
+elif view == "movers":
+    _render_mode_switcher()
+    from ui.movers_view import render_movers_page
+    render_movers_page()
 elif view == "diagnose":
     render_diagnose_page()
 else:

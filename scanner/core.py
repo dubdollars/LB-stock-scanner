@@ -35,6 +35,7 @@ from .setups import (
     detect_breakout_retest,
     detect_breakout_today,
     detect_cheat_setup,
+    detect_episodic_pivot,
     detect_extension_from_50ma,
     detect_gap_up_today,
     detect_ma_target,
@@ -43,6 +44,7 @@ from .setups import (
     detect_vcp_contractions,
     find_pivot_point,
     calculate_smart_stop,
+    robust_avg_volume,
     vcp_quality_score,
 )
 
@@ -135,6 +137,11 @@ class ScanResult:
     # See detect_market_state_and_ftds() for the full contract. Legacy
     # scan files that predate this field load with empty dict.
     market_state: dict = field(default_factory=dict)
+    # MOVERS list — reverse-funnel scan output (added 2026-08-07). Tickers
+    # up 3%+ today on 1.5x robust median volume with trend template intact
+    # and close in upper half of range. Ranked by move_pct × vol_ratio.
+    # See scanner/movers.py for the full gate spec. Legacy scans get [].
+    movers: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1330,6 +1337,61 @@ def collect_tickers(progress: ProgressCallback = None) -> tuple[list[str], set[s
         seen.add(t)
         cleaned.append(t)
 
+    # ---- Fallback: reuse last healthy scan's ticker universe -----------------
+    # (added 2026-08-07 after user got stuck when all three live ticker sources
+    # returned near-zero at night — NASDAQ Trader FTP had a hiccup.)
+    #
+    # If we didn't clear ~1500 usable tickers after de-dupe + validation, the
+    # live-fetch phase clearly failed. Rather than let the scan die (or run
+    # against 2 tickers and hit the rate-limit guardrail), read the ticker list
+    # embedded in the most recent HEALTHY scan (`industry_universe` field —
+    # every ticker that had valid RS/history when that scan ran).
+    #
+    # Caveats: list is ~24h old. Brand-new IPOs won't be there. Tickers
+    # delisted since won't be scannable but yfinance will just skip them
+    # silently (the per-ticker try/except in run_filters swallows those).
+    # Trade-off is trivial versus the alternative of "you can't scan tonight."
+    if len(cleaned) < 1500:
+        try:
+            from .cache import load_latest_scan  # local import to avoid cycles
+            latest = load_latest_scan()
+            if latest:
+                fallback_rows = latest.get("industry_universe") or []
+                fallback_tickers = [
+                    r.get("Ticker") for r in fallback_rows
+                    if r.get("Ticker")
+                ]
+                if len(fallback_tickers) >= 1500:
+                    if progress:
+                        progress(
+                            "tickers", 5, 5,
+                            f"⚠ Live ticker fetch returned only {len(cleaned)} — "
+                            f"falling back to {len(fallback_tickers)} tickers from "
+                            f"last healthy scan ({latest.get('timestamp','?')[:10]})",
+                        )
+                    # Merge — keep any live tickers we DID get (fresh IPOs
+                    # would only appear in live), plus the cached universe.
+                    fallback_set = set(fallback_tickers)
+                    for t in fallback_tickers:
+                        if t not in seen:
+                            seen.add(t)
+                            cleaned.append(t)
+                    # Also refresh sp500 / nq100 sets if they came back empty
+                    # (Wikipedia can throttle independently of the ticker feed).
+                    if not sp500:
+                        sp500 = {
+                            r.get("Ticker") for r in fallback_rows
+                            if r.get("Ticker") and r.get("Index") == "S&P500"
+                        }
+                    if not nq100:
+                        nq100 = {
+                            r.get("Ticker") for r in fallback_rows
+                            if r.get("Ticker") and r.get("Index") == "NQ100"
+                        }
+        except Exception:
+            # Fallback is best-effort — don't let it break the scan path
+            pass
+
     return cleaned, sp500, nq100
 
 
@@ -1354,6 +1416,26 @@ def _batch_yf_download(
     start_str = start_date.strftime("%Y-%m-%d") if hasattr(start_date, "strftime") else str(start_date)
     end_str = end_date.strftime("%Y-%m-%d") if (end_date is not None and hasattr(end_date, "strftime")) else None
 
+    # ---- Per-ticker retry helper (added 2026-08-17) --------------------
+    # After batched yf.download() finishes, any ticker that came back empty
+    # gets a single-call retry via yf.Ticker.history(). Diagnostic on user's
+    # box confirmed single calls work fine even when batched silently returns
+    # nothing for large chunks of the universe — this is yfinance's known
+    # failure mode under load. Small sleep between retries stays polite so
+    # we don't trigger a real 429.
+    import time as _time_retry
+
+    def _retry_single(t: str) -> "pd.DataFrame | None":
+        try:
+            d = yf.Ticker(t).history(start=start_str, end=end_str, interval="1d")
+            if d is None or d.empty:
+                return None
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(0)
+            return d
+        except Exception:
+            return None
+
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
         try:
@@ -1371,18 +1453,22 @@ def _batch_yf_download(
             # If the whole batch fails, retry one ticker at a time so a
             # single bad symbol doesn\'t poison the rest. Slow path.
             for t in batch:
-                try:
-                    d = yf.Ticker(t).history(start=start_str, end=end_str, interval="1d")
-                    if isinstance(d.columns, pd.MultiIndex):
-                        d.columns = d.columns.get_level_values(0)
-                    if not d.empty:
-                        out[t] = d
-                except Exception:
-                    continue
+                d = _retry_single(t)
+                if d is not None:
+                    out[t] = d
+                _time_retry.sleep(0.05)
             continue
 
         # Parse the MultiIndex DataFrame back into per-ticker DataFrames.
         if df is None or df.empty:
+            # Whole batch returned nothing (silent failure). Retry each
+            # ticker individually — single calls have a different failure
+            # profile and usually still work.
+            for t in batch:
+                d = _retry_single(t)
+                if d is not None:
+                    out[t] = d
+                _time_retry.sleep(0.05)
             continue
         if isinstance(df.columns, pd.MultiIndex):
             # group_by="ticker" → top-level keys are tickers
@@ -1404,6 +1490,22 @@ def _batch_yf_download(
                         out[batch[0]] = sub
                 except Exception:
                     pass
+
+        # ---- Per-ticker gap fill for THIS batch (added 2026-08-17) ----
+        # Even when the batched call "succeeded" (no exception, non-empty
+        # DataFrame), individual tickers within the batch commonly come back
+        # empty because of yfinance's silent-drop behavior under parallel
+        # load. Sweep the batch and retry each missing ticker individually.
+        # Small delay keeps us polite so we don't turn one bad batch into
+        # a 429 cascade.
+        _missing = [t for t in batch if t not in out]
+        if _missing:
+            for t in _missing:
+                d = _retry_single(t)
+                if d is not None:
+                    out[t] = d
+                _time_retry.sleep(0.05)
+
     return out
 
 
@@ -1512,15 +1614,182 @@ def download_history_and_rs(
                 cached_dfs[t] = df
                 save_price_history(t, df)
 
+    # ---- Stooq fallback (added 2026-08-07) ----------------------------
+    # Yahoo Finance throttles retail IPs, especially at night. When yfinance
+    # returns empty DataFrames for large chunks of the universe, we lose the
+    # scan. Stooq is a free European stock-data mirror with almost no
+    # throttling on retail volume — perfect as a secondary source. We
+    # calculate the expected-latest-trading-day first, then for every ticker
+    # whose most-recent bar is behind that date, hit Stooq to fill the gap.
+    #
+    # This runs autonomously — no user has to watch or intervene. If Yahoo
+    # served everything fresh, nothing happens (Stooq round-trip skipped).
+    # If Yahoo failed on 2,500 tickers, Stooq refills them and the scan
+    # completes with real, current prices.
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt_stoo, timedelta as _td_stoo, time as _time_stoo
+        _now_et_stoo = _dt_stoo.now(ZoneInfo("America/New_York"))
+        _et_today_stoo = _now_et_stoo.date()
+        if _et_today_stoo.weekday() == 5:
+            _expected_stoo = _et_today_stoo - _td_stoo(days=1)
+        elif _et_today_stoo.weekday() == 6:
+            _expected_stoo = _et_today_stoo - _td_stoo(days=2)
+        elif _now_et_stoo.time() < _time_stoo(16, 0):
+            _prev = _et_today_stoo - _td_stoo(days=1)
+            while _prev.weekday() >= 5:
+                _prev -= _td_stoo(days=1)
+            _expected_stoo = _prev
+        else:
+            _expected_stoo = _et_today_stoo
+    except Exception:
+        _expected_stoo = None
+
+    if _expected_stoo is not None:
+        # Which tickers still need a fresh bar? Include:
+        #   * Tickers we know about but yfinance never returned data for
+        #   * Tickers whose last cached bar is behind expected_latest
+        _needs_stooq: list[str] = []
+        for _t in tickers:
+            _cd = cached_dfs.get(_t)
+            if _cd is None or (hasattr(_cd, "empty") and _cd.empty):
+                _needs_stooq.append(_t)
+                continue
+            try:
+                _last = _cd.index.max()
+                _last_d = _last.date() if hasattr(_last, "date") else None
+                if _last_d is None or _last_d < _expected_stoo:
+                    _needs_stooq.append(_t)
+            except Exception:
+                _needs_stooq.append(_t)
+
+        if _needs_stooq and progress:
+            progress("history", total, total,
+                     f"Yahoo missed {len(_needs_stooq)} tickers — trying Stooq fallback…")
+
+        if _needs_stooq:
+            try:
+                from .stooq import fetch_stooq_batch
+                # Stooq is friendly but not infinite — cap workers to 4.
+                # Cap ticker count too; if truly everything is missing we're
+                # in a total outage and 3,000 sequential HTTP calls at 4-wide
+                # parallelism = ~15 minutes. Worth it (user is not watching).
+                _stooq_progress_last = [0]
+                def _stooq_cb(done, tot, current):
+                    # Only fire every 100 to avoid spamming the UI
+                    if done - _stooq_progress_last[0] >= 100 or done == tot:
+                        _stooq_progress_last[0] = done
+                        if progress:
+                            progress("history", total, total,
+                                     f"Stooq fallback: {done}/{tot} tickers filled")
+
+                stooq_dfs = fetch_stooq_batch(
+                    _needs_stooq,
+                    start_date=start_dt.date() if hasattr(start_dt, "date") else None,
+                    end_date=end_dt.date() if hasattr(end_dt, "date") else None,
+                    workers=4,
+                    progress_cb=_stooq_cb,
+                )
+                # Merge Stooq data into the assembled cache. Persist to disk
+                # so the price cache reflects the freshest source we have.
+                for _t, _df in stooq_dfs.items():
+                    if _df is None or _df.empty:
+                        continue
+                    # If we had an older cached DF, merge history so we don't
+                    # lose the deep past when Stooq returns a shorter window.
+                    _prior = cached_dfs.get(_t)
+                    if _prior is not None and not _prior.empty:
+                        try:
+                            _merged = merge_price_history(_prior, _df)
+                        except Exception:
+                            _merged = _df
+                    else:
+                        _merged = _df
+                    cached_dfs[_t] = _merged
+                    try:
+                        save_price_history(_t, _merged)
+                    except Exception:
+                        pass
+
+                if progress:
+                    progress("history", total, total,
+                             f"Stooq fallback complete — refilled {len(stooq_dfs)} of {len(_needs_stooq)} tickers")
+            except Exception as _e:
+                if progress:
+                    progress("history", total, total,
+                             f"Stooq fallback failed ({type(_e).__name__}) — proceeding with what we have")
+
     # --- Apply liquidity filter + RS computation on assembled cache ---
     stock_cache: dict[str, pd.DataFrame] = {}
     rs_list: list[dict] = []
     skipped_liquidity = 0
     skipped_history = 0
+    skipped_stale = 0
+    stale_tickers: list[str] = []  # for diagnostics
 
     if progress:
         progress("history", total, total,
                  f"Computing RS for {len(cached_dfs)} tickers (cache: {n_fresh} fresh, {n_incr} warm, {n_full} cold)...")
+
+    # Compute EXPECTED-LATEST-TRADING-DAY based on ET wall-clock time. This
+    # replaces a naive "> N calendar days" threshold (added 2026-08-07,
+    # tightened same day) that let 1-day-stale data through: user reported
+    # VSXY/DGII/ARW/AVT showing Wednesday closes in a Thursday-evening scan
+    # because the incremental yf.download silently failed for those tickers
+    # and my 4-day tolerance passed the stale data as "fresh enough."
+    #
+    # The right rule: what's the most recent trading-day bar we EXPECT to
+    # have available right now? A ticker whose cache is behind that date
+    # was not refreshed successfully and shouldn't be trusted.
+    #
+    # Cases:
+    #   Weekend (Sat/Sun)                → Friday
+    #   Weekday BEFORE 4pm ET (mkt open) → yesterday's trading day
+    #                                       (today's bar not finalized yet)
+    #   Weekday AFTER 4pm ET             → today
+    #
+    # Uses ET for the wall-clock reference; falls back to a permissive
+    # 4-day threshold if zoneinfo isn't available.
+    _STALENESS_LIMIT_DAYS = 4  # fallback only — real check is expected_latest
+    expected_latest = today_date
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt, timedelta as _td, time as _time
+        now_et = _dt.now(ZoneInfo("America/New_York"))
+        et_today = now_et.date()
+        # Roll back to the previous weekday if today is Sat/Sun.
+        # 0=Mon..4=Fri, 5=Sat, 6=Sun.
+        if et_today.weekday() == 5:      # Saturday
+            expected_latest = et_today - _td(days=1)      # Friday
+        elif et_today.weekday() == 6:    # Sunday
+            expected_latest = et_today - _td(days=2)      # Friday
+        elif now_et.time() < _time(16, 0):
+            # Weekday before 4pm ET — today's bar isn't final yet.
+            # Expect yesterday. If yesterday was weekend, roll to Friday.
+            prev = et_today - _td(days=1)
+            while prev.weekday() >= 5:
+                prev -= _td(days=1)
+            expected_latest = prev
+        else:
+            expected_latest = et_today
+    except Exception:
+        expected_latest = None
+
+    # Two-tier collection: candidates whose cache IS current, and a fallback
+    # bucket for candidates whose cache is stale (Yahoo silently failed to
+    # refresh them). Added 2026-08-07 after user reported repeated 2-ticker
+    # scans: yfinance was throttling ALL incremental fetches, my strict
+    # staleness gate dropped everything with cached data, and only two
+    # tickers (auto-refreshed by the Journal's Refresh Prices button)
+    # survived. Result: user was locked out for hours on end.
+    #
+    # New logic: collect stale drops into a side bucket rather than tossing
+    # them. If the strict-pass survivor pool is healthy (>= 1500), we
+    # discard the stale bucket like before — normal behavior. If the strict
+    # pool is too small (Yahoo outage), we adopt the stale bucket into the
+    # scan universe with a loud warning banner. Better to trade on
+    # 1-3-day-old prices with eyes open than not scan at all.
+    _stale_pool: dict[str, tuple[pd.DataFrame, int]] = {}  # ticker → (df, days_stale)
 
     for ticker, raw_df in cached_dfs.items():
         try:
@@ -1530,6 +1799,45 @@ def download_history_and_rs(
             if len(df) < 252:
                 skipped_history += 1
                 continue
+            # Staleness check — drop tickers whose most recent bar is BEHIND
+            # the expected-latest-trading-day (computed above). Catches the
+            # yfinance silent-fetch-failure case where a ticker in the
+            # incremental batch didn't return data and we fell back to
+            # yesterday's cache. When expected_latest computation failed
+            # (zoneinfo missing), fall back to a permissive calendar-day
+            # threshold so we don't accidentally drop everything.
+            is_stale = False
+            days_stale = 0
+            try:
+                last_bar = df.index.max()
+                last_bar_date = last_bar.date() if hasattr(last_bar, "date") else None
+                if last_bar_date is not None:
+                    if expected_latest is not None:
+                        if last_bar_date < expected_latest:
+                            days_stale = (expected_latest - last_bar_date).days
+                            is_stale = True
+                    else:
+                        # Fallback path — zoneinfo unavailable
+                        _days_behind = (today_date - last_bar_date).days
+                        if _days_behind > _STALENESS_LIMIT_DAYS:
+                            days_stale = _days_behind
+                            is_stale = True
+            except Exception:
+                # Bad index / missing date — treat as fresh rather than dropping
+                # legitimate data on a metadata quirk. Safe fallback.
+                pass
+
+            if is_stale:
+                # Cap stale-tolerance at 7 calendar days. Beyond that the data
+                # is genuinely obsolete (delisting, extended outage) and worth
+                # dropping even in the Yahoo-outage fallback path.
+                if days_stale <= 7:
+                    _stale_pool[ticker] = (df, days_stale)
+                skipped_stale += 1
+                if len(stale_tickers) < 50:
+                    stale_tickers.append(f"{ticker}({days_stale}d)")
+                continue
+
             current_price = df["Close"].iloc[-1]
             avg_volume = df["Volume"].rolling(50).mean().iloc[-1]
             if current_price < settings.min_price:
@@ -1556,6 +1864,12 @@ def download_history_and_rs(
         except Exception:
             continue
 
+    # NOTE: A "stale-cache fallback" was added and immediately reverted here on
+    # 2026-08-07 — adopting 1-3-day-old prices to complete a scan created a
+    # dashboard the user couldn't trust (breakouts "today" that were actually
+    # Monday's, etc.). Fresh data or no data — no half-measures on prices.
+    # See _stale_pool above: kept for diagnostic visibility only, not adopted.
+
     rs_df = pd.DataFrame(rs_list).dropna(subset=["Raw_Score"]) if rs_list else pd.DataFrame(columns=["Ticker", "Raw_Score"])
     if len(rs_df):
         rs_df["Rank_Pct"] = rs_df["Raw_Score"].rank(pct=True)
@@ -1563,6 +1877,18 @@ def download_history_and_rs(
         rs_map = rs_df.set_index("Ticker")["RS_Rating"].to_dict()
     else:
         rs_map = {}
+
+    # Log stale drops so the user has visibility. Sample of ticker + how many
+    # trading days behind is included when the count is small enough to be
+    # useful. These are tickers where yfinance's incremental refresh failed
+    # to return today's bar — best to drop them than to trade on stale data.
+    if progress and skipped_stale > 0:
+        sample = ", ".join(stale_tickers[:15])
+        more = f" (+{skipped_stale - 15} more)" if skipped_stale > 15 else ""
+        progress(
+            "history", total, total,
+            f"Dropped {skipped_stale} tickers with stale data (yfinance fetch failure): {sample}{more}",
+        )
 
     return stock_cache, rs_df, rs_map, skipped_history, skipped_liquidity
 
@@ -2224,6 +2550,7 @@ def _build_signals_warnings(
     market_state: Optional[dict] = None,
     pead: Optional[dict] = None,
     breakout_retest: Optional[dict] = None,
+    ep: Optional[dict] = None,
 ) -> tuple[list[str], list[str]]:
     """Build the green-signal + red-warning tag lists for a candidate.
 
@@ -2310,50 +2637,17 @@ def _build_signals_warnings(
     )
     if in_buy_zone:
         signals.append("BUY ZONE")
-
-    # ---- BZ-LITE (added 2026-08-04, revised same day) ----
-    # BUY ZONE variant that drops the VCP-grade quality requirement. Catches
-    # stocks in high-vol regimes where clean VCP structure can't form but the
-    # underlying institutional-accumulation signature (pressure_20d up,
-    # near 50MA, adequate liquidity) is still present.
-    #
-    # First-attempt (2026-08-04 morning) added `range_ratio_5v20 <= 1.30` as a
-    # "quality substitute for VCP." Result: 0 candidates. Root cause: vol
-    # contraction IS essentially what VCP measures. Stocks that fail VCP
-    # grading also tend to fail a vol-ratio gate, so the "substitute" just
-    # recreated the original requirement in a different shape. Removed.
-    #
-    # Gates now (three required):
-    #   - pressure_20d >= floor    (same as BUY ZONE, adapts to state)
-    #   - -3% <= pct_50ma <= max   (same as BUY ZONE, adapts to state)
-    #   - avg_dollar_volume_20d >= $20M (same liquidity floor)
-    #
-    # SIGNAL SEMANTICS: dedup remains. A stock with VCP grade A/B/C that meets
-    # all other BUY ZONE gates is tagged BUY ZONE only; it will NOT also carry
-    # a BZ-LITE tag. Keeps the Signals column clean and per-signal counts
-    # unambiguous.
-    #
-    # FILTER SEMANTICS: the BZ-LITE FILTER button (in app.py) shows the
-    # SUPERSET — every BUY ZONE stock PLUS every BZ-LITE-only stock. That
-    # matches the user's mental model of "a wider funnel." The filter-level
-    # superset is enforced in the filter-apply logic, not here.
-    #
-    # Note that all candidates in run_filters already pass the Minervini
-    # trend template (price > 50 > 150 > 200, 200MA rising, RS >= 70/85),
-    # so BZ-LITE isn't loosening trend quality — just the base-pattern gate.
-    in_buy_zone_lite = (
-        not in_buy_zone  # dedup: don't dual-tag; superset happens at filter time
-        and pressure_20d >= pressure_floor
-        and -3.0 <= pct_50ma <= pct_50ma_max
-        and avg_dollar_volume_20d >= _MIN_BUY_ZONE_DOLLAR_VOLUME
-    )
-    if in_buy_zone_lite:
-        signals.append("BZ-LITE")
     # RETEST — pullback to a prior breakout pivot on quiet volume. Ranked
     # high-priority because these are second-entries into proven leaders
     # (Minervini "add on strength"). Added 2026-08-04.
     if breakout_retest and breakout_retest.get("is_retest"):
         signals.append("RETEST")
+    # EP — Qullamaggie Episodic Pivot (added 2026-08-07). Big catalyst-day
+    # gap-up (8%+ on 3x+ volume) from a neglected base. Ranked between
+    # RETEST and PEAD because it's the day-of / day-1 catalyst signal —
+    # highest-conviction fresh setup after RETEST's second-entry.
+    if ep and ep.get("is_ep"):
+        signals.append("EP")
     # PEAD — Post-Earnings Announcement Drift. Ranked ahead of BO TODAY
     # because it identifies fundamentally-driven consolidations that often
     # PRECEDE the breakout. Added 2026-08-04.
@@ -2482,7 +2776,17 @@ def run_filters(
             risk_pct = (risk_per_share / buy_trigger) * 100
 
             curr_vol = data["Volume"].iloc[-1]
-            avg_vol_50 = data["Volume"].rolling(50).mean().iloc[-1]
+            # Robust median-of-cleaned average (2026-08-07). Naive mean gets
+            # inflated by 1-2 outlier days (earnings, buyout news, index-add
+            # spikes) — a stock with a 6M-share earnings print looks like it
+            # normally trades ~420k/day even if its typical day is 300k, so
+            # a legitimate 350k accumulation day fails the 1.5x-avg gate.
+            # This value feeds EVERY volume-based detector: BREAKOUT, GAP UP,
+            # EP, CHEAT, PEAD, RETEST, VDU. Fix here fixes all of them.
+            _avg = robust_avg_volume(data["Volume"], window=50, drop_top_pct=0.05)
+            # Legacy naive value only used as a fallback if robust returned None
+            # (window too short, all zeros). Keeps behavior stable on new IPOs.
+            avg_vol_50 = _avg if _avg is not None else float(data["Volume"].rolling(50).mean().iloc[-1] or 0)
             if curr_vol < (avg_vol_50 * 0.5):
                 vdu_display = "Extreme"
             elif curr_vol < avg_vol_50:
@@ -2615,6 +2919,17 @@ def run_filters(
                 float(avg_vol_50) if avg_vol_50 else None,
             )
 
+            # EP — Qullamaggie-style Episodic Pivot (added 2026-08-07).
+            # Big catalyst-day gap-up (8%+ on 3x+ volume) from a neglected
+            # base. Fires day-of-gap or day-after — a short entry window on
+            # the unfakeable institutional footprint. Orthogonal to BUY
+            # ZONE (anticipatory), PEAD (drift phase), and BREAKOUT
+            # (pivot-cross). See detect_episodic_pivot for full gate spec.
+            ep = detect_episodic_pivot(
+                data, float(avg_vol_50) if avg_vol_50 else None,
+                pct_above_50ma=extension.get("pct_above_50ma") if extension else None,
+            )
+
             signals, warnings_list = _build_signals_warnings(
                 breakout=breakout, power_play=power_play,
                 rs_new_high=rs_new_high_bool, vcp=vcp_quality,
@@ -2628,6 +2943,7 @@ def run_filters(
                 market_state=market_state,
                 pead=pead,
                 breakout_retest=breakout_retest,
+                ep=ep,
             )
 
             sector_val, industry_val = sector_map.get(ticker, ("N/A", "N/A"))
@@ -2807,6 +3123,34 @@ def run_scan(settings: ScanSettings, progress: ProgressCallback = None) -> ScanR
         market_state=market_state,
     )
 
+    # ---- MOVERS reverse funnel (added 2026-08-07) ----------------------
+    # Runs against the FULL stock_cache (not just Momentum candidates) so it
+    # can surface leadership our structural funnel would exclude. Cheap
+    # because it reuses the already-downloaded price data — no additional
+    # network calls. Typically finds 20-80 names on a healthy tape day.
+    movers_rows: list = []
+    try:
+        if progress:
+            progress("filter", 1, 1, "Computing MOVERS (reverse funnel)...")
+        from .movers import find_movers
+        movers_rows = find_movers(
+            stock_cache=stock_cache,
+            rs_map=rs_map,
+            sector_map=sector_map,
+            mktcap_map=mktcap_map,
+            industry_ranks=industry_ranks,
+            momentum_candidates=candidates,
+            sp500_set=sp500_set,
+            nq100_set=nq100_set,
+        )
+        if progress:
+            progress("filter", 1, 1, f"MOVERS: {len(movers_rows)} tickers moving on demand today")
+    except Exception as _e:
+        # MOVERS is a best-effort supplement — never fail the whole scan
+        # if it errors. Momentum results still ship normally.
+        if progress:
+            progress("filter", 1, 1, f"MOVERS scan skipped ({type(_e).__name__})")
+
     if progress:
         progress("done", 1, 1, "Scan complete")
 
@@ -2855,4 +3199,5 @@ def run_scan(settings: ScanSettings, progress: ProgressCallback = None) -> ScanR
         skipped_liquidity=skipped_liquidity,
         industry_ranks=industry_ranks,
         industry_universe=industry_universe_rows,
+        movers=movers_rows,
     )

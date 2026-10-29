@@ -26,6 +26,50 @@ import pandas as pd
 
 
 # ---------------------------------------------------------------------------
+# Robust average volume (added 2026-08-07)
+# ---------------------------------------------------------------------------
+
+def robust_avg_volume(
+    volumes: pd.Series,
+    window: int = 50,
+    drop_top_pct: float = 0.05,
+) -> Optional[float]:
+    """Return a spike-resistant "typical volume" for the last `window` sessions.
+
+    Motivation
+    ----------
+    Naive `Volume.rolling(50).mean()` gets inflated by 1-2 outlier days
+    (earnings prints, buyout news, index-add spikes). A stock that normally
+    trades 300k/day but had a 6M share earnings day sees its 50-day mean
+    balloon to ~420k, so a "normal" 350k day fails a 1.5x-avg-volume gate
+    even though relative to a typical day it's a legitimate 1.17x expansion.
+
+    Fix: take the last `window` sessions, drop the top `drop_top_pct`
+    (5% default → drops the top 2-3 days out of 50), then return the
+    MEDIAN of what remains. Median is 30-50% more resistant to remaining
+    outliers than the mean.
+
+    Returns None if the series is too short or every value is zero/NaN.
+    """
+    try:
+        if volumes is None or len(volumes) < window:
+            return None
+        tail = volumes.tail(window).astype(float).dropna()
+        if tail.empty:
+            return None
+        # Drop the top N days as spike defence.
+        n_drop = max(1, int(round(len(tail) * drop_top_pct)))
+        if n_drop < len(tail):
+            trimmed = tail.nlargest(len(tail) - n_drop, keep="first")
+        else:
+            trimmed = tail
+        med = float(trimmed.median())
+        return med if med > 0 else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # ATR
 # ---------------------------------------------------------------------------
 
@@ -783,6 +827,167 @@ def detect_gap_up_today(df: pd.DataFrame, avg_vol_50: Optional[float]) -> dict:
                     out["fail_reason"] = f"failed_{name}"
                     break
         out["is_gap_up"] = bool(is_gap_up)
+    except Exception as e:
+        out["fail_reason"] = f"error:{type(e).__name__}"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# EP — Episodic Pivot (added 2026-08-07)
+# ---------------------------------------------------------------------------
+
+def detect_episodic_pivot(
+    df: pd.DataFrame,
+    avg_vol_50: Optional[float],
+    pct_above_50ma: Optional[float] = None,
+) -> dict:
+    """Detect a Qullamaggie-style Episodic Pivot.
+
+    An EP is a big catalyst-day gap-up from a neglected base — the
+    unfakeable institutional footprint that says someone big just started
+    accumulating. The setup fires on the day OF the gap or the immediately
+    following session, giving the trader a short entry window before the
+    move develops into a full trend.
+
+    Distinct from GAP UP (which fires at 2%+ gap on 1.5x volume — too
+    permissive for the EP concept) and from PEAD (which fires 3-15 sessions
+    AFTER, during the consolidation phase). EP is the catalyst-day-itself
+    signal.
+
+    Six gates required (all must fire on the same session):
+      1. Gap >= 8%           — real institutional-scale open, not drift
+      2. Volume >= 3x 50d    — unfakeable size, retail can't produce this
+      3. Close in upper half — held the gap through the close (close_pos >= 0.5)
+      4. Not extended        — pct_above_50ma at CLOSE OF PRIOR DAY <= 20%
+                               (the base was still reasonable before the move)
+      5. Prior vol modest    — 20-day ATR / prior close <= 5% (rules out
+                               already-parabolic names where the gap is
+                               continuation of an existing tear)
+      6. Signal window       — day of gap (i.e. today) OR one session ago;
+                               after day-1 the entry window is over — PEAD
+                               takes over as the second-chance filter
+
+    Returns dict with:
+      is_ep              — bool
+      gap_pct            — the catalyst-day gap size
+      vol_ratio          — vol as multiple of 50d avg on the catalyst day
+      close_pos          — where in the day's range price closed (0-1)
+      pct_50ma_pre       — pct above 50ma at prior close (neglect gauge)
+      atr_pct_pre        — 20d ATR / prior close (parabolic gauge)
+      days_since_gap     — 0 if today, 1 if yesterday
+      fail_reason        — human-readable reason if is_ep == False
+    """
+    out = {
+        "is_ep":           False,
+        "gap_pct":         None,
+        "vol_ratio":       None,
+        "close_pos":       None,
+        "pct_50ma_pre":    None,
+        "atr_pct_pre":     None,
+        "days_since_gap":  None,
+        "fail_reason":     "",
+    }
+
+    if df is None or len(df) < 55:
+        out["fail_reason"] = "insufficient_history"
+        return out
+    if avg_vol_50 is None or avg_vol_50 <= 0:
+        out["fail_reason"] = "no_avg_volume"
+        return out
+
+    try:
+        # Check today (offset=1) and yesterday (offset=2) as the catalyst day.
+        # Take the strongest by gap * vol.
+        candidates = []
+        for offset in (1, 2):
+            if offset >= len(df):
+                continue
+            try:
+                bar_open  = float(df["Open"].iloc[-offset])
+                bar_close = float(df["Close"].iloc[-offset])
+                bar_high  = float(df["High"].iloc[-offset])
+                bar_low   = float(df["Low"].iloc[-offset])
+                bar_vol   = float(df["Volume"].iloc[-offset])
+                prev_close = float(df["Close"].iloc[-offset - 1])
+                if prev_close <= 0 or avg_vol_50 <= 0:
+                    continue
+                gap_pct = (bar_open - prev_close) / prev_close * 100
+                vol_ratio = bar_vol / avg_vol_50
+                rng = bar_high - bar_low
+                close_pos = ((bar_close - bar_low) / rng) if rng > 0 else 0.5
+                candidates.append({
+                    "offset":    offset,
+                    "gap_pct":   gap_pct,
+                    "vol_ratio": vol_ratio,
+                    "close_pos": close_pos,
+                    "prev_close": prev_close,
+                })
+            except Exception:
+                continue
+
+        if not candidates:
+            out["fail_reason"] = "no_catalyst_bar"
+            return out
+
+        # Pick the strongest candidate by gap * vol product.
+        ep_bar = max(candidates, key=lambda c: c["gap_pct"] * c["vol_ratio"])
+        out["gap_pct"]        = round(ep_bar["gap_pct"], 2)
+        out["vol_ratio"]      = round(ep_bar["vol_ratio"], 2)
+        out["close_pos"]      = round(ep_bar["close_pos"], 2)
+        out["days_since_gap"] = ep_bar["offset"] - 1
+
+        # ---- Gate 1: gap >= 8% ----
+        if ep_bar["gap_pct"] < 8.0:
+            out["fail_reason"] = f"gap_only_{round(ep_bar['gap_pct'],1)}pct"
+            return out
+
+        # ---- Gate 2: volume >= 3x 50d avg ----
+        if ep_bar["vol_ratio"] < 3.0:
+            out["fail_reason"] = f"vol_only_{round(ep_bar['vol_ratio'],1)}x"
+            return out
+
+        # ---- Gate 3: closed in upper half of range ----
+        if ep_bar["close_pos"] < 0.5:
+            out["fail_reason"] = "closed_weak"
+            return out
+
+        # ---- Gate 4: NOT extended before the gap ----
+        # Compute pct_50ma using the CLOSE of the day BEFORE the catalyst
+        # (i.e., the base state before the move happened). Using post-gap
+        # pct_50ma would trivially fail — the gap itself pushes it up.
+        prev_bar_idx = -ep_bar["offset"] - 1
+        try:
+            pre_gap_close = float(df["Close"].iloc[prev_bar_idx])
+            sma50_at_prev = float(df["Close"].rolling(50).mean().iloc[prev_bar_idx])
+            if sma50_at_prev > 0:
+                pct_50ma_pre = (pre_gap_close - sma50_at_prev) / sma50_at_prev * 100
+                out["pct_50ma_pre"] = round(pct_50ma_pre, 2)
+                if pct_50ma_pre > 20.0:
+                    out["fail_reason"] = f"extended_pre_{round(pct_50ma_pre,1)}pct"
+                    return out
+        except Exception:
+            pass
+
+        # ---- Gate 5: prior 20-day range modest (not already parabolic) ----
+        # ATR/close before the gap. Loose price ranges = already-in-motion
+        # names where an EP is just continuation, not a fresh catalyst move.
+        try:
+            hi = df["High"].iloc[prev_bar_idx - 19:prev_bar_idx + 1]
+            lo = df["Low"].iloc[prev_bar_idx - 19:prev_bar_idx + 1]
+            cl = df["Close"].iloc[prev_bar_idx - 19:prev_bar_idx + 1]
+            tr = (hi - lo).abs()
+            atr20 = float(tr.mean())
+            pre_close = float(cl.iloc[-1])
+            if pre_close > 0:
+                atr_pct_pre = (atr20 / pre_close) * 100
+                out["atr_pct_pre"] = round(atr_pct_pre, 2)
+                if atr_pct_pre > 5.0:
+                    out["fail_reason"] = f"parabolic_atr_{round(atr_pct_pre,1)}pct"
+                    return out
+        except Exception:
+            pass
+
+        out["is_ep"] = True
     except Exception as e:
         out["fail_reason"] = f"error:{type(e).__name__}"
     return out

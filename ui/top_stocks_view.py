@@ -702,9 +702,10 @@ def render_top_stocks_page():
     # Build the dataframe — drop the carried-along _long/_quality private cols.
     # Also drop Buy_Trigger and Stop per user request (2026-06-02): the row
     # itself opens the deep dive, where the user can see those values inside
-    # the Execution tab. Keeping them out of the table keeps it cleaner.
+    # Buy_Trigger + Stop kept in the table 2026-08-07 for column parity with
+    # Momentum tab (user wants the same trade-plan info visible on both).
     df = pd.DataFrame(candidates).drop(
-        columns=["_long", "_quality", "Buy_Trigger", "Stop"],
+        columns=["_long", "_quality"],
         errors="ignore",
     )
 
@@ -725,6 +726,18 @@ def render_top_stocks_page():
         "RS_Rating":        "RS",
         "Risk_Pct":         "Risk %",
         "Fwd_EPS_Growth":   "Fwd EPS Growth %",
+        # Column-parity renames added 2026-08-07 to match Momentum labels
+        "PEG_Ratio":        "PEG",
+        "VCP_Quality":      "VCP",
+        "Pressure_20d":     "Pressure",
+        "Pct_Above_50MA":   "% > 50MA",
+        "Vol_vs_Avg":       "Vol ×",
+        "Days_To_Earnings": "ER (d)",
+        "Fundamentals":     "Fund",
+        "Earnings_Date":    "Earnings Date",
+        "Market_Cap":       "Mkt Cap",
+        "Buy_Trigger":      "Buy >",
+        "Stop":             "Stop <",
     })
 
     # Column formatting notes:
@@ -739,6 +752,8 @@ def render_top_stocks_page():
     #   - Fwd EPS Growth % width=170 hand-sized to fit the full header label.
     column_config = {
         "Ticker":           st.column_config.TextColumn("Ticker", pinned=True, width="small"),
+        "Tier":             st.column_config.TextColumn("Tier", width="small", alignment="center",
+                                                        help="A = Trade Now · B = Watch List · C = qualifying but not focus-list"),
         "Sector":           st.column_config.TextColumn("Sector", width="small"),
         "Industry":         st.column_config.TextColumn("Industry", width="medium"),
         "Composite":        st.column_config.NumberColumn("Composite",            format="%d",     width="small",  alignment="center"),
@@ -747,12 +762,36 @@ def render_top_stocks_page():
         "U/D Vol":          st.column_config.NumberColumn("  U/D Vol",            format="%.2f",   width="small",  alignment="center"),
         "RS":               st.column_config.NumberColumn("     RS",              format="%d",     width="small",  alignment="center"),
         "RSI":              st.column_config.NumberColumn("    RSI",              format="%.1f",   width="small",  alignment="center"),
+        "PEG":              st.column_config.NumberColumn("PEG", format="%.2f", width="small", alignment="center",
+                                                          help="Price/Earnings to Growth. <1 = growth is undervalued · 1-2 = fair · >2 = expensive."),
         "Price":            st.column_config.NumberColumn("   Price",             format="$%,.2f", width="small",  alignment="center"),
+        "Buy >":            st.column_config.NumberColumn("Buy >", format="$%,.2f", width="small", alignment="center",
+                                                          help="Buy trigger (0.5% above pivot)"),
+        "Stop <":           st.column_config.NumberColumn("Stop <", format="$%,.2f", width="small", alignment="center",
+                                                          help="Smart stop level"),
         "Risk %":           st.column_config.NumberColumn("  Risk %",             format="%.2f%%", width="small",  alignment="center"),
-        "Signals":          st.column_config.TextColumn  ("  Signals",                             width="small"),
+        "% > 50MA":         st.column_config.NumberColumn("% > 50MA", format="%.1f%%", width="small", alignment="center",
+                                                          help="Distance above 50-day MA. >20% is extended (EXT warning)."),
+        "Vol ×":            st.column_config.NumberColumn("Vol ×", format="%.1fx", width="small", alignment="center",
+                                                          help="Today's volume as a multiple of 50-day avg."),
+        "Pressure":         st.column_config.NumberColumn("Pressure", format="%.2fx", width="small", alignment="center",
+                                                          help="20-day up-vol / down-vol ratio. >1.3 = accumulation."),
+        "VCP":              st.column_config.TextColumn("VCP", width="small", alignment="center",
+                                                        help="A = 3+ contractions decreasing depth · B = 2+ · C = 1+ · None = no clean pattern"),
+        "VDU":              st.column_config.TextColumn("VDU", width="small", alignment="center",
+                                                        help="Volume dry-up: Extreme <50% avg · Yes <avg · No >avg"),
+        "Fund":             st.column_config.TextColumn("Fund", width="small",
+                                                        help="EPS++ = accelerating · EPS+ = >25% YoY · Sale+ = >20% YoY revenue"),
+        "RS_NH":            st.column_config.TextColumn("RS NH", width="small", alignment="center",
+                                                        help="RS line at new 50-day high"),
+        "ER (d)":           st.column_config.NumberColumn("ER (d)", format="%d", width="small", alignment="center",
+                                                          help="Days until next earnings (negative = past). Avoid initiating within 7 days."),
+        "Earnings Date":    st.column_config.TextColumn("Earnings", width="small", alignment="center"),
+        "Signals":          st.column_config.TextColumn  ("  Signals",                             width="medium"),
         "Warnings":         st.column_config.TextColumn  ("Warnings",                              width="small"),
         "Fwd EPS Growth %": st.column_config.NumberColumn(" Fwd EPS Growth %",
                                                           format="%,.1f%%",                       width=170,      alignment="center"),
+        "Mkt Cap":          st.column_config.TextColumn("Mkt Cap", width="small", alignment="center"),
     }
 
     # Cache filtered df for the sidebar exports

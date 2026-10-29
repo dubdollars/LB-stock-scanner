@@ -224,7 +224,12 @@ def compute_top_stocks(
             continue
 
         # Build the merged row. Order chosen for the table columns:
-        # identity | quality ratings | technical (RSI, RS) | trade plan | tags
+        # identity | quality ratings | technical (RSI, RS) | trade plan | tags.
+        # Column parity fields added 2026-08-07: Tier, PEG_Ratio, VCP_Quality,
+        # VDU, Pressure_20d, Pct_Above_50MA, Vol_vs_Avg, Days_To_Earnings,
+        # Fundamentals, Earnings_Date, Market_Cap — all pulled through from
+        # the Momentum candidate (l = _long) so the Top Stocks table can
+        # display the same trade-focused fields the Momentum tab shows.
         rows.append({
             "Ticker":              ticker,
             "Sector":              q.get("Sector") or l.get("Sector", ""),
@@ -246,6 +251,22 @@ def compute_top_stocks(
             "Signals":             l.get("Signals", []) or [],
             "Warnings":            l.get("Warnings", []) or [],
             "Fwd_EPS_Growth":      q.get("Fwd_EPS_Growth"),
+            # ---- Column-parity carryovers from Momentum (2026-08-07) ----
+            "Tier":                l.get("Tier"),
+            "PEG_Ratio":           l.get("PEG_Ratio"),
+            "VCP_Quality":         (l.get("VCP_Quality")
+                                    if isinstance(l.get("VCP_Quality"), str)
+                                    else (l.get("VCP_Quality") or {}).get("quality")
+                                    if isinstance(l.get("VCP_Quality"), dict) else None),
+            "VDU":                 l.get("VDU"),
+            "Pressure_20d":        l.get("Pressure_20d"),
+            "Pct_Above_50MA":      l.get("Pct_Above_50MA"),
+            "Vol_vs_Avg":          l.get("Vol_vs_Avg"),
+            "Days_To_Earnings":    l.get("Days_To_Earnings"),
+            "Fundamentals":        l.get("Fundamentals"),
+            "Earnings_Date":       l.get("Earnings_Date"),
+            "Market_Cap":          l.get("Market_Cap"),
+            "RS_NH":               l.get("RS_NH"),
             # Carry the full Long + Quality dicts on the side in case the
             # deep dive or future features want richer data without a re-fetch.
             "_long":               l,

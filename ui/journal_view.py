@@ -1851,7 +1851,7 @@ def _render_trades_table(trades: list[Trade]):
                  "For CLOSED positions: total trade duration (last exit − entry date), frozen.",
         ),
         "Closed":     st.column_config.TextColumn("Closed", width="small"),
-        "Held":       st.column_config.NumberColumn("Held", format="%,d", width="small", alignment="center"),
+        "Held":       st.column_config.NumberColumn("Shares", format="%,d", width="small", alignment="center"),
         "Avg Entry":  st.column_config.NumberColumn("Avg Entry", format="$%,.2f", width="small", alignment="center"),
         "Cost $":     st.column_config.NumberColumn(
             "Cost $", format="$%,.0f", width="small", alignment="center",
